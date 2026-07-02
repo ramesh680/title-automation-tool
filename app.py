@@ -11,6 +11,15 @@ except Exception:  # keep the app running even if the module is missing
     def fetch_metadata(title):
         return {}
 
+import json
+import base64
+
+try:
+    from validator import validate_workbook, DEFAULT_RULES
+except Exception:  # validator is optional; page still loads
+    validate_workbook = None
+    DEFAULT_RULES = {"rules": []}
+
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 logging.basicConfig(level=logging.INFO)
@@ -355,6 +364,41 @@ def generate_excel():
         )
     except Exception as e:
         logging.error(f"Error generating Excel: {str(e)}")
+        return jsonify({'error': f"Error: {str(e)}"}), 500
+
+
+@app.route('/validator')
+def validator_page():
+    return render_template('validator.html',
+                           default_rules=json.dumps(DEFAULT_RULES, indent=2))
+
+
+@app.route('/api/validate', methods=['POST'])
+def api_validate():
+    try:
+        if not request.files.get('file'):
+            return jsonify({'error': 'Please upload a workbook (.xlsx or .csv).'}), 400
+        if validate_workbook is None:
+            return jsonify({'error': 'Validator module unavailable.'}), 500
+
+        raw = request.form.get('rules')
+        if request.files.get('rulesFile'):
+            raw = request.files['rulesFile'].read().decode('utf-8', errors='replace')
+        rules = None
+        if raw and raw.strip():
+            try:
+                rules = json.loads(raw)
+            except Exception as e:
+                return jsonify({'error': f'Invalid rules JSON: {e}'}), 400
+
+        xlsx_bytes, summary = validate_workbook(request.files['file'], rules)
+        return jsonify({
+            'summary': summary,
+            'file_b64': base64.b64encode(xlsx_bytes).decode('ascii'),
+            'filename': f"Validated_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        })
+    except Exception as e:
+        logging.error(f"Error validating workbook: {str(e)}")
         return jsonify({'error': f"Error: {str(e)}"}), 500
 
 
