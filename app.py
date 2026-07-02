@@ -4,6 +4,12 @@ from io import BytesIO
 from datetime import datetime
 import logging
 
+try:
+    from metadata_fetcher import fetch_metadata
+except Exception:  # keep the app running even if the module is missing
+    def fetch_metadata(title):
+        return {}
+
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 logging.basicConfig(level=logging.INFO)
@@ -118,7 +124,23 @@ def _read_upload(file_storage):
     return df
 
 
-def build_rows_from_upload(file_storage, include_dar):
+def _merge_meta(base_meta, title, auto_fetch):
+    """Overlay auto-discovered metadata under any explicit metadata.
+
+    Explicit values (from the upload / request) always win; auto-discovery
+    only fills fields that are missing or blank.
+    """
+    if not auto_fetch:
+        return base_meta or {}
+    discovered = fetch_metadata(title) or {}
+    merged = dict(discovered)
+    for k, v in (base_meta or {}).items():
+        if v not in (None, ''):
+            merged[k] = v
+    return merged
+
+
+def build_rows_from_upload(file_storage, include_dar, auto_fetch=False):
     """Turn an uploaded file into fully-populated rows.
 
     * Full-schema files (already containing social channels / record_type) are
@@ -144,6 +166,13 @@ def build_rows_from_upload(file_storage, include_dar):
         # Fill sensible defaults only where blank
         df['record_type'] = df['record_type'].replace('', 'INGESTED')
         rows = df.to_dict('records')
+        if auto_fetch:
+            # fill blank social/ID fields from Wikidata, keeping existing values
+            filled = []
+            for r in rows:
+                merged = _merge_meta(r, str(r.get('title', '')), auto_fetch=True)
+                filled.append(merged)
+            rows = filled
     else:
         # Title-list mode
         title_col = lower_cols.get('title') or df.columns[0]
@@ -157,9 +186,10 @@ def build_rows_from_upload(file_storage, include_dar):
             if type_col:
                 is_movie = 'tv' not in str(r[type_col]).strip().lower()
             network = str(r[network_col]).strip() if network_col else ''
-            rows.append(create_row(title, is_movie, network))
+            meta = _merge_meta({}, title, auto_fetch)
+            rows.append(create_row(title, is_movie, network, meta))
             if include_dar and ' - DAR' not in title:
-                rows.append(create_row(f"{title} - DAR", is_movie, network))
+                rows.append(create_row(f"{title} - DAR", is_movie, network, meta))
     return rows
 
 
@@ -167,6 +197,7 @@ def build_rows_from_titles(data):
     """Build rows from a manual titles payload (JSON)."""
     titles = data.get('titles', [])
     include_dar = data.get('includeDar', True)
+    auto_fetch = bool(data.get('autoFetch', False))
     rows = []
     for title in titles:
         title = title.strip()
@@ -174,7 +205,7 @@ def build_rows_from_titles(data):
             continue
         is_movie = data.get('titles_type', {}).get(title, 'movie') == 'movie'
         network = data.get('networks', {}).get(title, '')
-        metadata = data.get('metadata', {}).get(title, {})
+        metadata = _merge_meta(data.get('metadata', {}).get(title, {}), title, auto_fetch)
         rows.append(create_row(title, is_movie, network, metadata))
         if include_dar and ' - DAR' not in title:
             rows.append(create_row(f"{title} - DAR", is_movie, network, metadata))
@@ -185,7 +216,8 @@ def collect_rows(limit=None):
     """Collect rows from either an uploaded file or a JSON titles payload."""
     if request.files.get('file'):
         include_dar = request.form.get('includeDar', 'true').lower() != 'false'
-        rows = build_rows_from_upload(request.files['file'], include_dar)
+        auto_fetch = request.form.get('autoFetch', 'false').lower() == 'true'
+        rows = build_rows_from_upload(request.files['file'], include_dar, auto_fetch)
     else:
         data = request.get_json(silent=True) or {}
         rows = build_rows_from_titles(data)
