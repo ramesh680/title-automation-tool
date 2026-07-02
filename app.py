@@ -3,6 +3,9 @@ import pandas as pd
 from io import BytesIO
 from datetime import datetime
 import re
+import time
+import uuid
+import threading
 import logging
 
 try:
@@ -242,13 +245,20 @@ def create_row(title, is_movie, network="", metadata=None):
     return row
 
 
-def _read_upload(file_storage):
-    """Read an uploaded CSV/XLSX into a DataFrame with clean string values."""
-    filename = (file_storage.filename or '').lower()
-    if filename.endswith('.csv'):
-        df = pd.read_csv(file_storage)
+def _read_upload(src):
+    """Read an uploaded CSV/XLSX into a DataFrame.
+    `src` is a Werkzeug FileStorage OR a (bytes, filename) tuple (used by jobs)."""
+    if isinstance(src, tuple):
+        data, filename = src
+        stream = BytesIO(data)
     else:
-        df = pd.read_excel(file_storage, engine='openpyxl')
+        filename = src.filename
+        stream = src
+    fn = (filename or '').lower()
+    if fn.endswith('.csv'):
+        df = pd.read_csv(stream)
+    else:
+        df = pd.read_excel(stream, engine='openpyxl')
     df.columns = [str(c).strip() for c in df.columns]
     df = df.where(pd.notnull(df), '')
     return df
@@ -268,13 +278,13 @@ def _merge_meta(base_meta, title, auto_fetch, is_movie=True):
     return merged
 
 
-def build_rows_from_upload(file_storage, include_dar, auto_fetch=False, max_titles=None):
+def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None, progress=None):
     """Turn an uploaded file into fully-populated rows.
 
-    max_titles caps how many source rows/titles are processed BEFORE any
-    (slow) auto-discovery lookups -- used to keep Preview fast.
+    max_titles caps titles processed BEFORE lookups (keeps Preview fast).
+    progress(done, total) is called after each source title (for job progress).
     """
-    df = _read_upload(file_storage)
+    df = _read_upload(src)
     lower_cols = {c.lower(): c for c in df.columns}
     has_full_schema = any(col in lower_cols for col in SOCIAL_COLUMNS + ['record_type', 'brand_id'])
 
@@ -288,53 +298,59 @@ def build_rows_from_upload(file_storage, include_dar, auto_fetch=False, max_titl
         records = df.to_dict('records')
         if max_titles:
             records = records[:max_titles]
-        if auto_fetch:
-            records = [_merge_meta(
-                r, str(r.get('title', '')), True,
-                is_movie=('tv' not in str(r.get('title_category', '')).lower())
-            ) for r in records]
-        rows = records
+        total = len(records)
+        for i, r in enumerate(records):
+            if auto_fetch:
+                r = _merge_meta(r, str(r.get('title', '')), True,
+                                is_movie=('tv' not in str(r.get('title_category', '')).lower()))
+            rows.append(r)
+            if progress:
+                progress(i + 1, total)
     else:
         title_col = lower_cols.get('title') or df.columns[0]
         type_col = lower_cols.get('type') or lower_cols.get('title_category')
         network_col = lower_cols.get('network')
-        seen = 0
+        specs = []
         for _, r in df.iterrows():
             title = str(r[title_col]).strip()
             if not title:
                 continue
-            if max_titles and seen >= max_titles:
+            if max_titles and len(specs) >= max_titles:
                 break
-            seen += 1
             is_movie = True
             if type_col:
                 is_movie = 'tv' not in str(r[type_col]).strip().lower()
             network = str(r[network_col]).strip() if network_col else ''
+            specs.append((title, is_movie, network))
+        total = len(specs)
+        for i, (title, is_movie, network) in enumerate(specs):
             meta = _merge_meta({}, title, auto_fetch, is_movie=is_movie)
             rows.append(create_row(title, is_movie, network, meta))
             if include_dar and ' - DAR' not in title:
                 rows.append(create_row(f"{title} - DAR", is_movie, network, meta))
+            if progress:
+                progress(i + 1, total)
     return rows
 
 
-def build_rows_from_titles(data, max_titles=None):
+def build_rows_from_titles(data, max_titles=None, progress=None):
     """Build rows from a manual titles payload (JSON)."""
-    titles = data.get('titles', [])
+    titles = [t.strip() for t in data.get('titles', []) if t and t.strip()]
     if max_titles:
         titles = titles[:max_titles]
     include_dar = data.get('includeDar', True)
     auto_fetch = bool(data.get('autoFetch', False))
+    total = len(titles)
     rows = []
-    for title in titles:
-        title = title.strip()
-        if not title:
-            continue
+    for i, title in enumerate(titles):
         is_movie = data.get('titles_type', {}).get(title, 'movie') == 'movie'
         network = data.get('networks', {}).get(title, '')
         metadata = _merge_meta(data.get('metadata', {}).get(title, {}), title, auto_fetch, is_movie=is_movie)
         rows.append(create_row(title, is_movie, network, metadata))
         if include_dar and ' - DAR' not in title:
             rows.append(create_row(f"{title} - DAR", is_movie, network, metadata))
+        if progress:
+            progress(i + 1, total)
     return rows
 
 
@@ -445,6 +461,100 @@ def api_validate():
     except Exception as e:
         logging.error(f"Error validating workbook: {str(e)}")
         return jsonify({'error': f"Error: {str(e)}"}), 500
+
+
+# ============================ background jobs =============================
+# In-memory job store for full-file generation. Runs in a daemon thread so long
+# auto-discovery runs don't hit the request timeout. IMPORTANT: run gunicorn with
+# a SINGLE worker + threads so this store is shared, e.g.:
+#   web: gunicorn app:app --workers 1 --threads 8 --timeout 120
+_JOBS = {}
+_JOBS_LOCK = threading.Lock()
+_JOB_TTL = 1800  # seconds to keep a finished job's file in memory
+
+
+def _job_set(jid, **kw):
+    with _JOBS_LOCK:
+        if jid in _JOBS:
+            _JOBS[jid].update(kw)
+
+
+def _prune_jobs():
+    now = time.time()
+    with _JOBS_LOCK:
+        for k in [k for k, v in _JOBS.items() if now - v.get('created', now) > _JOB_TTL]:
+            _JOBS.pop(k, None)
+
+
+def _run_generation(jid, kind, payload):
+    try:
+        def prog(done, total):
+            _job_set(jid, done=done, total=total)
+
+        if kind == 'file':
+            rows = build_rows_from_upload(
+                (payload['bytes'], payload['filename']),
+                payload['include_dar'], payload['auto_fetch'], progress=prog)
+        else:
+            rows = build_rows_from_titles(payload['data'], progress=prog)
+
+        if not rows:
+            _job_set(jid, status='error', error='No titles provided')
+            return
+        df = pd.DataFrame(rows).reindex(columns=COLUMNS).where(lambda x: pd.notnull(x), '')
+        out = BytesIO()
+        df.to_excel(out, sheet_name='Sheet1', index=False)
+        out.seek(0)
+        _job_set(jid, status='done', file=out.getvalue(), rows=len(df),
+                 filename=f"Titles_Export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+    except Exception as e:  # noqa: BLE001
+        logging.error(f"generation job {jid} failed: {e}")
+        _job_set(jid, status='error', error=str(e))
+
+
+@app.route('/api/generate_async', methods=['POST'])
+def generate_async():
+    """Kick off full-file generation in the background; returns a job id."""
+    _prune_jobs()
+    jid = uuid.uuid4().hex[:12]
+    if request.files.get('file'):
+        f = request.files['file']
+        payload = {
+            'bytes': f.read(), 'filename': f.filename,
+            'include_dar': request.form.get('includeDar', 'true').lower() != 'false',
+            'auto_fetch': request.form.get('autoFetch', 'false').lower() == 'true',
+        }
+        kind = 'file'
+    else:
+        payload = {'data': request.get_json(silent=True) or {}}
+        kind = 'titles'
+    with _JOBS_LOCK:
+        _JOBS[jid] = {'status': 'running', 'done': 0, 'total': 0, 'error': None,
+                      'file': None, 'filename': None, 'rows': None, 'created': time.time()}
+    threading.Thread(target=_run_generation, args=(jid, kind, payload), daemon=True).start()
+    return jsonify({'job_id': jid})
+
+
+@app.route('/api/job/<jid>')
+def job_status(jid):
+    with _JOBS_LOCK:
+        j = _JOBS.get(jid)
+        if not j:
+            return jsonify({'error': 'Unknown or expired job'}), 404
+        return jsonify({'status': j['status'], 'done': j['done'], 'total': j['total'],
+                        'error': j['error'], 'rows': j.get('rows')})
+
+
+@app.route('/api/job/<jid>/download')
+def job_download(jid):
+    with _JOBS_LOCK:
+        j = _JOBS.get(jid)
+        if not j or j['status'] != 'done' or not j['file']:
+            return jsonify({'error': 'File not ready'}), 404
+        data, fn = j['file'], j['filename']
+    return send_file(BytesIO(data),
+                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                     as_attachment=True, download_name=fn)
 
 
 if __name__ == '__main__':
