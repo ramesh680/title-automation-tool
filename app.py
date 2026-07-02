@@ -254,8 +254,12 @@ def _merge_meta(base_meta, title, auto_fetch):
     return merged
 
 
-def build_rows_from_upload(file_storage, include_dar, auto_fetch=False):
-    """Turn an uploaded file into fully-populated rows."""
+def build_rows_from_upload(file_storage, include_dar, auto_fetch=False, max_titles=None):
+    """Turn an uploaded file into fully-populated rows.
+
+    max_titles caps how many source rows/titles are processed BEFORE any
+    (slow) auto-discovery lookups -- used to keep Preview fast.
+    """
     df = _read_upload(file_storage)
     lower_cols = {c.lower(): c for c in df.columns}
     has_full_schema = any(col in lower_cols for col in SOCIAL_COLUMNS + ['record_type', 'brand_id'])
@@ -267,17 +271,24 @@ def build_rows_from_upload(file_storage, include_dar, auto_fetch=False):
         df = df.reindex(columns=COLUMNS)
         df = df.where(pd.notnull(df), '')
         df['record_type'] = df['record_type'].replace('', 'INGESTED')
-        rows = df.to_dict('records')
+        records = df.to_dict('records')
+        if max_titles:
+            records = records[:max_titles]
         if auto_fetch:
-            rows = [_merge_meta(r, str(r.get('title', '')), True) for r in rows]
+            records = [_merge_meta(r, str(r.get('title', '')), True) for r in records]
+        rows = records
     else:
         title_col = lower_cols.get('title') or df.columns[0]
         type_col = lower_cols.get('type') or lower_cols.get('title_category')
         network_col = lower_cols.get('network')
+        seen = 0
         for _, r in df.iterrows():
             title = str(r[title_col]).strip()
             if not title:
                 continue
+            if max_titles and seen >= max_titles:
+                break
+            seen += 1
             is_movie = True
             if type_col:
                 is_movie = 'tv' not in str(r[type_col]).strip().lower()
@@ -289,9 +300,11 @@ def build_rows_from_upload(file_storage, include_dar, auto_fetch=False):
     return rows
 
 
-def build_rows_from_titles(data):
+def build_rows_from_titles(data, max_titles=None):
     """Build rows from a manual titles payload (JSON)."""
     titles = data.get('titles', [])
+    if max_titles:
+        titles = titles[:max_titles]
     include_dar = data.get('includeDar', True)
     auto_fetch = bool(data.get('autoFetch', False))
     rows = []
@@ -308,17 +321,25 @@ def build_rows_from_titles(data):
     return rows
 
 
-def collect_rows(limit=None):
-    """Collect rows from either an uploaded file or a JSON titles payload."""
+# how many titles Preview samples (keeps auto-discovery fast on free tier)
+PREVIEW_MAX_TITLES = 3
+
+
+def collect_rows(preview=False):
+    """Collect rows from either an uploaded file or a JSON titles payload.
+
+    When preview=True only the first PREVIEW_MAX_TITLES titles are processed,
+    BEFORE any auto-discovery, so the preview stays responsive.
+    """
+    max_titles = PREVIEW_MAX_TITLES if preview else None
     if request.files.get('file'):
         include_dar = request.form.get('includeDar', 'true').lower() != 'false'
         auto_fetch = request.form.get('autoFetch', 'false').lower() == 'true'
-        rows = build_rows_from_upload(request.files['file'], include_dar, auto_fetch)
+        rows = build_rows_from_upload(request.files['file'], include_dar, auto_fetch,
+                                      max_titles=max_titles)
     else:
         data = request.get_json(silent=True) or {}
-        rows = build_rows_from_titles(data)
-    if limit:
-        rows = rows[:limit]
+        rows = build_rows_from_titles(data, max_titles=max_titles)
     return rows
 
 
@@ -330,15 +351,22 @@ def index():
 @app.route('/api/preview', methods=['POST'])
 def preview_data():
     try:
-        rows = collect_rows()
+        rows = collect_rows(preview=True)
         if not rows:
             return jsonify({'error': 'No titles provided'}), 400
         df = pd.DataFrame(rows)
         df = df.reindex(columns=COLUMNS).where(lambda x: pd.notnull(x), '')
+        # figure out whether the source had more titles than we sampled
+        if request.files.get('file'):
+            preview_limited = True
+        else:
+            src = len((request.get_json(silent=True) or {}).get('titles', []))
+            preview_limited = src > PREVIEW_MAX_TITLES
         return jsonify({
             'total_rows': len(df),
             'preview': df.head(4).to_dict('records'),
-            'columns': list(df.columns)
+            'columns': list(df.columns),
+            'preview_limited': preview_limited,
         })
     except Exception as e:
         logging.error(f"Error previewing data: {str(e)}")
