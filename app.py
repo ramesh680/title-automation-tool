@@ -20,10 +20,120 @@ except Exception:  # keep the app running even if the module is missing
 import json
 import base64
 
-try:
-    import reference_data as REF
-except Exception:  # reference tables optional
-    REF = None
+import types as _types
+
+# ---- Reference tables (inlined so no separate file can be missed on deploy) ----
+# distributor (raw from BOM/IMDb/TMDB) -> LF network label
+_NETWORK_LABEL = {
+    "lionsgate": "Lionsgate / Summit", "summit entertainment": "Lionsgate / Summit",
+    "lionsgate films": "Lionsgate / Summit", "columbia pictures": "Sony / Columbia",
+    "sony pictures releasing": "Sony / Columbia", "sony pictures": "Sony / Columbia",
+    "sony pictures entertainment": "Sony / Columbia", "sony pictures classics": "Sony Classics",
+    "20th century fox": "20th Century Studios", "20th century studios": "20th Century Studios",
+    "walt disney studios motion pictures": "Disney", "walt disney pictures": "Disney",
+    "amazon mgm studios": "Amazon MGM Studios", "amazon studios": "Amazon MGM Studios",
+    "warner bros.": "Warner Bros.", "warner bros. pictures": "Warner Bros.", "pbs": "PBS network",
+}
+_NETWORK_TO_COMPANIES = {
+    "20th Century Studios": "Walt Disney Pictures", "Amazon MGM Studios": "Amazon Studios",
+    "Disney": "Walt Disney Pictures", "Lionsgate / Summit": "Lionsgate", "Neon": "Neon",
+    "Sony / Columbia": "Sony Pictures", "Sony Classics": "Sony Pictures",
+    "Warner Bros.": "Warner Bros. Pictures",
+}
+_NETWORK_TO_YOUTUBE = {
+    "20th Century Studios": "http://www.youtube.com/user/FoxMovies",
+    "Amazon MGM Studios": "http://www.youtube.com/channel/UCf5CjDJvsFvtVIhkfmKAwAA",
+    "Atlas Distribution": "http://www.youtube.com/channel/UCMLA_XtSbnfjXHL2An8zfGg",
+    "Aura Entertainment": "http://www.youtube.com/@AuraEntFilms",
+    "Big World Pictures": "http://www.youtube.com/channel/UCx1mHWMsCO96ungWSwS5Udg",
+    "Blue Fox": "http://www.youtube.com/channel/UCmHYPCM_h8Tw9JkI3UnrCvA",
+    "Dark Sky Films": "http://www.youtube.com/user/dsf2006",
+    "Disney": "http://www.youtube.com/@pixar",
+    "Fathom Events": "http://www.youtube.com/user/FathomEvents",
+    "Fin & Fur Films": "http://www.youtube.com/@finfurfilms/videos",
+    "GKIDS": "http://www.youtube.com/user/GKIDStv",
+    "Giant Pictures": "http://www.youtube.com/@GiantPictures",
+    "Greenwich Entertainment": "http://www.youtube.com/channel/UCLFmfzQaJE_YlgXtnkr3e_Q",
+    "IFC Films": "http://www.youtube.com/user/IFCFilmsTube",
+    "Iconic Events": "http://www.youtube.com/@iconicreleasing",
+    "Independent Film Company": "http://www.youtube.com/@IndependentFilmCompany",
+    "Indican Pictures": "http://www.youtube.com/user/IndicanPictures",
+    "Janus Films": "http://www.youtube.com/user/janusfilmsnyc",
+    "Kani Releasing": "http://www.youtube.com/@kani-releasing",
+    "Kino Lorber": "http://www.youtube.com/user/kinolorber",
+    "Lionsgate / Summit": "http://www.youtube.com/user/LionsgateLIVE",
+    "MUBI": "http://www.youtube.com/@mubi",
+    "Magnolia": "http://www.youtube.com/user/MagnoliaPictures",
+    "Neon": "http://www.youtube.com/channel/UCpy5dRhZd-JbZP4NsrnLt1w",
+    "Oscilloscope Pictures": "http://www.youtube.com/user/oscopelabs",
+    "PBS network": "http://www.youtube.com/@PBS",
+    "Persimmon": "http://www.youtube.com/@persimmonpresents",
+    "Roadside Attractions": "http://www.youtube.com/user/RoadsideFlix",
+    "Row K Entertainment": "http://youtube.com/@rowkpresents",
+    "Sandbox Films": "http://www.youtube.com/@sandboxdocs",
+    "Sony / Columbia": "http://www.youtube.com/@sonypictures",
+    "Sony Classics": "http://www.youtube.com/user/SonyPicturesClassics",
+    "Strand Releasing": "http://www.youtube.com/user/StrandReleasing",
+    "Sumerian Pictures": "http://www.youtube.com/@SumerianRecords",
+    "Trafalgar Releasing": "http://www.youtube.com/channel/UC_0NZhyl9KH0aMWXRnAKM4g",
+    "Warner Bros.": "http://www.youtube.com/user/WarnerBrosPictures",
+    "Watermelon Pictures": "http://www.youtube.com/@watermelonpicturesco",
+    "Well Go USA": "http://www.youtube.com/user/wellgousa",
+}
+_NETWORK_TO_MANAGER = {
+    "20th Century Studios": "Disney Insights & Analytics + Disney Theatrical Research + Disney Ad Sales",
+    "Disney": "Disney Insights & Analytics + Disney Theatrical Research + Disney Ad Sales",
+    "Amazon MGM Studios": "Amazon PV Enterprise", "Lionsgate / Summit": "Lionsgate",
+    "Neon": "Neon", "Sony / Columbia": "Sony Enterprise", "Sony Classics": "Sony Enterprise",
+    "Warner Bros.": "Warner Bros.",
+}
+_NETWORK_TO_SUBCATEGORY = {
+    "Disney": "Release - Wide\nStudio - Major",
+    "Warner Bros.": "Release - Limited\nStudio - Major",
+    "Sony / Columbia": "Release - Wide\nStudio - Independent",
+    "Amazon MGM Studios": "Release - Wide\nStudio - Independent",
+    "AMC Network": "Release - Wide\nStudio - Independent",
+}
+_GENRE_FIX = {"Sci-Fi": "Sci Fi", "Science Fiction": "Sci Fi", "Film-Noir": "Film Noir", "Rom-Com": "Romance"}
+
+
+def _ref_ci_get(mapping, key):
+    if key is None:
+        return None
+    k = str(key).strip()
+    if k in mapping:
+        return mapping[k]
+    kl = k.lower()
+    for mk, mv in mapping.items():
+        if mk.lower() == kl:
+            return mv
+    return None
+
+
+def _ref_normalize_network(raw):
+    if not raw:
+        return raw
+    return _ref_ci_get(_NETWORK_LABEL, raw) or str(raw).strip()
+
+
+def _ref_normalize_genres(genre_multiline):
+    if not genre_multiline:
+        return genre_multiline, ""
+    parts = [p.strip() for p in str(genre_multiline).split("\n") if p.strip()]
+    fixed = [_GENRE_FIX.get(p, p) for p in parts]
+    seen = set()
+    uniq = [g for g in fixed if not (g in seen or seen.add(g))]
+    return "\n".join(uniq), (uniq[0] if uniq else "")
+
+
+REF = _types.SimpleNamespace(
+    NETWORK_TO_MANAGER=_NETWORK_TO_MANAGER,
+    normalize_network=_ref_normalize_network,
+    companies_for=lambda n: _ref_ci_get(_NETWORK_TO_COMPANIES, n) or "",
+    youtube_for=lambda n: _ref_ci_get(_NETWORK_TO_YOUTUBE, n) or "",
+    subcategory_for=lambda n: _ref_ci_get(_NETWORK_TO_SUBCATEGORY, n) or "",
+    normalize_genres=_ref_normalize_genres,
+)
 
 try:
     from validator import validate_workbook, DEFAULT_RULES
