@@ -28,7 +28,7 @@ ENTITYDATA = "https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
 HEADERS = {
     "User-Agent": "ListenFirstTitleTool/1.0 (https://listenfirstmedia.com; contact@listenfirstmedia.com)"
 }
-TIMEOUT = 12
+TIMEOUT = 8
 
 FILM_TV_TYPES = {
     "Q11424", "Q202866", "Q24856", "Q93204", "Q506240", "Q5398426",
@@ -138,7 +138,7 @@ def _is_film_or_tv(claims):
 def resolve_entity(title):
     """Return (qid, entity) for the best film/TV match, else (None, None)."""
     fallback = None
-    for qid in _search_candidates(title):
+    for qid in _search_candidates(title)[:3]:  # cap network round-trips per title
         ent = _entity(qid)
         if not ent:
             continue
