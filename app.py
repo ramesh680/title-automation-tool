@@ -8,7 +8,7 @@ import logging
 try:
     from metadata_fetcher import fetch_metadata
 except Exception:  # keep the app running even if the module is missing
-    def fetch_metadata(title):
+    def fetch_metadata(title, is_movie=True):
         return {}
 
 import json
@@ -140,6 +140,16 @@ def generate_url_managers(row):
 
 
 
+def _norm_bool(v):
+    """Normalise a truthiness/string into the lowercase 'true'/'false' the feed expects."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    sv = str(v).strip().lower()
+    if sv in ("false", "0", "no", "n", ""):
+        return "false"
+    return "true"
+
+
 def create_row(title, is_movie, network="", metadata=None):
     """Create a data row for a title - ALL 42 COLUMNS POPULATED.
 
@@ -165,6 +175,10 @@ def create_row(title, is_movie, network="", metadata=None):
     else:
         companies = eff_network if eff_network else "Unknown"
         brand_set = "Competitive View"
+        # Wide theatrical releases carry an extra brand_set line
+        _sub = str(metadata.get('title_sub_category') or 'Release - Limited\nStudio - Independent')
+        if 'release - wide' in _sub.lower():
+            brand_set = "Competitive View\n[Data Feed] Film - Wide Release + Custom Requests"
 
     # Release year for search-term generation
     rel = str(metadata.get('released_on') or metadata.get('title_created_date') or '')
@@ -192,7 +206,7 @@ def create_row(title, is_movie, network="", metadata=None):
         'companies': mv('companies', companies),
         'brand_set': mv('brand_set', brand_set),
         'composite_brand_set': metadata.get('composite_brand_set', ''),
-        'active': metadata.get('active', True),
+        'active': _norm_bool(metadata.get('active', True)),
         'released_on': metadata.get('released_on', ''),
         'domestic_opening_weekend_box_office': metadata.get('domestic_opening_weekend_box_office', ''),
         'domestic_opening_weekend_screens': metadata.get('domestic_opening_weekend_screens', ''),
@@ -240,13 +254,13 @@ def _read_upload(file_storage):
     return df
 
 
-def _merge_meta(base_meta, title, auto_fetch):
+def _merge_meta(base_meta, title, auto_fetch, is_movie=True):
     """Overlay auto-discovered metadata under any explicit metadata.
     Explicit values always win; auto-discovery only fills missing/blank fields.
     """
     if not auto_fetch:
         return base_meta or {}
-    discovered = fetch_metadata(title) or {}
+    discovered = fetch_metadata(title, is_movie) or {}
     merged = dict(discovered)
     for k, v in (base_meta or {}).items():
         if v not in (None, ''):
@@ -275,7 +289,10 @@ def build_rows_from_upload(file_storage, include_dar, auto_fetch=False, max_titl
         if max_titles:
             records = records[:max_titles]
         if auto_fetch:
-            records = [_merge_meta(r, str(r.get('title', '')), True) for r in records]
+            records = [_merge_meta(
+                r, str(r.get('title', '')), True,
+                is_movie=('tv' not in str(r.get('title_category', '')).lower())
+            ) for r in records]
         rows = records
     else:
         title_col = lower_cols.get('title') or df.columns[0]
@@ -293,7 +310,7 @@ def build_rows_from_upload(file_storage, include_dar, auto_fetch=False, max_titl
             if type_col:
                 is_movie = 'tv' not in str(r[type_col]).strip().lower()
             network = str(r[network_col]).strip() if network_col else ''
-            meta = _merge_meta({}, title, auto_fetch)
+            meta = _merge_meta({}, title, auto_fetch, is_movie=is_movie)
             rows.append(create_row(title, is_movie, network, meta))
             if include_dar and ' - DAR' not in title:
                 rows.append(create_row(f"{title} - DAR", is_movie, network, meta))
@@ -314,7 +331,7 @@ def build_rows_from_titles(data, max_titles=None):
             continue
         is_movie = data.get('titles_type', {}).get(title, 'movie') == 'movie'
         network = data.get('networks', {}).get(title, '')
-        metadata = _merge_meta(data.get('metadata', {}).get(title, {}), title, auto_fetch)
+        metadata = _merge_meta(data.get('metadata', {}).get(title, {}), title, auto_fetch, is_movie=is_movie)
         rows.append(create_row(title, is_movie, network, metadata))
         if include_dar and ' - DAR' not in title:
             rows.append(create_row(f"{title} - DAR", is_movie, network, metadata))
