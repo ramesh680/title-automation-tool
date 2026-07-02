@@ -9,13 +9,21 @@ import threading
 import logging
 
 try:
-    from metadata_fetcher import fetch_metadata
+    from metadata_fetcher import fetch_metadata, fetch_metadata_by_tt
 except Exception:  # keep the app running even if the module is missing
     def fetch_metadata(title, is_movie=True):
         return {}
 
+    def fetch_metadata_by_tt(tt, is_movie=True, title=""):
+        return {}
+
 import json
 import base64
+
+try:
+    import reference_data as REF
+except Exception:  # reference tables optional
+    REF = None
 
 try:
     from validator import validate_workbook, DEFAULT_RULES
@@ -90,10 +98,10 @@ def generate_search_terms(clean_title, network, year, is_dar):
     return terms, kw
 
 
-# company / network -> manager-team lookup. POPULATED FROM repo logic (media-tools-hub).
-# Keys are lowercased network or companies names. Left empty until that mapping is wired in;
-# while empty, url_managers stays blank (no incorrect output).
+# network -> url_managers team (from reference_data, learned from the manual file).
 URL_MANAGER_MAP = {}
+if REF is not None:
+    URL_MANAGER_MAP = {k.lower(): v for k, v in REF.NETWORK_TO_MANAGER.items()}
 
 
 def _first_line(v):
@@ -166,8 +174,11 @@ def create_row(title, is_movie, network="", metadata=None):
     clean_title = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
     title_category = "Movies" if is_movie else "TV Shows"
 
-    # Effective network = discovered/explicit network, else the passed arg
+    # Effective network = discovered/explicit network, else the passed arg;
+    # normalise raw distributor -> LF network label (e.g. "Lionsgate" -> "Lionsgate / Summit").
     eff_network = (str(metadata.get('network') or network or '')).strip()
+    if REF is not None and eff_network:
+        eff_network = REF.normalize_network(eff_network)
 
     if is_dar:
         companies = "Pristine Brand"
@@ -176,10 +187,16 @@ def create_row(title, is_movie, network="", metadata=None):
         else:
             brand_set = "Pristine DAR Brands"
     else:
-        companies = eff_network if eff_network else "Unknown"
+        # companies = curated PARENT of the network (not the network itself); else Unknown
+        parent = REF.companies_for(eff_network) if (REF and eff_network) else ""
+        companies = parent or "Unknown"
         brand_set = "Competitive View"
         # Wide theatrical releases carry an extra brand_set line
-        _sub = str(metadata.get('title_sub_category') or 'Release - Limited\nStudio - Independent')
+        _sub = str(metadata.get('title_sub_category') or '').strip()
+        if not _sub and REF is not None:
+            _sub = REF.subcategory_for(eff_network)
+        if not _sub:
+            _sub = 'Release - Limited\nStudio - Independent'
         if 'release - wide' in _sub.lower():
             brand_set = "Competitive View\n[Data Feed] Film - Wide Release + Custom Requests"
 
@@ -188,6 +205,22 @@ def create_row(title, is_movie, network="", metadata=None):
     year = rel[:4] if rel[:4].isdigit() else ''
 
     gen_terms, gen_keywords = generate_search_terms(clean_title, eff_network, year, is_dar)
+
+    # normalise genre tokens to the LF taxonomy (Sci-Fi -> Sci Fi, etc.)
+    _genre = metadata.get('genre', '')
+    _primary = metadata.get('primary_genre', '')
+    if REF is not None and _genre:
+        _genre, _primary_fix = REF.normalize_genres(_genre)
+        if not _primary:            # keep a provided primary_genre; else derive
+            _primary = _primary_fix
+    # distributor YouTube channel from reference when not already present
+    _yt_company = metadata.get('youtube_channel_company', '')
+    _yt_username = metadata.get('youtube_channel_username', '')
+    if REF is not None and not _yt_company and eff_network:
+        ch = REF.youtube_for(eff_network)
+        if ch:
+            _yt_company = ch
+            _yt_username = ch + "|" + clean_title.lower()
 
     def mv(key, default=''):
         """metadata value, falling back to default when missing OR blank."""
@@ -200,9 +233,9 @@ def create_row(title, is_movie, network="", metadata=None):
         'title': title,
         'title_created_date': mv('title_created_date', datetime.now().strftime('%Y-%m-%d')),
         'title_category': mv('title_category', title_category),
-        'title_sub_category': mv('title_sub_category', 'Release - Limited\nStudio - Independent'),
-        'genre': metadata.get('genre', ''),
-        'primary_genre': metadata.get('primary_genre', ''),
+        'title_sub_category': mv('title_sub_category', _sub if not is_dar else 'Release - Limited\nStudio - Independent'),
+        'genre': _genre,
+        'primary_genre': _primary,
         'iso_mic': metadata.get('iso_mic', ''),
         'stock_exchange': metadata.get('stock_exchange', ''),
         'ticker_symbol': metadata.get('ticker_symbol', ''),
@@ -221,8 +254,8 @@ def create_row(title, is_movie, network="", metadata=None):
         'twitter_handle': metadata.get('twitter_handle', ''),
         'twitter_verified': metadata.get('twitter_verified', ''),
         'instagram_user': metadata.get('instagram_user', ''),
-        'youtube_channel_username': metadata.get('youtube_channel_username', ''),
-        'youtube_channel_company': metadata.get('youtube_channel_company', ''),
+        'youtube_channel_username': _yt_username,
+        'youtube_channel_company': _yt_company,
         'tiktok_user': metadata.get('tiktok_user', ''),
         'linkedin_page': metadata.get('linkedin_page', ''),
         'threads_page': metadata.get('threads_page', ''),
@@ -270,9 +303,14 @@ def _merge_meta(base_meta, title, auto_fetch, is_movie=True):
     """
     if not auto_fetch:
         return base_meta or {}
-    discovered = fetch_metadata(title, is_movie) or {}
+    base = base_meta or {}
+    tt = re.search(r"tt\d{5,}", str(base.get('imdb_id') or base.get('imdb_url') or ''))
+    if tt:
+        discovered = fetch_metadata_by_tt(tt.group(0), is_movie, title) or {}
+    else:
+        discovered = fetch_metadata(title, is_movie) or {}
     merged = dict(discovered)
-    for k, v in (base_meta or {}).items():
+    for k, v in base.items():
         if v not in (None, ''):
             merged[k] = v
     return merged
