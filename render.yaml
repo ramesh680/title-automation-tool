@@ -1,8 +1,0 @@
-services:
-  - type: web
-    name: title-automation-tool
-    env: python
-    plan: free
-    pythonVersion: 3.11.0
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
