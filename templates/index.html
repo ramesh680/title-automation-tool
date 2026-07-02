@@ -379,42 +379,68 @@
             document.getElementById('previewStats').style.display = 'block';
         }
 
+        // Full-file generation runs as a background job (no request timeout).
         function generateExcel() {
             const init = buildRequestInit();
             if (!init) return;
 
-            showLoading('previewContent', true);
-            showMessage('previewMessage', 'Generating Excel file...', 'success');
+            renderProgress(0, 0, 'Starting…');
+            showMessage('previewMessage', 'Generating in the background…', 'success');
 
-            fetch('/api/generate', init)
-            .then(async r => {
-                if (!r.ok) {
-                    let msg = 'Server error ' + r.status;
-                    if (r.status === 502 || r.status === 504) {
-                        msg = 'The server timed out building the file. For large uploads, turn off Auto-discover (its per-title lookups are slow on the free tier).';
-                    } else {
-                        const t = await r.text().catch(() => '');
-                        try { const j = JSON.parse(t); if (j.error) msg = j.error; } catch (_) {}
+            fetch('/api/generate_async', init)
+                .then(r => r.json())
+                .then(d => {
+                    if (d.error) {
+                        showMessage('previewMessage', d.error, 'error');
+                        showLoading('previewContent', false);
+                        return;
                     }
-                    throw new Error(msg);
-                }
-                return r.blob();
-            })
-            .then(blob => {
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `Titles_Export_${new Date().getTime()}.xlsx`;
-                document.body.appendChild(a);
-                a.click();
-                window.URL.revokeObjectURL(url);
-                document.body.removeChild(a);
-                showMessage('previewMessage', '✓ Excel file downloaded successfully!', 'success');
-            })
-            .catch(e => {
-                showMessage('previewMessage', `Download error: ${e.message}`, 'error');
-            })
-            .finally(() => showLoading('previewContent', false));
+                    pollJob(d.job_id);
+                })
+                .catch(e => {
+                    showMessage('previewMessage', `Error: ${e.message}`, 'error');
+                    showLoading('previewContent', false);
+                });
+        }
+
+        function renderProgress(done, total, label) {
+            const pct = total ? Math.round(100 * done / total) : 0;
+            const bar = total
+                ? `<div style="height:8px;background:rgba(255,255,255,.1);border-radius:99px;overflow:hidden;margin:14px auto 0;max-width:280px">
+                     <div style="height:100%;width:${pct}%;background:linear-gradient(135deg,var(--brand1),var(--brand2));transition:width .3s"></div>
+                   </div>` : '';
+            document.getElementById('previewContent').innerHTML =
+                `<div class="loading"><div class="spinner"></div>
+                   <p>${label || 'Enriching titles…'} ${total ? (done + ' / ' + total + ' (' + pct + '%)') : ''}</p>${bar}</div>`;
+        }
+
+        function pollJob(id) {
+            fetch('/api/job/' + id)
+                .then(r => r.json())
+                .then(j => {
+                    if (j.error && j.status !== 'running') {
+                        showMessage('previewMessage', j.error, 'error');
+                        showLoading('previewContent', false);
+                        return;
+                    }
+                    if (j.status === 'running') {
+                        renderProgress(j.done, j.total, 'Enriching titles…');
+                        setTimeout(() => pollJob(id), 1500);
+                    } else if (j.status === 'done') {
+                        const a = document.createElement('a');
+                        a.href = '/api/job/' + id + '/download';
+                        document.body.appendChild(a);
+                        a.click();
+                        a.remove();
+                        document.getElementById('previewContent').innerHTML =
+                            '<p class="placeholder" style="color:var(--ok);text-align:center;padding:44px 0">✓ Export complete (' + (j.rows || '') + ' rows) — file downloaded.</p>';
+                        showMessage('previewMessage', '✓ Excel file downloaded successfully!', 'success');
+                    } else {
+                        showMessage('previewMessage', j.error || 'Generation failed', 'error');
+                        showLoading('previewContent', false);
+                    }
+                })
+                .catch(() => setTimeout(() => pollJob(id), 2500));  // transient poll error -> retry
         }
 
         function showLoading(elementId, show) {
