@@ -3,331 +3,164 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Listenfirst Media Tools - Title Data Automation</title>
+    <title>Title Data Automation · Ramesh Goswami</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+        :root{
+            --bg:#0b0d17; --bg2:#0e1120;
+            --card:rgba(255,255,255,.05); --card-brd:rgba(255,255,255,.09);
+            --text:#eef1f7; --muted:#9aa3b2; --faint:#6b7385;
+            --brand1:#7c5cff; --brand2:#22d3ee; --brand3:#f472b6;
+            --ok:#34d399; --okbg:rgba(52,211,153,.12);
+            --err:#fb7185; --errbg:rgba(251,113,133,.12);
+            --radius:18px; --radius-sm:12px;
         }
-
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
+        *{margin:0;padding:0;box-sizing:border-box}
+        html{scroll-behavior:smooth}
+        body{
+            font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+            color:var(--text);
+            min-height:100vh;
+            background:radial-gradient(1200px 700px at 12% -10%,rgba(124,92,255,.28),transparent 60%),
+                       radial-gradient(1000px 600px at 100% 0%,rgba(34,211,238,.18),transparent 55%),
+                       radial-gradient(900px 700px at 80% 110%,rgba(244,114,182,.16),transparent 55%),
+                       linear-gradient(180deg,var(--bg),var(--bg2));
+            background-attachment:fixed;
+            padding:0 20px 60px;
+            -webkit-font-smoothing:antialiased;
         }
-
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-
-        header {
-            text-align: center;
-            color: white;
-            margin-bottom: 40px;
-            padding-top: 20px;
-        }
-
-        header h1 {
-            font-size: 2.5em;
-            margin-bottom: 10px;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
-        }
-
-        header p {
-            font-size: 1.1em;
-            opacity: 0.9;
-        }
-
-        .main-content {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 30px;
-            margin-bottom: 30px;
-        }
-
-        .card {
-            background: white;
-            border-radius: 12px;
-            padding: 30px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
-            transition: transform 0.3s ease, box-shadow 0.3s ease;
-        }
-
-        .card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 15px 50px rgba(0,0,0,0.2);
-        }
-
-        .card h2 {
-            color: #667eea;
-            margin-bottom: 20px;
-            font-size: 1.5em;
-        }
-
-        .form-group {
-            margin-bottom: 20px;
-        }
-
-        label {
-            display: block;
-            margin-bottom: 8px;
-            color: #333;
-            font-weight: 500;
-        }
-
-        textarea, select {
-            width: 100%;
-            padding: 12px;
-            border: 2px solid #e0e0e0;
-            border-radius: 8px;
-            font-family: 'Courier New', monospace;
-            font-size: 14px;
-            resize: vertical;
-            transition: border-color 0.3s ease;
-        }
-
-        textarea:focus, select:focus {
-            outline: none;
-            border-color: #667eea;
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-        }
-
-        textarea {
-            min-height: 200px;
-        }
-
-        .checkbox-group {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-
-        input[type="checkbox"] {
-            width: 20px;
-            height: 20px;
-            cursor: pointer;
-        }
-
-        .preview-section {
-            background: #f8f9fa;
-            border-radius: 8px;
-            padding: 20px;
-            margin-top: 20px;
-            max-height: 400px;
-            overflow-y: auto;
-        }
-
-        .preview-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 12px;
-        }
-
-        .preview-table th {
-            background: #667eea;
-            color: white;
-            padding: 10px;
-            text-align: left;
-            position: sticky;
-            top: 0;
-        }
-
-        .preview-table td {
-            padding: 8px;
-            border-bottom: 1px solid #e0e0e0;
-        }
-
-        .preview-table tr:hover {
-            background: #f0f0f0;
-        }
-
-        .button-group {
-            display: flex;
-            gap: 12px;
-            margin-top: 20px;
-        }
-
-        button {
-            flex: 1;
-            padding: 12px 24px;
-            border: none;
-            border-radius: 8px;
-            font-size: 1em;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-
-        .btn-primary {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-        }
-
-        .btn-primary:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
-        }
-
-        .btn-secondary {
-            background: #f0f0f0;
-            color: #333;
-            border: 2px solid #e0e0e0;
-        }
-
-        .btn-secondary:hover {
-            background: #e8e8e8;
-            border-color: #667eea;
-            color: #667eea;
-        }
-
-        .stats {
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 8px;
-            margin-top: 15px;
-            text-align: center;
-        }
-
-        .stat-item {
-            display: inline-block;
-            margin-right: 30px;
-        }
-
-        .stat-value {
-            font-size: 1.5em;
-            font-weight: bold;
-            color: #667eea;
-        }
-
-        .stat-label {
-            font-size: 0.9em;
-            color: #666;
-            margin-top: 5px;
-        }
-
-        .loading {
-            display: none;
-            text-align: center;
-            padding: 20px;
-        }
-
-        .spinner {
-            border: 4px solid #f3f3f3;
-            border-top: 4px solid #667eea;
-            border-radius: 50%;
-            width: 40px;
-            height: 40px;
-            animation: spin 1s linear infinite;
-            margin: 0 auto 10px;
-        }
-
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-
-        .message {
-            padding: 15px;
-            border-radius: 8px;
-            margin-top: 15px;
-            display: none;
-        }
-
-        .message.success {
-            background: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
-            display: block;
-        }
-
-        .message.error {
-            background: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-            display: block;
-        }
-
-        .file-upload {
-            position: relative;
-            display: inline-block;
-            width: 100%;
-        }
-
-        .file-upload input[type='file'] {
-            display: none;
-        }
-
-        .file-upload-label {
-            display: block;
-            padding: 12px;
-            background: #f0f0f0;
-            border: 2px dashed #667eea;
-            border-radius: 8px;
-            text-align: center;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-
-        .file-upload-label:hover {
-            background: #e8e8ff;
-            border-color: #764ba2;
-        }
-
-        @media (max-width: 768px) {
-            .main-content {
-                grid-template-columns: 1fr;
-            }
-
-            header h1 {
-                font-size: 1.8em;
-            }
-
-            .button-group {
-                flex-direction: column;
-            }
-        }
-
-        .footer {
-            text-align: center;
-            color: white;
-            margin-top: 40px;
-            padding: 20px;
-            opacity: 0.8;
-        }
+        .wrap{max-width:1240px;margin:0 auto}
+        /* NAV */
+        nav{display:flex;align-items:center;justify-content:space-between;padding:22px 4px;position:sticky;top:0;z-index:20;
+            backdrop-filter:blur(8px)}
+        .brand{display:flex;align-items:center;gap:12px;font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:1.15rem;letter-spacing:.2px}
+        .logo{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;font-size:20px;
+            background:linear-gradient(135deg,var(--brand1),var(--brand3));box-shadow:0 8px 24px rgba(124,92,255,.45)}
+        .nav-pill{font-size:.78rem;color:var(--muted);border:1px solid var(--card-brd);padding:7px 14px;border-radius:999px;background:var(--card)}
+        .nav-links{display:flex;gap:10px;align-items:center}
+        /* HERO */
+        header.hero{text-align:center;padding:34px 0 30px}
+        .eyebrow{display:inline-flex;align-items:center;gap:8px;font-size:.76rem;font-weight:600;letter-spacing:.14em;text-transform:uppercase;
+            color:var(--brand2);border:1px solid var(--card-brd);padding:7px 16px;border-radius:999px;background:var(--card);margin-bottom:20px}
+        .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 12px var(--ok)}
+        header.hero h1{font-family:'Space Grotesk',sans-serif;font-size:clamp(2rem,5vw,3.4rem);line-height:1.05;font-weight:700;letter-spacing:-.5px}
+        header.hero h1 .grad{background:linear-gradient(100deg,var(--brand1),var(--brand2) 55%,var(--brand3));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+        header.hero p{color:var(--muted);max-width:600px;margin:16px auto 0;font-size:1.05rem;line-height:1.6}
+        /* GRID */
+        .main-content{display:grid;grid-template-columns:1fr 1.05fr;gap:24px;margin-top:14px}
+        .card{background:var(--card);border:1px solid var(--card-brd);border-radius:var(--radius);padding:28px;
+            backdrop-filter:blur(14px);box-shadow:0 24px 60px -30px rgba(0,0,0,.7);position:relative}
+        .card-head{display:flex;align-items:center;gap:12px;margin-bottom:22px}
+        .card-head .ic{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;font-size:17px;
+            background:linear-gradient(135deg,rgba(124,92,255,.25),rgba(34,211,238,.2));border:1px solid var(--card-brd)}
+        .card-head h2{font-family:'Space Grotesk',sans-serif;font-size:1.15rem;font-weight:600}
+        .card-head .sub{font-size:.8rem;color:var(--faint);margin-top:2px}
+        .form-group{margin-bottom:20px}
+        label.lbl{display:block;margin-bottom:9px;font-size:.82rem;font-weight:600;color:var(--muted);letter-spacing:.02em}
+        textarea,select{width:100%;padding:13px 15px;border:1px solid var(--card-brd);border-radius:var(--radius-sm);
+            background:rgba(255,255,255,.03);color:var(--text);font-family:inherit;font-size:.92rem;transition:.2s;outline:none}
+        textarea{min-height:180px;resize:vertical;font-family:'Inter',monospace;line-height:1.5}
+        textarea::placeholder{color:var(--faint)}
+        select{appearance:none;cursor:pointer;
+            background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%239aa3b2' stroke-width='2.5'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+            background-repeat:no-repeat;background-position:right 14px center;padding-right:40px}
+        textarea:focus,select:focus{border-color:var(--brand1);box-shadow:0 0 0 3px rgba(124,92,255,.22);background:rgba(255,255,255,.05)}
+        select option{background:#141826;color:var(--text)}
+        /* toggles */
+        .toggle{display:flex;align-items:center;gap:13px;cursor:pointer;user-select:none;padding:12px 14px;border:1px solid var(--card-brd);
+            border-radius:var(--radius-sm);background:rgba(255,255,255,.02);transition:.2s}
+        .toggle:hover{background:rgba(255,255,255,.05);border-color:rgba(124,92,255,.4)}
+        .toggle input{position:absolute;opacity:0;width:0;height:0}
+        .slider{flex:none;width:44px;height:25px;border-radius:999px;background:rgba(255,255,255,.14);position:relative;transition:.25s}
+        .slider::after{content:'';position:absolute;top:3px;left:3px;width:19px;height:19px;border-radius:50%;background:#fff;transition:.25s}
+        .toggle input:checked+.slider{background:linear-gradient(135deg,var(--brand1),var(--brand2))}
+        .toggle input:checked+.slider::after{transform:translateX(19px)}
+        .toggle .t-txt{font-size:.9rem;font-weight:500}
+        .toggle .t-sub{display:block;font-size:.76rem;color:var(--faint);margin-top:3px;font-weight:400;line-height:1.45}
+        /* dropzone */
+        .file-upload{position:relative}
+        .file-upload input[type='file']{display:none}
+        .file-upload-label{display:flex;flex-direction:column;align-items:center;gap:8px;padding:34px 20px;border:1.5px dashed rgba(124,92,255,.45);
+            border-radius:var(--radius-sm);text-align:center;cursor:pointer;transition:.2s;background:rgba(124,92,255,.05);color:var(--muted);font-size:.9rem}
+        .file-upload-label:hover{background:rgba(124,92,255,.1);border-color:var(--brand1);color:var(--text)}
+        
+        .hint{color:var(--faint);font-size:.78rem;margin-top:9px;display:block;line-height:1.5}
+        /* buttons */
+        .button-group{display:flex;gap:12px;margin-top:24px}
+        button{flex:1;padding:13px 22px;border:none;border-radius:var(--radius-sm);font-size:.92rem;font-weight:600;font-family:inherit;
+            cursor:pointer;transition:.2s;display:inline-flex;align-items:center;justify-content:center;gap:8px}
+        .btn-primary{color:#fff;background:linear-gradient(135deg,var(--brand1),var(--brand3));box-shadow:0 12px 30px -10px rgba(124,92,255,.7)}
+        .btn-primary:hover{transform:translateY(-2px);box-shadow:0 16px 40px -10px rgba(124,92,255,.85)}
+        .btn-secondary{background:rgba(255,255,255,.05);color:var(--muted);border:1px solid var(--card-brd)}
+        .btn-secondary:hover{background:rgba(255,255,255,.09);color:var(--text)}
+        .btn-download{width:100%;margin-top:6px;background:linear-gradient(135deg,var(--ok),#059669);color:#04150f;box-shadow:0 12px 30px -12px rgba(52,211,153,.7)}
+        .btn-download:hover{transform:translateY(-2px)}
+        /* messages */
+        .message{padding:13px 16px;border-radius:var(--radius-sm);margin-top:16px;display:none;font-size:.86rem;font-weight:500}
+        .message.success{display:block;background:var(--okbg);color:var(--ok);border:1px solid rgba(52,211,153,.3)}
+        .message.error{display:block;background:var(--errbg);color:var(--err);border:1px solid rgba(251,113,133,.3)}
+        /* preview */
+        #previewContent .placeholder{color:var(--faint);text-align:center;padding:56px 0;font-size:.92rem}
+        .preview-section{background:rgba(0,0,0,.25);border:1px solid var(--card-brd);border-radius:var(--radius-sm);padding:6px;margin-top:6px;max-height:420px;overflow:auto}
+        .preview-table{width:100%;border-collapse:collapse;font-size:.72rem}
+        .preview-table th{background:rgba(124,92,255,.22);color:#e8e2ff;padding:9px 11px;text-align:left;position:sticky;top:0;white-space:nowrap;font-weight:600;backdrop-filter:blur(6px)}
+        .preview-table td{padding:8px 11px;border-bottom:1px solid rgba(255,255,255,.06);color:var(--muted);white-space:nowrap}
+        .preview-table tr:hover td{background:rgba(255,255,255,.03);color:var(--text)}
+        .stats{display:flex;gap:14px;margin-top:18px}
+        .stat-item{flex:1;background:rgba(255,255,255,.04);border:1px solid var(--card-brd);border-radius:var(--radius-sm);padding:16px;text-align:center}
+        .stat-value{font-family:'Space Grotesk',sans-serif;font-size:1.8rem;font-weight:700;
+            background:linear-gradient(135deg,var(--brand2),var(--brand1));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+        .stat-label{font-size:.74rem;color:var(--faint);margin-top:4px;text-transform:uppercase;letter-spacing:.08em}
+        .loading{display:flex;flex-direction:column;align-items:center;gap:14px;padding:56px 0;color:var(--muted)}
+        .spinner{width:42px;height:42px;border-radius:50%;border:3px solid rgba(255,255,255,.1);border-top-color:var(--brand1);animation:spin .8s linear infinite}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        .footer{text-align:center;color:var(--faint);margin-top:46px;padding:22px;font-size:.85rem}
+        .footer .grad{background:linear-gradient(100deg,var(--brand1),var(--brand3));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;font-weight:600}
+        @media(max-width:900px){.main-content{grid-template-columns:1fr}.nav-links{display:none}}
     </style>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>📊 Title Data Automation Tool</h1>
-            <p>Automatically generate metadata-rich Excel files for movies and TV shows</p>
+    <div class="wrap">
+        <nav>
+            <div class="brand"><span class="logo">🎬</span> TitleForge</div>
+            <div class="nav-links">
+                <a class="nav-pill" href="/" style="text-decoration:none;color:#fff;background:linear-gradient(135deg,var(--brand1),var(--brand3));border:none">Generator</a>
+                <a class="nav-pill" href="/validator" style="text-decoration:none">Validator</a>
+                <span class="nav-pill">Ramesh Goswami</span>
+            </div>
+        </nav>
+
+        <header class="hero">
+            <span class="eyebrow"><span class="dot"></span> Metadata Automation Engine</span>
+            <h1>Turn a list of titles into<br><span class="grad">ingestion-ready metadata</span></h1>
+            <p>Paste titles or drop a file. Auto-discover networks, genres, social handles, IMDb &amp; more — then export a clean, fully-formatted Excel in one click.</p>
         </header>
 
         <div class="main-content">
             <!-- Input Section -->
             <div class="card">
-                <h2>📝 Input Titles</h2>
-                
+                <div class="card-head">
+                    <span class="ic">✍️</span>
+                    <div><h2>Input Titles</h2><div class="sub">Manual list or CSV / Excel upload</div></div>
+                </div>
+
                 <div class="form-group">
-                    <label>How would you like to input titles?</label>
+                    <label class="lbl">Input method</label>
                     <select id="inputMethod" onchange="toggleInputMethod()">
                         <option value="manual">Manual Entry (Paste List)</option>
-                        <option value="file">Upload CSV/Excel File</option>
+                        <option value="file">Upload CSV / Excel File</option>
                     </select>
                 </div>
 
-                <!-- Manual Entry -->
                 <div id="manualInput">
                     <div class="form-group">
-                        <label>Enter titles (one per line):</label>
+                        <label class="lbl">Titles (one per line)</label>
                         <textarea id="titlesList" placeholder="Cookie Queens&#10;Cruel Hands&#10;Elijah Peel&#10;..."></textarea>
                     </div>
-
                     <div class="form-group">
-                        <label>Title Type (applies to all):</label>
+                        <label class="lbl">Title type (applies to all)</label>
                         <select id="titleType">
                             <option value="movie">Movies</option>
                             <option value="tvshow">TV Shows</option>
@@ -336,83 +169,62 @@
                     </div>
                 </div>
 
-                <!-- File Upload -->
-                <div id="fileInput" style="display: none;">
+                <div id="fileInput" style="display:none">
                     <div class="form-group">
-                        <label>Upload CSV/Excel file:</label>
+                        <label class="lbl">Upload CSV / Excel file</label>
                         <div class="file-upload">
                             <input type="file" id="fileUpload" accept=".csv,.xlsx,.xls">
-                            <label for="fileUpload" class="file-upload-label">
-                                📁 Click to select or drag file here
-                            </label>
+                            <label for="fileUpload" class="file-upload-label">Click to select or drag file here</label>
                         </div>
-                        <small style="color: #666; margin-top: 10px; display: block;">
-                            Expected format: Single column with title names, or CSV with 'title' and 'type' columns
-                        </small>
+                        <span class="hint">Single column of title names, or a full export with a <b>title</b> column.</span>
                     </div>
                 </div>
 
                 <div class="form-group">
-                    <div class="checkbox-group">
-                        <input type="checkbox" id="includeDar" checked>
-                        <label for="includeDar" style="margin: 0;">Create both regular and DAR versions</label>
-                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" id="includeDar" checked><span class="slider"></span>
+                        <span class="t-txt">Create both regular and DAR versions</span>
+                    </label>
                 </div>
 
                 <div class="form-group">
-                    <div class="checkbox-group">
-                        <input type="checkbox" id="autoFetch">
-                        <label for="autoFetch" style="margin: 0;">Auto-discover handles &amp; IDs from title (via Wikidata)</label>
-                    </div>
-                    <small style="color:#666;display:block;margin-top:6px;">
-                        Looks up IMDb, Rotten Tomatoes, Metacritic, Wikipedia and official
-                        social accounts (Twitter/Instagram/Facebook/YouTube/TikTok) for each title.
-                        Adds a few seconds per title.
-                    </small>
+                    <label class="toggle">
+                        <input type="checkbox" id="autoFetch"><span class="slider"></span>
+                        <span class="t-txt">Auto-discover handles &amp; IDs from title
+                            <span class="t-sub">Looks up IMDb, Rotten Tomatoes, Metacritic, Wikipedia and social accounts via Wikidata. Adds a few seconds per title.</span>
+                        </span>
+                    </label>
                 </div>
 
                 <div class="button-group">
                     <button class="btn-primary" onclick="previewData()">👁️ Preview</button>
                     <button class="btn-secondary" onclick="resetForm()">↻ Reset</button>
                 </div>
-
                 <div id="inputMessage" class="message"></div>
             </div>
 
             <!-- Preview Section -->
             <div class="card">
-                <h2>👀 Data Preview</h2>
-                
+                <div class="card-head">
+                    <span class="ic">📊</span>
+                    <div><h2>Data Preview</h2><div class="sub">See exactly how your export will look</div></div>
+                </div>
                 <div id="previewContent">
-                    <p style="color: #999; text-align: center; padding: 40px 0;">
-                        Click "Preview" to see how your data will be formatted
-                    </p>
+                    <p class="placeholder">Click “Preview” to see how your data will be formatted.</p>
                 </div>
-
-                <div id="previewStats" class="stats" style="display: none;">
-                    <div class="stat-item">
-                        <div class="stat-value" id="totalRows">0</div>
-                        <div class="stat-label">Total Rows</div>
-                    </div>
-                    <div class="stat-item">
-                        <div class="stat-value" id="totalTitles">0</div>
-                        <div class="stat-label">Unique Titles</div>
-                    </div>
+                <div id="previewStats" class="stats" style="display:none">
+                    <div class="stat-item"><div class="stat-value" id="totalRows">0</div><div class="stat-label">Total Rows</div></div>
+                    <div class="stat-item"><div class="stat-value" id="totalTitles">0</div><div class="stat-label">Unique Titles</div></div>
                 </div>
-
                 <div class="button-group">
-                    <button class="btn-primary" onclick="generateExcel()" style="display: none;" id="generateBtn">⬇️ Download Excel</button>
+                    <button class="btn-download" onclick="generateExcel()" style="display:none" id="generateBtn">⬇️ Download Excel</button>
                 </div>
-
                 <div id="previewMessage" class="message"></div>
             </div>
         </div>
 
-        <footer class="footer">
-            <p>🚀 Powered by Ramesh Goswami | Automation at Scale</p>
-        </footer>
+        <footer class="footer">🚀 Powered by <span class="grad">Ramesh Goswami</span> · Automation at Scale</footer>
     </div>
-
     <script>
         function toggleInputMethod() {
             const method = document.getElementById('inputMethod').value;
@@ -606,5 +418,6 @@
             document.getElementById('previewMessage').className = 'message';
         }
     </script>
+
 </body>
 </html>
