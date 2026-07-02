@@ -2,6 +2,7 @@ from flask import Flask, render_template, request, jsonify, send_file
 import pandas as pd
 from io import BytesIO
 from datetime import datetime
+import re
 import logging
 
 try:
@@ -38,20 +39,61 @@ SOCIAL_COLUMNS = [
     'pinterest_board',
 ]
 
+# Fixed keyword tail used in twitter_search_term_keywords (derived from Test_Run)
+_KEYWORDS = ('"all new" or episode or watch or tv or show or series or season or '
+             'binge or stream or film or movie or premiere or screening or feature '
+             'or trailer or teaser or theater or release')
+
+
+def _alnum(s):
+    """Lowercase and strip everything except letters/digits (for hashtags)."""
+    return re.sub(r'[^a-z0-9]', '', (s or '').lower())
+
+
+def generate_search_terms(clean_title, network, year, is_dar):
+    """Generate twitter_search_terms (AL) and twitter_search_term_keywords (AN)
+    following the exact pattern observed in the Test_Run export.
+    """
+    label = "DAR" if is_dar else "Operations - Core Title"
+    t_hash = _alnum(clean_title)
+    n_hash = _alnum(network)
+
+    # twitter_search_terms
+    lines = [f"#{t_hash}|{label}|{label}"]
+    if n_hash:
+        lines.append(f"#{t_hash}{n_hash}|{label}|{label}")
+    terms = "\n".join(lines)
+
+    # twitter_search_term_keywords
+    inner = []
+    if network:
+        inner.append(f'"{network.lower()}" or @{n_hash} or #{n_hash}')
+    if year:
+        inner.append(f'"{year}"')
+    inner.append(_KEYWORDS)
+    clause = "(" + " or ".join(inner) + ")"
+    kw = f'("{clean_title.lower()}") {clause}|{label}|{label}'
+    if is_dar:
+        kw += "|2021-01-01"
+    return terms, kw
+
 
 def create_row(title, is_movie, network="", metadata=None):
     """Create a data row for a title - ALL 42 COLUMNS POPULATED.
 
     Any value present in `metadata` overrides the computed default, so an
-    uploaded row's social-media channels (and every other field) are preserved.
+    uploaded row's channels (and every other field) are preserved.
+    `companies` follows the effective network; search-term columns are
+    generated when not already supplied.
     """
+    metadata = metadata or {}
     is_dar = " - DAR" in title
+    clean_title = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
     title_category = "Movies" if is_movie else "TV Shows"
 
-    if metadata is None:
-        metadata = {}
+    # Effective network = discovered/explicit network, else the passed arg
+    eff_network = (str(metadata.get('network') or network or '')).strip()
 
-    # companies = network for non-DAR, Pristine Brand for DAR
     if is_dar:
         companies = "Pristine Brand"
         if is_movie:
@@ -59,23 +101,34 @@ def create_row(title, is_movie, network="", metadata=None):
         else:
             brand_set = "Pristine DAR Brands"
     else:
-        companies = network if network else "Unknown"
+        companies = eff_network if eff_network else "Unknown"
         brand_set = "Competitive View"
 
+    # Release year for search-term generation
+    rel = str(metadata.get('released_on') or metadata.get('title_created_date') or '')
+    year = rel[:4] if rel[:4].isdigit() else ''
+
+    gen_terms, gen_keywords = generate_search_terms(clean_title, eff_network, year, is_dar)
+
+    def mv(key, default=''):
+        """metadata value, falling back to default when missing OR blank."""
+        v = metadata.get(key, '')
+        return v if v not in (None, '') else default
+
     row = {
-        'record_type': metadata.get('record_type', 'INGESTED'),
+        'record_type': mv('record_type', 'INGESTED'),
         'brand_id': metadata.get('brand_id', ''),
         'title': title,
-        'title_created_date': metadata.get('title_created_date', datetime.now().strftime('%Y-%m-%d')),
-        'title_category': metadata.get('title_category', title_category),
-        'title_sub_category': metadata.get('title_sub_category', 'Release - Limited\nStudio - Independent'),
+        'title_created_date': mv('title_created_date', datetime.now().strftime('%Y-%m-%d')),
+        'title_category': mv('title_category', title_category),
+        'title_sub_category': mv('title_sub_category', 'Release - Limited\nStudio - Independent'),
         'genre': metadata.get('genre', ''),
         'primary_genre': metadata.get('primary_genre', ''),
         'iso_mic': metadata.get('iso_mic', ''),
         'stock_exchange': metadata.get('stock_exchange', ''),
         'ticker_symbol': metadata.get('ticker_symbol', ''),
-        'companies': metadata.get('companies', companies),
-        'brand_set': metadata.get('brand_set', brand_set),
+        'companies': mv('companies', companies),
+        'brand_set': mv('brand_set', brand_set),
         'composite_brand_set': metadata.get('composite_brand_set', ''),
         'active': metadata.get('active', True),
         'released_on': metadata.get('released_on', ''),
@@ -83,7 +136,7 @@ def create_row(title, is_movie, network="", metadata=None):
         'domestic_opening_weekend_screens': metadata.get('domestic_opening_weekend_screens', ''),
         'domestic_opening_weekend_rank': metadata.get('domestic_opening_weekend_rank', ''),
         'street_date': metadata.get('street_date', ''),
-        'network': metadata.get('network', network),
+        'network': eff_network,
         'facebook_page': metadata.get('facebook_page', ''),
         'facebook_verified': metadata.get('facebook_verified', ''),
         'twitter_handle': metadata.get('twitter_handle', ''),
@@ -100,10 +153,9 @@ def create_row(title, is_movie, network="", metadata=None):
         'rottentomatoes': metadata.get('rottentomatoes', ''),
         'imdb_id': metadata.get('imdb_id', ''),
         'metacritic': metadata.get('metacritic', ''),
-        # previously missing columns
-        'twitter_search_terms': metadata.get('twitter_search_terms', ''),
+        'twitter_search_terms': mv('twitter_search_terms', gen_terms),
         'instagram_business_hashtags': metadata.get('instagram_business_hashtags', ''),
-        'twitter_search_term_keywords': metadata.get('twitter_search_term_keywords', ''),
+        'twitter_search_term_keywords': mv('twitter_search_term_keywords', gen_keywords),
         'url_managers': metadata.get('url_managers', ''),
         'last_reviewed': metadata.get('last_reviewed', ''),
     }
@@ -118,7 +170,6 @@ def _read_upload(file_storage):
         df = pd.read_csv(file_storage)
     else:
         df = pd.read_excel(file_storage, engine='openpyxl')
-    # Normalise column names and blank out NaNs
     df.columns = [str(c).strip() for c in df.columns]
     df = df.where(pd.notnull(df), '')
     return df
@@ -126,9 +177,7 @@ def _read_upload(file_storage):
 
 def _merge_meta(base_meta, title, auto_fetch):
     """Overlay auto-discovered metadata under any explicit metadata.
-
-    Explicit values (from the upload / request) always win; auto-discovery
-    only fills fields that are missing or blank.
+    Explicit values always win; auto-discovery only fills missing/blank fields.
     """
     if not auto_fetch:
         return base_meta or {}
@@ -141,40 +190,22 @@ def _merge_meta(base_meta, title, auto_fetch):
 
 
 def build_rows_from_upload(file_storage, include_dar, auto_fetch=False):
-    """Turn an uploaded file into fully-populated rows.
-
-    * Full-schema files (already containing social channels / record_type) are
-      passed through with every column preserved -- this is what carries the
-      social-media channels from the test run into the output.
-    * Simple title-list files (just a `title` column, optionally `type`) are
-      expanded with defaults and optional DAR duplicates, like manual entry.
-    """
+    """Turn an uploaded file into fully-populated rows."""
     df = _read_upload(file_storage)
     lower_cols = {c.lower(): c for c in df.columns}
-
     has_full_schema = any(col in lower_cols for col in SOCIAL_COLUMNS + ['record_type', 'brand_id'])
 
     rows = []
     if has_full_schema:
-        # Preserve everything: reindex to the canonical 42 columns.
-        # Existing columns (incl. all social channels) keep their values;
-        # any of the 42 that are absent are added as blanks.
         rename_map = {lower_cols[c.lower()]: c for c in COLUMNS if c.lower() in lower_cols}
         df = df.rename(columns=rename_map)
         df = df.reindex(columns=COLUMNS)
         df = df.where(pd.notnull(df), '')
-        # Fill sensible defaults only where blank
         df['record_type'] = df['record_type'].replace('', 'INGESTED')
         rows = df.to_dict('records')
         if auto_fetch:
-            # fill blank social/ID fields from Wikidata, keeping existing values
-            filled = []
-            for r in rows:
-                merged = _merge_meta(r, str(r.get('title', '')), auto_fetch=True)
-                filled.append(merged)
-            rows = filled
+            rows = [_merge_meta(r, str(r.get('title', '')), True) for r in rows]
     else:
-        # Title-list mode
         title_col = lower_cols.get('title') or df.columns[0]
         type_col = lower_cols.get('type') or lower_cols.get('title_category')
         network_col = lower_cols.get('network')
@@ -237,10 +268,8 @@ def preview_data():
         rows = collect_rows()
         if not rows:
             return jsonify({'error': 'No titles provided'}), 400
-
         df = pd.DataFrame(rows)
         df = df.reindex(columns=COLUMNS).where(lambda x: pd.notnull(x), '')
-
         return jsonify({
             'total_rows': len(df),
             'preview': df.head(4).to_dict('records'),
@@ -257,14 +286,11 @@ def generate_excel():
         rows = collect_rows()
         if not rows:
             return jsonify({'error': 'No titles provided'}), 400
-
         df = pd.DataFrame(rows)
         df = df.reindex(columns=COLUMNS).where(lambda x: pd.notnull(x), '')
-
         output = BytesIO()
         df.to_excel(output, sheet_name='Sheet1', index=False)
         output.seek(0)
-
         return send_file(
             output,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
