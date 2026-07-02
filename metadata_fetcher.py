@@ -198,20 +198,8 @@ def _tmdb_pick(results, title):
     return results[0]
 
 
-def tmdb_lookup(title, is_movie):
-    if not TMDB_API_KEY:
-        return {}, None
-    kind = "movie" if is_movie else "tv"
-    search = _get_json(TMDB + "/search/" + kind, {"api_key": TMDB_API_KEY, "query": title})
-    if not search:
-        return {}, None
-    hit = _tmdb_pick(search.get("results", []), title)
-    if not hit:
-        return {}, None
-    details = _get_json(TMDB + "/" + kind + "/" + str(hit["id"]),
-                        {"api_key": TMDB_API_KEY, "append_to_response": "external_ids"})
-    if not details:
-        return {}, None
+def _tmdb_details_meta(details, kind):
+    """Map a TMDB details payload (with external_ids) to our columns + wikidata_id."""
     meta = {}
     genres = [g.get("name") for g in details.get("genres", []) if g.get("name")]
     if genres:
@@ -240,6 +228,41 @@ def tmdb_lookup(title, is_movie):
     return meta, ext.get("wikidata_id")
 
 
+def tmdb_lookup(title, is_movie):
+    """Resolve by title search (best-effort; unreliable for obscure titles)."""
+    if not TMDB_API_KEY:
+        return {}, None
+    kind = "movie" if is_movie else "tv"
+    search = _get_json(TMDB + "/search/" + kind, {"api_key": TMDB_API_KEY, "query": title})
+    if not search:
+        return {}, None
+    hit = _tmdb_pick(search.get("results", []), title)
+    if not hit:
+        return {}, None
+    details = _get_json(TMDB + "/" + kind + "/" + str(hit["id"]),
+                        {"api_key": TMDB_API_KEY, "append_to_response": "external_ids"})
+    if not details:
+        return {}, None
+    return _tmdb_details_meta(details, kind)
+
+
+def tmdb_find_by_imdb(tt):
+    """Resolve by EXACT imdb id via /find (reliable). Returns (meta, wikidata_id)."""
+    if not TMDB_API_KEY or not tt:
+        return {}, None
+    data = _get_json(TMDB + "/find/" + tt, {"api_key": TMDB_API_KEY, "external_source": "imdb_id"})
+    if not data:
+        return {}, None
+    for key, kind in (("movie_results", "movie"), ("tv_results", "tv")):
+        res = data.get(key) or []
+        if res:
+            details = _get_json(TMDB + "/" + kind + "/" + str(res[0]["id"]),
+                                {"api_key": TMDB_API_KEY, "append_to_response": "external_ids"})
+            if details:
+                return _tmdb_details_meta(details, kind)
+    return {}, None
+
+
 # ---------------- OMDb ----------------
 def _omdb_date(s):
     m = re.match(r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})", s or "")
@@ -250,16 +273,21 @@ def _omdb_date(s):
     return "%s-%02d-%02d" % (y, _MONTHS[mon], int(d)) if mon in _MONTHS else None
 
 
-def omdb_lookup(title):
-    if not OMDB_API_KEY:
+def omdb_by_id(tt):
+    """OMDb keyed by exact imdb id (API -> not IP-blocked)."""
+    if not OMDB_API_KEY or not tt:
         return {}
-    data = _get_json(OMDB, {"t": title, "apikey": OMDB_API_KEY})
+    data = _get_json(OMDB, {"i": tt, "apikey": OMDB_API_KEY})
+    return _omdb_meta(data)
+
+
+def _omdb_meta(data):
     if not data or data.get("Response") == "False":
         return {}
     meta = {}
     if data.get("imdbID"):
         meta["imdb_id"] = "http://www.imdb.com/title/" + data["imdbID"]
-    if data.get("Genre"):
+    if data.get("Genre") and data["Genre"] != "N/A":
         gs = [g.strip() for g in data["Genre"].split(",") if g.strip()]
         if gs:
             meta["genre"] = "\n".join(gs)
@@ -268,6 +296,12 @@ def omdb_lookup(title):
     if d:
         meta["released_on"] = d
     return meta
+
+
+def omdb_lookup(title):
+    if not OMDB_API_KEY:
+        return {}
+    return _omdb_meta(_get_json(OMDB, {"t": title, "apikey": OMDB_API_KEY}))
 
 
 # ---------------- Wikidata ----------------
@@ -426,7 +460,49 @@ def _fill(dst, src):
 _CACHE = {}
 
 
+def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
+    """Merge all sources keyed off an exact IMDb tt. Priority:
+    IMDb/BOM (authoritative for network/genre/release) > OMDb-by-id > TMDB-find > Wikidata."""
+    meta = {}
+    # IMDb + BOM (authoritative) -- may be blocked from datacenter IPs; fails soft
+    _fill(meta, bom_scrape(tt))        # US Domestic Distributor -> network (+opening)
+    _fill(meta, imdb_scrape(tt))       # genre + US release date (+ prod-co network)
+    # OMDb by id (reliable API) -> genre / release / imdb fallback
+    _fill(meta, omdb_by_id(tt))
+    # TMDB find by exact id -> socials, network fallback, wikidata_id
+    tmeta, wid = tmdb_find_by_imdb(tt)
+    wikidata_id = wikidata_id or wid
+    _fill(meta, tmeta)
+    # Wikidata -> wikipedia / rottentomatoes / metacritic / tiktok / youtube / pinterest
+    _fill(meta, wikidata_meta(title_hint, qid=wikidata_id))
+    if not meta.get("youtube_channel_company"):
+        _fill(meta, youtube_channel(title_hint))
+    meta.setdefault("imdb_id", "http://www.imdb.com/title/" + tt)
+    return meta
+
+
+def fetch_metadata_by_tt(tt, is_movie=True, title=""):
+    """Preferred entry point when the exact IMDb id is known (reliable)."""
+    tt = _tt(tt)
+    if not tt:
+        return {}
+    key = ("tt:" + tt, bool(is_movie))
+    if key in _CACHE:
+        return dict(_CACHE[key])
+    meta = {}
+    try:
+        meta = _enrich_by_tt(tt, is_movie, title or tt)
+    except Exception as e:  # noqa: BLE001
+        log.warning("fetch_metadata_by_tt failed for %s: %s", tt, e)
+    _CACHE[key] = dict(meta)
+    return meta
+
+
 def fetch_metadata(title, is_movie=True):
+    """Entry point when only the title is known. Resolves an IMDb id first
+    (via TMDB search / OMDb) then enriches by that id. For obscure/pre-release
+    titles the id may not resolve -- pass the imdb_id via fetch_metadata_by_tt
+    for reliable results."""
     if not title:
         return {}
     clean = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
@@ -436,30 +512,18 @@ def fetch_metadata(title, is_movie=True):
 
     meta = {}
     try:
-        tmdb_meta, wikidata_id = tmdb_lookup(clean, is_movie)
+        tmdb_meta, wid = tmdb_lookup(clean, is_movie)
         tt = _tt(tmdb_meta.get("imdb_id"))
-        omdb_meta = {}
         if not tt:
-            omdb_meta = omdb_lookup(clean)
-            tt = _tt(omdb_meta.get("imdb_id"))
-
-        # AUTHORITATIVE: IMDb + Box Office Mojo for network / genre / release
-        authoritative = {}
+            tt = _tt(omdb_lookup(clean).get("imdb_id"))
         if tt:
-            _fill(authoritative, bom_scrape(tt))     # US distributor -> network (wins)
-            _fill(authoritative, imdb_scrape(tt))    # genre + US release date
-        _fill(meta, authoritative)
-
-        # then TMDB (socials, imdb id, and genre/release/network fallback)
-        _fill(meta, tmdb_meta)
-        # Wikidata for wikipedia / RT / metacritic / tiktok / youtube / pinterest
-        _fill(meta, wikidata_meta(clean, qid=wikidata_id))
-        # OMDb fallback for the core identifiers
-        if not all(meta.get(k) for k in ("imdb_id", "genre", "released_on")):
-            _fill(meta, omdb_meta or omdb_lookup(clean))
-        # YouTube channel if still missing
-        if not meta.get("youtube_channel_company"):
-            _fill(meta, youtube_channel(clean))
+            meta = _enrich_by_tt(tt, is_movie, clean, wikidata_id=wid)
+            _fill(meta, tmdb_meta)  # socials etc. from the title match
+        else:
+            # could not resolve an id -> best effort from title-based sources
+            _fill(meta, tmdb_meta)
+            _fill(meta, wikidata_meta(clean, qid=wid))
+            _fill(meta, omdb_lookup(clean))
     except Exception as e:  # noqa: BLE001
         log.warning("fetch_metadata failed for %r: %s", title, e)
 
