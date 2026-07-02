@@ -312,7 +312,16 @@
             showLoading('previewContent', true);
 
             fetch('/api/preview', init)
-            .then(r => r.json())
+            .then(async r => {
+                if (!r.ok) {
+                    const t = await r.text().catch(() => '');
+                    if (r.status === 502 || r.status === 504 || !t) {
+                        throw new Error('The server timed out. With Auto-discover on, try fewer titles or turn it off for large files.');
+                    }
+                    throw new Error('Server error ' + r.status + (t ? ': ' + t.slice(0, 160) : ''));
+                }
+                return r.json();
+            })
             .then(data => {
                 if (data.error) {
                     showMessage('previewMessage', data.error, 'error');
@@ -321,7 +330,8 @@
 
                 displayPreview(data);
                 document.getElementById('generateBtn').style.display = 'block';
-                showMessage('previewMessage', `✓ Preview ready for ${data.total_rows} rows`, 'success');
+                const note = data.preview_limited ? ' (sample — full set is built on Download)' : '';
+                showMessage('previewMessage', `✓ Preview ready for ${data.total_rows} rows` + note, 'success');
             })
             .catch(e => {
                 showMessage('previewMessage', `Error: ${e.message}`, 'error');
@@ -377,7 +387,19 @@
             showMessage('previewMessage', 'Generating Excel file...', 'success');
 
             fetch('/api/generate', init)
-            .then(r => r.blob())
+            .then(async r => {
+                if (!r.ok) {
+                    let msg = 'Server error ' + r.status;
+                    if (r.status === 502 || r.status === 504) {
+                        msg = 'The server timed out building the file. For large uploads, turn off Auto-discover (its per-title lookups are slow on the free tier).';
+                    } else {
+                        const t = await r.text().catch(() => '');
+                        try { const j = JSON.parse(t); if (j.error) msg = j.error; } catch (_) {}
+                    }
+                    throw new Error(msg);
+                }
+                return r.blob();
+            })
             .then(blob => {
                 const url = window.URL.createObjectURL(blob);
                 const a = document.createElement('a');
