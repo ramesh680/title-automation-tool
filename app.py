@@ -1,4 +1,5 @@
 from flask import Flask, render_template, request, jsonify, send_file
+import pandas as pd
 from io import BytesIO
 import requests
 from bs4 import BeautifulSoup
