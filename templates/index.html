@@ -359,6 +359,18 @@
                     </div>
                 </div>
 
+                <div class="form-group">
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="autoFetch">
+                        <label for="autoFetch" style="margin: 0;">Auto-discover handles &amp; IDs from title (via Wikidata)</label>
+                    </div>
+                    <small style="color:#666;display:block;margin-top:6px;">
+                        Looks up IMDb, Rotten Tomatoes, Metacritic, Wikipedia and official
+                        social accounts (Twitter/Instagram/Facebook/YouTube/TikTok) for each title.
+                        Adds a few seconds per title.
+                    </small>
+                </div>
+
                 <div class="button-group">
                     <button class="btn-primary" onclick="previewData()">👁️ Preview</button>
                     <button class="btn-secondary" onclick="resetForm()">↻ Reset</button>
@@ -397,7 +409,7 @@
         </div>
 
         <footer class="footer">
-            <p>🚀 Powered by Listenfirst Media Tools | Automation at Scale</p>
+            <p>🚀 Powered by Ramesh Goswami | Automation at Scale</p>
         </footer>
     </div>
 
@@ -407,6 +419,21 @@
             document.getElementById('manualInput').style.display = method === 'manual' ? 'block' : 'none';
             document.getElementById('fileInput').style.display = method === 'file' ? 'block' : 'none';
         }
+
+        // Reflect the chosen filename in the upload label
+        document.addEventListener('DOMContentLoaded', function () {
+            const fileUpload = document.getElementById('fileUpload');
+            if (fileUpload) {
+                fileUpload.addEventListener('change', function () {
+                    const label = document.querySelector('.file-upload-label');
+                    if (this.files && this.files[0]) {
+                        label.textContent = '\uD83D\uDCC4 ' + this.files[0].name;
+                    } else {
+                        label.textContent = '\uD83D\uDCC1 Click to select or drag file here';
+                    }
+                });
+            }
+        });
 
         function getTitles() {
             const method = document.getElementById('inputMethod').value;
@@ -422,35 +449,57 @@
             return titles;
         }
 
-        function previewData() {
+        // Build the fetch options for /api/preview and /api/generate.
+        // For file uploads we send multipart/form-data so the server can read
+        // the workbook and preserve ALL columns (incl. social channels).
+        function buildRequestInit() {
+            const method = document.getElementById('inputMethod').value;
+            const includeDar = document.getElementById('includeDar').checked;
+            const autoFetch = document.getElementById('autoFetch').checked;
+            const titleType = document.getElementById('titleType').value;
+
+            if (method === 'file') {
+                const fileInput = document.getElementById('fileUpload');
+                const file = fileInput.files && fileInput.files[0];
+                if (!file) {
+                    showMessage('inputMessage', 'Please select a CSV or Excel file', 'error');
+                    return null;
+                }
+                const fd = new FormData();
+                fd.append('file', file);
+                fd.append('includeDar', includeDar);
+                fd.append('autoFetch', autoFetch);
+                fd.append('titleType', titleType);
+                // Do NOT set Content-Type; the browser sets the multipart boundary.
+                return { method: 'POST', body: fd };
+            }
+
             const titles = getTitles();
             if (titles.length === 0) {
                 showMessage('inputMessage', 'Please enter at least one title', 'error');
-                return;
+                return null;
             }
 
-            const includeDar = document.getElementById('includeDar').checked;
-            const titleType = document.getElementById('titleType').value;
-
-            const payload = {
-                titles: titles,
-                includeDar: includeDar,
-                titles_type: {}
-            };
-
+            const payload = { titles: titles, includeDar: includeDar, autoFetch: autoFetch, titles_type: {} };
             if (titleType === 'movie') {
                 titles.forEach(t => payload.titles_type[t] = 'movie');
             } else if (titleType === 'tvshow') {
                 titles.forEach(t => payload.titles_type[t] = 'tvshow');
             }
-
-            showLoading('previewContent', true);
-
-            fetch('/api/preview', {
+            return {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)
-            })
+            };
+        }
+
+        function previewData() {
+            const init = buildRequestInit();
+            if (!init) return;
+
+            showLoading('previewContent', true);
+
+            fetch('/api/preview', init)
             .then(r => r.json())
             .then(data => {
                 if (data.error) {
@@ -468,24 +517,34 @@
             .finally(() => showLoading('previewContent', false));
         }
 
+        function escapeHtml(s) {
+            return String(s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
         function displayPreview(data) {
             const preview = data.preview || [];
+            // Render ALL columns returned by the server (42 for the full schema).
             const columns = data.columns || [];
-            
-            let html = '<div class="preview-section"><table class="preview-table"><thead><tr>';
-            
-            // Show key columns only
-            const keyColumns = ['title', 'title_category', 'companies', 'brand_set', 'network', 'imdb_id'];
-            keyColumns.forEach(col => {
-                html += `<th>${col}</th>`;
+
+            let html = `<p style="color:#666;font-size:12px;margin-bottom:8px;">`
+                + `Showing all <strong>${columns.length}</strong> columns `
+                + `&bull; ${preview.length} of ${data.total_rows} rows &bull; scroll sideways &rarr;</p>`;
+            html += '<div class="preview-section"><table class="preview-table"><thead><tr>';
+
+            columns.forEach(col => {
+                html += `<th>${escapeHtml(col)}</th>`;
             });
             html += '</tr></thead><tbody>';
 
             preview.forEach(row => {
                 html += '<tr>';
-                keyColumns.forEach(col => {
-                    const val = row[col] || '';
-                    html += `<td>${String(val).substring(0, 30)}...</td>`;
+                columns.forEach(col => {
+                    let val = row[col];
+                    if (val === null || val === undefined) val = '';
+                    val = String(val).replace(/\n/g, ' ');
+                    const display = val.length > 40 ? val.substring(0, 40) + '\u2026' : val;
+                    html += `<td title="${escapeHtml(val)}">${escapeHtml(display)}</td>`;
                 });
                 html += '</tr>';
             });
@@ -499,30 +558,13 @@
         }
 
         function generateExcel() {
-            const titles = getTitles();
-            const includeDar = document.getElementById('includeDar').checked;
-            const titleType = document.getElementById('titleType').value;
-
-            const payload = {
-                titles: titles,
-                includeDar: includeDar,
-                titles_type: {}
-            };
-
-            if (titleType === 'movie') {
-                titles.forEach(t => payload.titles_type[t] = 'movie');
-            } else if (titleType === 'tvshow') {
-                titles.forEach(t => payload.titles_type[t] = 'tvshow');
-            }
+            const init = buildRequestInit();
+            if (!init) return;
 
             showLoading('previewContent', true);
             showMessage('previewMessage', 'Generating Excel file...', 'success');
 
-            fetch('/api/generate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            })
+            fetch('/api/generate', init)
             .then(r => r.blob())
             .then(blob => {
                 const url = window.URL.createObjectURL(blob);
