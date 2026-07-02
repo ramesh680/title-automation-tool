@@ -1,21 +1,14 @@
 """
 metadata_fetcher.py
 -------------------
-Auto-discover social-media handles and external IDs (IMDb, Rotten Tomatoes,
-Metacritic, Wikipedia) for a movie / TV title using free, public Wikidata APIs.
+Auto-discover metadata for a movie / TV title using free, public Wikidata APIs
+(no API key). Everything is defensive: on any failure the functions return
+empty results so the main app never breaks.
 
-No API key required. Every network call is defensive: on any failure the
-functions return empty results so the main app never breaks.
-
-Design:
-  1. wbsearchentities  -> candidate Wikidata items for the title string
-  2. Special:EntityData/<QID>.json -> the item's claims + sitelinks
-  3. Pick the best candidate whose "instance of" (P31) is a film / TV type
-  4. Map Wikidata properties -> the export's columns, formatting URLs to match
-     the style seen in the Test_Run export.
-
-The property -> column mapping and URL formats are collected in one place
-(see PROPERTY_MAP / build_metadata) so they are easy to adjust.
+Discovers: network (distributor / broadcaster / production company),
+release date, genre + primary genre, IMDb / Rotten Tomatoes / Metacritic IDs,
+Wikipedia page, and official Twitter / Instagram / Facebook / YouTube / TikTok /
+Pinterest / Threads / LinkedIn accounts.
 """
 
 import logging
@@ -24,7 +17,7 @@ import re
 try:
     import requests
     _SESSION = requests.Session()
-except Exception:  # requests should be installed, but never hard-fail on import
+except Exception:
     requests = None
     _SESSION = None
 
@@ -37,39 +30,30 @@ HEADERS = {
 }
 TIMEOUT = 12
 
-# Wikidata QIDs that count as a film / TV title (used to disambiguate search hits)
 FILM_TV_TYPES = {
-    "Q11424",    # film
-    "Q202866",   # animated film
-    "Q24856",    # film series
-    "Q93204",    # documentary film
-    "Q506240",   # television film
-    "Q5398426",  # television series
-    "Q1259759",  # miniseries
-    "Q15416",    # television program
-    "Q21191270", # television series season
-    "Q3464665",  # television series episode
-    "Q580850",   # anthology series
-    "Q1054574",  # limited series
-    "Q1667921",  # novel series (occasionally used) -- harmless
-    "Q7725310",  # series of creative works
+    "Q11424", "Q202866", "Q24856", "Q93204", "Q506240", "Q5398426",
+    "Q1259759", "Q15416", "Q21191270", "Q3464665", "Q580850", "Q1054574",
+    "Q7725310", "Q1261214", "Q1366112",
 }
 
-# Wikidata property -> internal key
+# Wikidata property -> internal key (external IDs + socials)
 PROPERTY_MAP = {
-    "P345": "imdb",            # IMDb ID (tt/nm...)
-    "P1258": "rottentomatoes", # Rotten Tomatoes ID (m/...)
-    "P1712": "metacritic",     # Metacritic ID (movie/...)
-    "P2002": "twitter",        # X/Twitter username
-    "P2003": "instagram",      # Instagram username
-    "P2013": "facebook",       # Facebook ID
-    "P2397": "youtube_id",     # YouTube channel ID (UC...)
-    "P11245": "youtube_handle",# YouTube handle (@...)
-    "P7085": "tiktok",         # TikTok username
-    "P4264": "linkedin_co",    # LinkedIn company ID
-    "P3836": "pinterest",      # Pinterest username
-    "P11892": "threads",       # Threads username
+    "P345": "imdb",
+    "P1258": "rottentomatoes",
+    "P1712": "metacritic",
+    "P2002": "twitter",
+    "P2003": "instagram",
+    "P2013": "facebook",
+    "P2397": "youtube_id",
+    "P11245": "youtube_handle",
+    "P7085": "tiktok",
+    "P4264": "linkedin_co",
+    "P3836": "pinterest",
+    "P11892": "threads",
 }
+
+# Properties whose first available value (an item QID) is used as "network"
+NETWORK_PROPS = ["P449", "P750", "P272"]  # broadcaster, distributor, production company
 
 
 def _get_json(url, params=None):
@@ -79,19 +63,15 @@ def _get_json(url, params=None):
         r = _SESSION.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         return r.json()
-    except Exception as e:  # noqa: BLE001 - never propagate network errors
+    except Exception as e:  # noqa: BLE001
         log.warning("Wikidata request failed (%s): %s", url, e)
         return None
 
 
 def _search_candidates(title, limit=6):
     data = _get_json(WIKIDATA_API, {
-        "action": "wbsearchentities",
-        "search": title,
-        "language": "en",
-        "format": "json",
-        "type": "item",
-        "limit": limit,
+        "action": "wbsearchentities", "search": title, "language": "en",
+        "format": "json", "type": "item", "limit": limit,
     })
     if not data:
         return []
@@ -105,31 +85,60 @@ def _entity(qid):
     return data.get("entities", {}).get(qid)
 
 
+def _labels(qids):
+    """Resolve a list of item QIDs to their English labels in one request."""
+    qids = [q for q in qids if q]
+    if not qids:
+        return {}
+    data = _get_json(WIKIDATA_API, {
+        "action": "wbgetentities", "ids": "|".join(qids[:50]),
+        "props": "labels", "languages": "en", "format": "json",
+    })
+    out = {}
+    if not data:
+        return out
+    for qid, ent in data.get("entities", {}).items():
+        lbl = ent.get("labels", {}).get("en", {}).get("value")
+        if lbl:
+            out[qid] = lbl
+    return out
+
+
 def _claim_values(claims, prop):
-    """Return the list of simple values for a property's claims."""
     out = []
     for c in claims.get(prop, []):
         snak = c.get("mainsnak", {})
         if snak.get("snaktype") != "value":
             continue
         val = snak.get("datavalue", {}).get("value")
-        if isinstance(val, dict) and "id" in val:      # entity reference (e.g. P31)
+        if isinstance(val, dict) and "id" in val:
             out.append(val["id"])
         elif val is not None:
             out.append(val)
     return out
 
 
+def _parse_time(val):
+    """Wikidata time value dict -> 'YYYY-MM-DD' (best effort)."""
+    if not isinstance(val, dict):
+        return None
+    m = re.match(r"[+-]?(\d{4})-(\d{2})-(\d{2})", val.get("time", ""))
+    if not m:
+        return None
+    y, mo, d = m.groups()
+    mo = "01" if mo == "00" else mo
+    d = "01" if d == "00" else d
+    return f"{y}-{mo}-{d}"
+
+
 def _is_film_or_tv(claims):
-    types = set(_claim_values(claims, "P31"))
-    return bool(types & FILM_TV_TYPES)
+    return bool(set(_claim_values(claims, "P31")) & FILM_TV_TYPES)
 
 
 def resolve_entity(title):
-    """Return (qid, entity_dict) for the best film/TV match, or (None, None)."""
-    candidates = _search_candidates(title)
+    """Return (qid, entity) for the best film/TV match, else (None, None)."""
     fallback = None
-    for qid in candidates:
+    for qid in _search_candidates(title):
         ent = _entity(qid)
         if not ent:
             continue
@@ -141,16 +150,7 @@ def resolve_entity(title):
 
 
 def build_metadata(title, entity):
-    """Map a Wikidata entity to export columns. Returns a dict of column->value.
-
-    URL formats mirror the style seen in the Test_Run export:
-      imdb_id        -> http://www.imdb.com/title/<ttID>
-      rottentomatoes -> http://www.rottentomatoes.com/<id>
-      metacritic     -> http://www.metacritic.com/<id>/
-      youtube_*      -> http://www.youtube.com/@<handle>  or  /channel/<UC...>
-    Handle-style fields (twitter/instagram/tiktok/pinterest) store the raw
-    username; *_page fields store full URLs.
-    """
+    """Map a Wikidata entity to export columns."""
     claims = entity.get("claims", {})
     raw = {}
     for prop, key in PROPERTY_MAP.items():
@@ -160,25 +160,22 @@ def build_metadata(title, entity):
 
     meta = {}
 
-    # External review / DB IDs
+    # External DB IDs (formatted like the Test_Run export)
     if "imdb" in raw:
         meta["imdb_id"] = f"http://www.imdb.com/title/{raw['imdb']}"
     if "rottentomatoes" in raw:
         meta["rottentomatoes"] = f"http://www.rottentomatoes.com/{raw['rottentomatoes']}"
     if "metacritic" in raw:
-        mc = raw["metacritic"].strip("/")
-        meta["metacritic"] = f"http://www.metacritic.com/{mc}/"
+        meta["metacritic"] = f"http://www.metacritic.com/{raw['metacritic'].strip('/')}/"
 
     # YouTube: prefer handle, else channel ID
     yt_url = None
     if raw.get("youtube_handle"):
-        h = raw["youtube_handle"].lstrip("@")
-        yt_url = f"http://www.youtube.com/@{h}"
+        yt_url = f"http://www.youtube.com/@{raw['youtube_handle'].lstrip('@')}"
     elif raw.get("youtube_id"):
         yt_url = f"http://www.youtube.com/channel/{raw['youtube_id']}"
     if yt_url:
         meta["youtube_channel_company"] = yt_url
-        # export pairs the channel URL with the title in the username column
         meta["youtube_channel_username"] = f"{yt_url}|{title.lower()}"
 
     # Social handles / pages
@@ -197,25 +194,54 @@ def build_metadata(title, entity):
     if "linkedin_co" in raw:
         meta["linkedin_page"] = f"http://www.linkedin.com/company/{raw['linkedin_co']}"
 
-    # Wikipedia page from sitelinks
-    sitelinks = entity.get("sitelinks", {})
-    enwiki = sitelinks.get("enwiki")
+    # Release date: publication date (P577), else start time (P580)
+    for p in ("P577", "P580"):
+        for v in _claim_values(claims, p):
+            d = _parse_time(v)
+            if d:
+                meta["released_on"] = d
+                break
+        if "released_on" in meta:
+            break
+
+    # --- Item-reference fields that need label lookups (network + genre) ---
+    to_label = []
+
+    network_qid = None
+    for p in NETWORK_PROPS:
+        vals = _claim_values(claims, p)
+        if vals:
+            network_qid = vals[0]
+            break
+    if network_qid:
+        to_label.append(network_qid)
+
+    genre_qids = _claim_values(claims, "P136")  # genre
+    to_label.extend(genre_qids)
+
+    labels = _labels(to_label) if to_label else {}
+
+    if network_qid and labels.get(network_qid):
+        meta["network"] = labels[network_qid]
+
+    genre_names = [labels[q] for q in genre_qids if labels.get(q)]
+    if genre_names:
+        meta["genre"] = "\n".join(genre_names)
+        meta["primary_genre"] = genre_names[0]
+
+    # Wikipedia page
+    enwiki = entity.get("sitelinks", {}).get("enwiki")
     if enwiki and enwiki.get("title"):
-        slug = enwiki["title"].replace(" ", "_")
-        meta["wikipedia_page"] = f"http://en.wikipedia.org/wiki/{slug}"
+        meta["wikipedia_page"] = "http://en.wikipedia.org/wiki/" + enwiki["title"].replace(" ", "_")
 
     return meta
 
 
-# simple in-process cache to avoid re-querying the same title
 _CACHE = {}
 
 
 def fetch_metadata(title):
-    """Public entry point: title string -> dict of discovered column values.
-
-    Always returns a dict (possibly empty). Never raises.
-    """
+    """title -> dict of discovered column values. Always returns a dict; never raises."""
     if not title:
         return {}
     key = title.strip().lower()
@@ -223,12 +249,10 @@ def fetch_metadata(title):
         return dict(_CACHE[key])
     result = {}
     try:
-        # strip a trailing " - DAR" so DAR variants resolve to the real title
         clean = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
         qid, entity = resolve_entity(clean)
         if entity:
             result = build_metadata(clean, entity)
-            result["_wikidata_qid"] = qid  # informational; harmless extra key
     except Exception as e:  # noqa: BLE001
         log.warning("fetch_metadata failed for %r: %s", title, e)
         result = {}
