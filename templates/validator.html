@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Workbook Validator · Ramesh Goswami</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root{
+            --bg:#0b0d17; --bg2:#0e1120;
+            --card:rgba(255,255,255,.05); --card-brd:rgba(255,255,255,.09);
+            --text:#eef1f7; --muted:#9aa3b2; --faint:#6b7385;
+            --brand1:#7c5cff; --brand2:#22d3ee; --brand3:#f472b6;
+            --ok:#34d399; --okbg:rgba(52,211,153,.12);
+            --err:#fb7185; --errbg:rgba(251,113,133,.12);
+            --radius:18px; --radius-sm:12px;
+        }
+        *{margin:0;padding:0;box-sizing:border-box}
+        html{scroll-behavior:smooth}
+        body{
+            font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+            color:var(--text);
+            min-height:100vh;
+            background:radial-gradient(1200px 700px at 12% -10%,rgba(124,92,255,.28),transparent 60%),
+                       radial-gradient(1000px 600px at 100% 0%,rgba(34,211,238,.18),transparent 55%),
+                       radial-gradient(900px 700px at 80% 110%,rgba(244,114,182,.16),transparent 55%),
+                       linear-gradient(180deg,var(--bg),var(--bg2));
+            background-attachment:fixed;
+            padding:0 20px 60px;
+            -webkit-font-smoothing:antialiased;
+        }
+        .wrap{max-width:1240px;margin:0 auto}
+        /* NAV */
+        nav{display:flex;align-items:center;justify-content:space-between;padding:22px 4px;position:sticky;top:0;z-index:20;
+            backdrop-filter:blur(8px)}
+        .brand{display:flex;align-items:center;gap:12px;font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:1.15rem;letter-spacing:.2px}
+        .logo{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;font-size:20px;
+            background:linear-gradient(135deg,var(--brand1),var(--brand3));box-shadow:0 8px 24px rgba(124,92,255,.45)}
+        .nav-pill{font-size:.78rem;color:var(--muted);border:1px solid var(--card-brd);padding:7px 14px;border-radius:999px;background:var(--card)}
+        .nav-links{display:flex;gap:10px;align-items:center}
+        /* HERO */
+        header.hero{text-align:center;padding:34px 0 30px}
+        .eyebrow{display:inline-flex;align-items:center;gap:8px;font-size:.76rem;font-weight:600;letter-spacing:.14em;text-transform:uppercase;
+            color:var(--brand2);border:1px solid var(--card-brd);padding:7px 16px;border-radius:999px;background:var(--card);margin-bottom:20px}
+        .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 12px var(--ok)}
+        header.hero h1{font-family:'Space Grotesk',sans-serif;font-size:clamp(2rem,5vw,3.4rem);line-height:1.05;font-weight:700;letter-spacing:-.5px}
+        header.hero h1 .grad{background:linear-gradient(100deg,var(--brand1),var(--brand2) 55%,var(--brand3));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+        header.hero p{color:var(--muted);max-width:600px;margin:16px auto 0;font-size:1.05rem;line-height:1.6}
+        /* GRID */
+        .main-content{display:grid;grid-template-columns:1fr 1.05fr;gap:24px;margin-top:14px}
+        .card{background:var(--card);border:1px solid var(--card-brd);border-radius:var(--radius);padding:28px;
+            backdrop-filter:blur(14px);box-shadow:0 24px 60px -30px rgba(0,0,0,.7);position:relative}
+        .card-head{display:flex;align-items:center;gap:12px;margin-bottom:22px}
+        .card-head .ic{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;font-size:17px;
+            background:linear-gradient(135deg,rgba(124,92,255,.25),rgba(34,211,238,.2));border:1px solid var(--card-brd)}
+        .card-head h2{font-family:'Space Grotesk',sans-serif;font-size:1.15rem;font-weight:600}
+        .card-head .sub{font-size:.8rem;color:var(--faint);margin-top:2px}
+        .form-group{margin-bottom:20px}
+        label.lbl{display:block;margin-bottom:9px;font-size:.82rem;font-weight:600;color:var(--muted);letter-spacing:.02em}
+        textarea,select{width:100%;padding:13px 15px;border:1px solid var(--card-brd);border-radius:var(--radius-sm);
+            background:rgba(255,255,255,.03);color:var(--text);font-family:inherit;font-size:.92rem;transition:.2s;outline:none}
+        textarea{min-height:180px;resize:vertical;font-family:'Inter',monospace;line-height:1.5}
+        textarea::placeholder{color:var(--faint)}
+        select{appearance:none;cursor:pointer;
+            background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%239aa3b2' stroke-width='2.5'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+            background-repeat:no-repeat;background-position:right 14px center;padding-right:40px}
+        textarea:focus,select:focus{border-color:var(--brand1);box-shadow:0 0 0 3px rgba(124,92,255,.22);background:rgba(255,255,255,.05)}
+        select option{background:#141826;color:var(--text)}
+        /* toggles */
+        .toggle{display:flex;align-items:center;gap:13px;cursor:pointer;user-select:none;padding:12px 14px;border:1px solid var(--card-brd);
+            border-radius:var(--radius-sm);background:rgba(255,255,255,.02);transition:.2s}
+        .toggle:hover{background:rgba(255,255,255,.05);border-color:rgba(124,92,255,.4)}
+        .toggle input{position:absolute;opacity:0;width:0;height:0}
+        .slider{flex:none;width:44px;height:25px;border-radius:999px;background:rgba(255,255,255,.14);position:relative;transition:.25s}
+        .slider::after{content:'';position:absolute;top:3px;left:3px;width:19px;height:19px;border-radius:50%;background:#fff;transition:.25s}
+        .toggle input:checked+.slider{background:linear-gradient(135deg,var(--brand1),var(--brand2))}
+        .toggle input:checked+.slider::after{transform:translateX(19px)}
+        .toggle .t-txt{font-size:.9rem;font-weight:500}
+        .toggle .t-sub{display:block;font-size:.76rem;color:var(--faint);margin-top:3px;font-weight:400;line-height:1.45}
+        /* dropzone */
+        .file-upload{position:relative}
+        .file-upload input[type='file']{display:none}
+        .file-upload-label{display:flex;flex-direction:column;align-items:center;gap:8px;padding:34px 20px;border:1.5px dashed rgba(124,92,255,.45);
+            border-radius:var(--radius-sm);text-align:center;cursor:pointer;transition:.2s;background:rgba(124,92,255,.05);color:var(--muted);font-size:.9rem}
+        .file-upload-label:hover{background:rgba(124,92,255,.1);border-color:var(--brand1);color:var(--text)}
+        
+        .hint{color:var(--faint);font-size:.78rem;margin-top:9px;display:block;line-height:1.5}
+        /* buttons */
+        .button-group{display:flex;gap:12px;margin-top:24px}
+        button{flex:1;padding:13px 22px;border:none;border-radius:var(--radius-sm);font-size:.92rem;font-weight:600;font-family:inherit;
+            cursor:pointer;transition:.2s;display:inline-flex;align-items:center;justify-content:center;gap:8px}
+        .btn-primary{color:#fff;background:linear-gradient(135deg,var(--brand1),var(--brand3));box-shadow:0 12px 30px -10px rgba(124,92,255,.7)}
+        .btn-primary:hover{transform:translateY(-2px);box-shadow:0 16px 40px -10px rgba(124,92,255,.85)}
+        .btn-secondary{background:rgba(255,255,255,.05);color:var(--muted);border:1px solid var(--card-brd)}
+        .btn-secondary:hover{background:rgba(255,255,255,.09);color:var(--text)}
+        .btn-download{width:100%;margin-top:6px;background:linear-gradient(135deg,var(--ok),#059669);color:#04150f;box-shadow:0 12px 30px -12px rgba(52,211,153,.7)}
+        .btn-download:hover{transform:translateY(-2px)}
+        /* messages */
+        .message{padding:13px 16px;border-radius:var(--radius-sm);margin-top:16px;display:none;font-size:.86rem;font-weight:500}
+        .message.success{display:block;background:var(--okbg);color:var(--ok);border:1px solid rgba(52,211,153,.3)}
+        .message.error{display:block;background:var(--errbg);color:var(--err);border:1px solid rgba(251,113,133,.3)}
+        /* preview */
+        #previewContent .placeholder{color:var(--faint);text-align:center;padding:56px 0;font-size:.92rem}
+        .preview-section{background:rgba(0,0,0,.25);border:1px solid var(--card-brd);border-radius:var(--radius-sm);padding:6px;margin-top:6px;max-height:420px;overflow:auto}
+        .preview-table{width:100%;border-collapse:collapse;font-size:.72rem}
+        .preview-table th{background:rgba(124,92,255,.22);color:#e8e2ff;padding:9px 11px;text-align:left;position:sticky;top:0;white-space:nowrap;font-weight:600;backdrop-filter:blur(6px)}
+        .preview-table td{padding:8px 11px;border-bottom:1px solid rgba(255,255,255,.06);color:var(--muted);white-space:nowrap}
+        .preview-table tr:hover td{background:rgba(255,255,255,.03);color:var(--text)}
+        .stats{display:flex;gap:14px;margin-top:18px}
+        .stat-item{flex:1;background:rgba(255,255,255,.04);border:1px solid var(--card-brd);border-radius:var(--radius-sm);padding:16px;text-align:center}
+        .stat-value{font-family:'Space Grotesk',sans-serif;font-size:1.8rem;font-weight:700;
+            background:linear-gradient(135deg,var(--brand2),var(--brand1));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+        .stat-label{font-size:.74rem;color:var(--faint);margin-top:4px;text-transform:uppercase;letter-spacing:.08em}
+        .loading{display:flex;flex-direction:column;align-items:center;gap:14px;padding:56px 0;color:var(--muted)}
+        .spinner{width:42px;height:42px;border-radius:50%;border:3px solid rgba(255,255,255,.1);border-top-color:var(--brand1);animation:spin .8s linear infinite}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        .footer{text-align:center;color:var(--faint);margin-top:46px;padding:22px;font-size:.85rem}
+        .footer .grad{background:linear-gradient(100deg,var(--brand1),var(--brand3));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;font-weight:600}
+        @media(max-width:900px){.main-content{grid-template-columns:1fr}.nav-links{display:none}}
+    </style>
+<style>
+  .val-grid{display:grid;grid-template-columns:1.15fr .85fr;gap:24px;margin-top:14px}
+  .rules-area{width:100%;min-height:320px;font-family:'Space Grotesk',ui-monospace,monospace;font-size:.8rem;
+     border:1px solid var(--card-brd);border-radius:var(--radius-sm);background:rgba(0,0,0,.28);color:#d7e0f5;padding:14px;line-height:1.5;resize:vertical;outline:none}
+  .rules-area:focus{border-color:var(--brand1);box-shadow:0 0 0 3px rgba(124,92,255,.22)}
+  .badges{display:flex;gap:12px;margin:4px 0 16px;flex-wrap:wrap}
+  .badge{flex:1;min-width:120px;border:1px solid var(--card-brd);border-radius:var(--radius-sm);padding:14px;text-align:center;background:rgba(255,255,255,.04)}
+  .badge .num{font-family:'Space Grotesk';font-size:1.7rem;font-weight:700}
+  .badge .lab{font-size:.72rem;color:var(--faint);text-transform:uppercase;letter-spacing:.08em;margin-top:3px}
+  .badge.ok .num{color:var(--ok)} .badge.fail .num{color:var(--err)} .badge.warn .num{color:#f6c453} .badge.rows .num{color:var(--brand2)}
+  .sev{display:inline-block;padding:2px 9px;border-radius:999px;font-size:.68rem;font-weight:700;text-transform:uppercase}
+  .sev.fail{background:var(--errbg);color:var(--err)} .sev.warn{background:rgba(246,196,83,.14);color:#f6c453}
+  .rule-ref{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:10px}
+  .rule-ref .r{border:1px solid var(--card-brd);border-radius:var(--radius-sm);padding:14px;background:rgba(255,255,255,.03)}
+  .rule-ref .r h4{font-family:'Space Grotesk';font-size:.82rem;color:var(--brand2);margin-bottom:6px;letter-spacing:.04em;text-transform:uppercase}
+  .rule-ref .r p{font-size:.8rem;color:var(--muted);line-height:1.5}
+  .navlink{font-size:.82rem;color:var(--muted);text-decoration:none;border:1px solid var(--card-brd);padding:7px 14px;border-radius:999px;background:var(--card);transition:.2s}
+  .navlink:hover{color:#fff;border-color:var(--brand1)} .navlink.active{color:#fff;background:linear-gradient(135deg,var(--brand1),var(--brand3));border:none}
+  @media(max-width:900px){.val-grid{grid-template-columns:1fr}.rule-ref{grid-template-columns:1fr}}
+</style>
+</head>
+
+
+
+<body>
+    <div class="wrap">
+        <nav>
+            <div class="brand"><span class="logo">🎬</span> TitleForge</div>
+            <div class="nav-links">
+                <a class="navlink" href="/">Generator</a>
+                <a class="navlink active" href="/validator">Validator</a>
+            </div>
+        </nav>
+
+        <header class="hero">
+            <span class="eyebrow"><span class="dot"></span> Data Ops Quality Gate</span>
+            <h1>Validate exports before<br><span class="grad">they ever get ingested</span></h1>
+            <p>Upload a workbook, apply your rules, and get it back with every failing cell highlighted plus a Validation Summary sheet.</p>
+        </header>
+
+        <div class="val-grid">
+            <div class="card">
+                <div class="card-head"><span class="ic">✅</span>
+                    <div><h2>Workbook Validator</h2><div class="sub">.xlsx or .csv → highlighted report</div></div></div>
+
+                <div class="form-group">
+                    <label class="lbl">Workbook file (.xlsx or .csv)</label>
+                    <div class="file-upload">
+                        <input type="file" id="valFile" accept=".csv,.xlsx,.xls">
+                        <label for="valFile" class="file-upload-label">Click to select or drag file here</label>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="lbl">Validation rules (JSON)</label>
+                    <textarea id="rulesJSON" class="rules-area" spellcheck="false">{{ default_rules }}</textarea>
+                    <span class="hint">Edit the rules or leave the defaults. Each rule = {sheet, column, check, …}.</span>
+                </div>
+
+                <div class="form-group">
+                    <label class="lbl">Optional rules file (.json)</label>
+                    <div class="file-upload">
+                        <input type="file" id="rulesFile" accept=".json">
+                        <label for="rulesFile" class="file-upload-label">Overrides the box above if provided</label>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="lbl">Run by</label>
+                    <select id="runByWrap" style="display:none"></select>
+                    <textarea id="runBy" class="rules-area" style="min-height:0;height:46px;font-family:'Inter';font-size:.9rem" placeholder="Your name or team name"></textarea>
+                </div>
+
+                <div class="button-group">
+                    <button class="btn-primary" id="validateBtn" onclick="validateWorkbook()">✅ Validate Workbook</button>
+                </div>
+                <div id="valMessage" class="message"></div>
+            </div>
+
+            <div class="card">
+                <div class="card-head"><span class="ic">📋</span>
+                    <div><h2>Results</h2><div class="sub">Summary &amp; downloadable report</div></div></div>
+                <div id="valResults">
+                    <p class="placeholder" style="color:var(--faint);text-align:center;padding:40px 0">Upload a workbook and click “Validate” to see results.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="card" style="margin-top:24px">
+            <div class="card-head"><span class="ic">📘</span><div><h2>Active validation rules</h2><div class="sub">What the default rule set checks</div></div></div>
+            <div class="rule-ref">
+                <div class="r"><h4>Required &amp; placeholders</h4><p>title must not be blank / #NA / N/A. title_category must be Movies or TV Shows.</p></div>
+                <div class="r"><h4>DAR / Competitive</h4><p>DAR titles need companies = Pristine Brand and brand_set with Pristine DAR Brands; others need Competitive View.</p></div>
+                <div class="r"><h4>IMDb &amp; Metacritic</h4><p>imdb_id must be a ttNNNNNNN / IMDb title URL; metacritic must be a metacritic.com movie/tv URL.</p></div>
+                <div class="r"><h4>Wikipedia</h4><p>wikipedia_page must be en.wikipedia.org/wiki/… and the article should match the title.</p></div>
+                <div class="r"><h4>URL managers</h4><p>url_managers must reference the row’s social accounts; Unknown &amp; Pristine Brand companies are skipped.</p></div>
+                <div class="r"><h4>Extensible</h4><p>Add / edit rules in the JSON box — the engine is data-driven per column and check type.</p></div>
+            </div>
+        </div>
+
+        <footer class="footer">🚀 Powered by <span class="grad">Ramesh Goswami</span> · Automation at Scale</footer>
+    </div>
+
+    <script>
+        function vmsg(t,type){var e=document.getElementById('valMessage');e.textContent=t;e.className='message '+(type||'');}
+        function vload(){document.getElementById('valResults').innerHTML='<div class="loading"><div class="spinner"></div><p>Validating…</p></div>';}
+        function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+        // reflect chosen filenames
+        document.addEventListener('DOMContentLoaded',function(){
+            [['valFile'],['rulesFile']].forEach(function(p){
+                var inp=document.getElementById(p[0]); if(!inp)return;
+                inp.addEventListener('change',function(){
+                    var lab=inp.parentElement.querySelector('.file-upload-label');
+                    lab.textContent=this.files&&this.files[0]?('📄 '+this.files[0].name):'Click to select or drag file here';
+                });
+            });
+        });
+
+        function validateWorkbook(){
+            var f=document.getElementById('valFile').files[0];
+            if(!f){vmsg('Please choose a workbook (.xlsx or .csv).','error');return;}
+            var fd=new FormData();
+            fd.append('file',f);
+            fd.append('rules',document.getElementById('rulesJSON').value||'');
+            var rf=document.getElementById('rulesFile').files[0]; if(rf) fd.append('rulesFile',rf);
+            fd.append('runBy',document.getElementById('runBy').value||'');
+            vload(); vmsg('Validating…','success');
+            fetch('/api/validate',{method:'POST',body:fd})
+              .then(function(r){return r.json();})
+              .then(function(d){
+                  if(d.error){vmsg(d.error,'error');document.getElementById('valResults').innerHTML='<p class="placeholder" style="color:var(--err);text-align:center;padding:40px 0">'+esc(d.error)+'</p>';return;}
+                  renderResults(d); vmsg('✓ Validation complete','success');
+              })
+              .catch(function(e){vmsg('Error: '+e.message,'error');});
+        }
+
+        function renderResults(d){
+            var s=d.summary||{}; var ok=(s.issues||0)===0;
+            var html='<div class="badges">'
+              +'<div class="badge rows"><div class="num">'+(s.total_rows||0)+'</div><div class="lab">Rows</div></div>'
+              +'<div class="badge fail"><div class="num">'+(s.fail||0)+'</div><div class="lab">Failures</div></div>'
+              +'<div class="badge warn"><div class="num">'+(s.warn||0)+'</div><div class="lab">Warnings</div></div>'
+              +'<div class="badge ok"><div class="num">'+(ok?'✓':(s.issues||0))+'</div><div class="lab">'+(ok?'All clear':'Issues')+'</div></div>'
+              +'</div>';
+            // download button
+            html+='<button class="btn-download" id="dlBtn">⬇️ Download highlighted report</button>';
+            var f=(s.failures||[]);
+            if(f.length){
+                html+='<div class="preview-section" style="margin-top:16px"><table class="preview-table"><thead><tr>'
+                    +'<th>Row</th><th>Column</th><th>Severity</th><th>Message</th><th>Value</th></tr></thead><tbody>';
+                f.slice(0,200).forEach(function(x){
+                    html+='<tr><td>'+x.row+'</td><td>'+esc(x.column)+'</td>'
+                        +'<td><span class="sev '+x.severity+'">'+x.severity+'</span></td>'
+                        +'<td>'+esc(x.message)+'</td><td title="'+esc(x.value)+'">'+esc(String(x.value).slice(0,40))+'</td></tr>';
+                });
+                html+='</tbody></table></div>';
+            } else {
+                html+='<p class="placeholder" style="color:var(--ok);text-align:center;padding:26px 0">✓ No issues found — all rules passed.</p>';
+            }
+            document.getElementById('valResults').innerHTML=html;
+            var dl=document.getElementById('dlBtn');
+            dl.onclick=function(){
+                var bin=atob(d.file_b64); var arr=new Uint8Array(bin.length);
+                for(var i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i);
+                var blob=new Blob([arr],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+                var url=URL.createObjectURL(blob); var a=document.createElement('a');
+                a.href=url; a.download=d.filename||'Validated.xlsx'; document.body.appendChild(a); a.click();
+                URL.revokeObjectURL(url); a.remove();
+            };
+        }
+    </script>
+
+</body>
+</html>
