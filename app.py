@@ -78,6 +78,59 @@ def generate_search_terms(clean_title, network, year, is_dar):
     return terms, kw
 
 
+# company / network -> manager-team lookup. POPULATED FROM repo logic (media-tools-hub).
+# Keys are lowercased network or companies names. Left empty until that mapping is wired in;
+# while empty, url_managers stays blank (no incorrect output).
+URL_MANAGER_MAP = {}
+
+
+def _first_line(v):
+    if not v:
+        return ""
+    return str(v).split("\n")[0].strip()
+
+
+def _resolve_manager(row):
+    for key in (row.get("network"), row.get("companies")):
+        m = URL_MANAGER_MAP.get((str(key) or "").strip().lower())
+        if m:
+            return m
+    return ""
+
+
+# companies values for which url_managers is NOT generated
+URL_MANAGER_SKIP_COMPANIES = {"unknown", "pristine brand"}
+
+
+def generate_url_managers(row):
+    """Build url_managers: one 'platform|value|manager' line per social present.
+    Skips titles whose companies is 'Unknown' or 'Pristine Brand'.
+    Returns '' if skipped or if no manager is resolvable.
+    """
+    companies = (str(row.get("companies")) or "").strip().lower()
+    if companies in URL_MANAGER_SKIP_COMPANIES:
+        return ""
+    manager = _resolve_manager(row)
+    if not manager:
+        return ""
+    entries = []
+    fb = row.get("facebook_page"); ig = row.get("instagram_user")
+    yt = _first_line(row.get("youtube_channel_company"))
+    tk = row.get("tiktok_user"); tw = row.get("twitter_handle")
+    if fb:
+        entries.append(f"facebook|{fb}|{manager}")
+    if ig:
+        entries.append(f"instagram|{ig}|{manager}")
+    if yt:
+        entries.append(f"youtube|{yt}|{manager}")
+    if tk:
+        entries.append(f"tiktok|{tk}|{manager}")
+    if tw:
+        entries.append(f"twitter|http://twitter.com/{tw}|{manager}")
+    return "\n".join(entries)
+
+
+
 def create_row(title, is_movie, network="", metadata=None):
     """Create a data row for a title - ALL 42 COLUMNS POPULATED.
 
@@ -159,6 +212,9 @@ def create_row(title, is_movie, network="", metadata=None):
         'url_managers': metadata.get('url_managers', ''),
         'last_reviewed': metadata.get('last_reviewed', ''),
     }
+
+    if not row.get('url_managers'):
+        row['url_managers'] = generate_url_managers(row)
 
     return row
 
