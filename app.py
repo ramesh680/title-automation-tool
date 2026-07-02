@@ -29,12 +29,8 @@ COLUMNS = [
 def search_title_data(title, is_movie=True):
     """Search for title data from IMDb and other sources"""
     try:
-        # Remove DAR from title for searching
         clean_title = title.replace(" - DAR", "").strip()
-        
-        # Search IMDb
         imdb_data = search_imdb(clean_title, is_movie)
-        
         return imdb_data
     except Exception as e:
         logging.error(f"Error searching data for {title}: {str(e)}")
@@ -43,11 +39,6 @@ def search_title_data(title, is_movie=True):
 def search_imdb(title, is_movie=True):
     """Search IMDb for title data"""
     try:
-        search_url = f"https://www.imdb.com/find?q={title}&s={'t' if is_movie else 'tt'}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        
-        # This is a simplified approach - in production, use IMDbPY or similar
-        # For now, return structured empty data
         return {
             'imdb_id': '',
             'rottentomatoes': '',
@@ -56,7 +47,12 @@ def search_imdb(title, is_movie=True):
             'genre': '',
             'primary_genre': '',
             'released_on': '',
-            'companies': 'Unknown'
+            'companies': 'Unknown',
+            'title_sub_category': 'Release - Limited\nStudio - Independent',
+            'facebook_page': '',
+            'twitter_handle': '',
+            'youtube_channel_username': '',
+            'youtube_channel_company': ''
         }
     except Exception as e:
         logging.error(f"IMDb search error: {str(e)}")
@@ -128,51 +124,6 @@ def create_row(title, is_movie, base_data=None):
 def index():
     return render_template('index.html')
 
-@app.route('/api/generate', methods=['POST'])
-def generate_excel():
-    try:
-        data = request.json
-        titles = data.get('titles', [])
-        include_dar = data.get('includeDar', True)
-        
-        if not titles:
-            return jsonify({'error': 'No titles provided'}), 400
-        
-        rows = []
-        for title in titles:
-            title = title.strip()
-            if not title:
-                continue
-            
-            is_movie = data.get('titles_type', {}).get(title, 'movie') == 'movie'
-            
-            # Regular version
-            rows.append(create_row(title, is_movie))
-            
-            # DAR version
-            if include_dar:
-                rows.append(create_row(f"{title} - DAR", is_movie))
-        
-        # Create DataFrame
-        df = pd.DataFrame(rows)
-        df = df[COLUMNS]
-        
-        # Create Excel file
-        output = BytesIO()
-        df.to_excel(output, sheet_name='Sheet1', index=False)
-        output.seek(0)
-        
-        return send_file(
-            output,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name=f'Titles_Export_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
-        )
-    
-    except Exception as e:
-        logging.error(f"Error generating Excel: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-
 @app.route('/api/preview', methods=['POST'])
 def preview_data():
     try:
@@ -184,7 +135,7 @@ def preview_data():
             return jsonify({'error': 'No titles provided'}), 400
         
         rows = []
-        for title in titles[:5]:  # Preview first 5
+        for title in titles[:5]:
             title = title.strip()
             if not title:
                 continue
@@ -206,6 +157,47 @@ def preview_data():
     
     except Exception as e:
         logging.error(f"Error previewing data: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/generate', methods=['POST'])
+def generate_excel():
+    try:
+        data = request.json
+        titles = data.get('titles', [])
+        include_dar = data.get('includeDar', True)
+        
+        if not titles:
+            return jsonify({'error': 'No titles provided'}), 400
+        
+        rows = []
+        for title in titles:
+            title = title.strip()
+            if not title:
+                continue
+            
+            is_movie = data.get('titles_type', {}).get(title, 'movie') == 'movie'
+            
+            rows.append(create_row(title, is_movie))
+            
+            if include_dar:
+                rows.append(create_row(f"{title} - DAR", is_movie))
+        
+        df = pd.DataFrame(rows)
+        df = df[COLUMNS]
+        
+        output = BytesIO()
+        df.to_excel(output, sheet_name='Sheet1', index=False)
+        output.seek(0)
+        
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=f'Titles_Export_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+        )
+    
+    except Exception as e:
+        logging.error(f"Error generating Excel: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
