@@ -189,13 +189,20 @@ def bom_scrape(tt):
 
 # ---------------- TMDB ----------------
 def _tmdb_pick(results, title):
+    """Pick the best TMDB search hit. Prefer an exact title match, and among
+    candidates choose the MOST RECENT release year -- these titles are upcoming,
+    so this avoids matching an older same-named film (e.g. a 1979 "Over the Edge")."""
     if not results:
         return None
     tl = title.strip().lower()
-    for r in results:
-        if str(r.get("title") or r.get("name") or "").strip().lower() == tl:
-            return r
-    return results[0]
+
+    def year(r):
+        d = str(r.get("release_date") or r.get("first_air_date") or "")
+        return int(d[:4]) if d[:4].isdigit() else 0
+
+    exact = [r for r in results if str(r.get("title") or r.get("name") or "").strip().lower() == tl]
+    pool = exact or results
+    return max(pool, key=year)
 
 
 def _tmdb_details_meta(details, kind):
