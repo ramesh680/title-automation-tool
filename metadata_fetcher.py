@@ -209,8 +209,15 @@ def _upcoming_meta(m):
 
 
 # ---------------- IMDb suggestion API (keyless, reliable) ----------------
-def imdb_suggest(title, is_movie=True):
-    """Resolve the IMDb tt id via IMDb's own suggestion API.
+# IMDb item type -> LF Program Type (for the TV BrandIngest schema)
+_IMDB_QID_PROGRAM_TYPE = {
+    "tvseries": "Series", "tvminiseries": "Mini-Series",
+    "tvmovie": "TV Movie", "tvspecial": "Special", "tvshort": "Special",
+}
+
+
+def imdb_suggest_item(title, is_movie=True):
+    """Best-matching item from IMDb's suggestion API (keyless), or None.
     Handles apostrophes/colons and titles that have no release yet.
     Prefers an exact title match of the right type, then the most recent year
     (these are upcoming titles, so avoid older same-named films)."""
@@ -237,7 +244,13 @@ def imdb_suggest(title, is_movie=True):
 
     best = max(items, key=score)
     # only trust it when the title actually matches
-    return best["id"] if _norm(best.get("l")) == tl else None
+    return best if _norm(best.get("l")) == tl else None
+
+
+def imdb_suggest(title, is_movie=True):
+    """Resolve just the IMDb tt id via the suggestion API."""
+    item = imdb_suggest_item(title, is_movie)
+    return item["id"] if item else None
 
 
 # ---------------- Wikipedia (keyless) ----------------
@@ -411,10 +424,18 @@ def _tmdb_details_meta(details, kind):
     rel = details.get("release_date") or details.get("first_air_date")
     if rel:
         meta["released_on"] = rel
+    if details.get("original_language"):
+        meta["original_language"] = details["original_language"]
     if kind == "tv":
         nets = [n.get("name") for n in details.get("networks", []) if n.get("name")]
         if nets:
             meta["network"] = nets[0]
+        # TMDB show type -> LF Program Type (fallback when IMDb didn't say)
+        ttype = str(details.get("type") or "").strip().lower()
+        if ttype == "miniseries":
+            meta["program_type"] = "Mini-Series"
+        elif ttype in ("scripted", "reality", "documentary", "talk show", "news", "soap"):
+            meta["program_type"] = "Series"
     pcs = [c.get("name") for c in details.get("production_companies", []) if c.get("name")]
     if pcs:
         meta["production_company"] = pcs[0]  # NOT the network; last resort only
@@ -760,7 +781,11 @@ def fetch_metadata(title, is_movie=True):
         # the upcoming-release-movies calendar resolves the tt code by exact
         # title AND supplies distributor/genre/date/scale in one shot
         um = _upcoming_index()["by_title"].get(_norm(clean)) if is_movie else None
-        tt = _tt((um or {}).get("tt_code")) or imdb_suggest(clean, is_movie)
+        sug = imdb_suggest_item(clean, is_movie) if not um else None
+        tt = _tt((um or {}).get("tt_code")) or (sug or {}).get("id")
+        # the IMDb item type gives the TV Program Type (Series / Mini-Series /
+        # TV Movie / Special) used by the BrandIngest schema
+        sug_ptype = _IMDB_QID_PROGRAM_TYPE.get(str((sug or {}).get("qid") or "").lower())
         tmdb_meta, wid = ({}, None)
         if not tt:
             tmdb_meta, wid = tmdb_lookup(clean, is_movie)
@@ -776,6 +801,8 @@ def fetch_metadata(title, is_movie=True):
             _fill(meta, tmdb_meta)
             _fill(meta, wikidata_meta(clean, qid=wid, is_movie=is_movie))
             _fill(meta, omdb_lookup(clean))
+        if sug_ptype:
+            meta["program_type"] = sug_ptype  # IMDb's own type beats TMDB's
     except Exception as e:  # noqa: BLE001
         log.warning("fetch_metadata failed for %r: %s", title, e)
 
