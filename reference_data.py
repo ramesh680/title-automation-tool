@@ -36,6 +36,7 @@ REF_DIR = os.getenv("REFERENCE_DIR",
 FILM_TEMPLATE = os.getenv("FILM_TEMPLATE", os.path.join(REF_DIR, "film_ingest_template.xlsx"))
 TV_TEMPLATE = os.getenv("TV_TEMPLATE", os.path.join(REF_DIR, "tv_ingest_template.xlsx"))
 TALENT_TEMPLATE = os.getenv("TALENT_TEMPLATE", os.path.join(REF_DIR, "talent_ingest_template.xlsx"))
+GAME_TEMPLATE = os.getenv("GAME_TEMPLATE", os.path.join(REF_DIR, "videogame_ingest_template.xlsx"))
 
 FILM_STUDIOS = {}       # studio(lower) -> dict(studio_type, youtube, company, twitter_clause, reddit_clause)
 FILM_ROLLUPS = {}       # studio(lower) -> "Roll-Up 1\nRoll-Up 2[\nRoll-Up 3]"
@@ -45,6 +46,10 @@ TV_PRIMARY_ORDER = []   # [(genre, mapped_primary), ...] in Order of Operations
 TALENT_TYPES = []       # ['Talent Type - Actor', ...]
 TALENT_SUBTYPES = []    # ['Talent Subtype - Athlete - Basketball', ...]
 TALENT_BRAND_SETS = []  # optional extra talent brand sets
+GAME_DEVELOPERS = {}    # dev(lower, no prefix) -> dict(twitter_clause, reddit_clause, youtube)
+GAME_PUBLISHERS = {}    # publisher(lower) -> dict(youtube, twitter_clause)
+GAME_GENRE_MAP = {}     # genre(lower) -> Primary Genre
+GAME_PLATFORMS = []     # ['Platform - PC', ...]
 
 LOADED = False
 
@@ -138,6 +143,39 @@ def _load_talent():
             TALENT_BRAND_SETS.append(bs)
 
 
+def _dev_key(v):
+    return _s(v).replace("Developer - ", "").strip().lower()
+
+
+def _load_game():
+    wb = openpyxl.load_workbook(GAME_TEMPLATE, data_only=True)
+    ws = wb["DropDown"]
+    for r in range(2, ws.max_row + 1):
+        dev = _s(ws.cell(r, 2).value)      # 'Developer - X'
+        if dev:
+            GAME_DEVELOPERS.setdefault(_dev_key(dev), {})["twitter_clause"] = \
+                _s(ws.cell(r, 3).value)
+        dev_r = _s(ws.cell(r, 11).value)   # reddit table
+        if dev_r:
+            GAME_DEVELOPERS.setdefault(_dev_key(dev_r), {})["reddit_clause"] = \
+                _s(ws.cell(r, 12).value)
+        dev_y = _s(ws.cell(r, 14).value)   # dev youtube table
+        if dev_y:
+            GAME_DEVELOPERS.setdefault(_dev_key(dev_y), {})["youtube"] = \
+                _s(ws.cell(r, 15).value)
+        pub = _s(ws.cell(r, 4).value)
+        if pub:
+            GAME_PUBLISHERS[pub.lower()] = dict(
+                youtube=_s(ws.cell(r, 5).value),
+                twitter_clause=_s(ws.cell(r, 6).value))
+        plat = _s(ws.cell(r, 8).value)
+        if plat and plat not in GAME_PLATFORMS:
+            GAME_PLATFORMS.append(plat)
+        g, p = _s(ws.cell(r, 9).value), _s(ws.cell(r, 10).value)
+        if g and p:
+            GAME_GENRE_MAP[g.lower()] = p
+
+
 def load():
     """(Re)load the templates. Returns True when any reference data loaded."""
     global LOADED
@@ -156,6 +194,10 @@ def load():
             _load_talent()
         else:
             log.warning("talent template not found: %s", TALENT_TEMPLATE)
+        if os.path.exists(GAME_TEMPLATE):
+            _load_game()
+        else:
+            log.warning("game template not found: %s", GAME_TEMPLATE)
         LOADED = bool(FILM_STUDIOS or TV_NETWORKS)
         log.info("reference templates loaded: %d studios, %d networks, "
                  "%d film roll-ups, %d tv conglomerates, %d genre mappings",
@@ -190,6 +232,34 @@ def tv_primary_genre(genres):
     for g, mapped in TV_PRIMARY_ORDER:
         if g in gs and mapped != "N/A":
             return mapped
+    return ""
+
+
+def game_developer(name):
+    return GAME_DEVELOPERS.get(_dev_key(name))
+
+
+def game_publisher(name):
+    return GAME_PUBLISHERS.get(_s(name).lower())
+
+
+def game_primary_genre(genre):
+    return GAME_GENRE_MAP.get(_s(genre).lower(), "")
+
+
+def game_platform_for(term):
+    """Match a discovered platform label to the template's 'Platform - X'.
+    Exact match wins before fuzzy (so 'Switch 2' doesn't hit 'Switch')."""
+    t = _s(term).lower()
+    if not t:
+        return ""
+    for p in GAME_PLATFORMS:
+        if p.split(" - ", 1)[1].lower() == t:
+            return p
+    for p in GAME_PLATFORMS:
+        tail = p.split(" - ", 1)[1].lower()
+        if tail in t or t in tail:
+            return p
     return ""
 
 
