@@ -25,6 +25,18 @@ import base64
 
 import types as _types
 
+# Ops ingest templates (reference/*.xlsx) are the AUTHORITATIVE logic source
+# for studios/networks/keywords/roll-ups; the inlined tables below remain as
+# fallback when the template files are absent.
+try:
+    import reference_data as TREF
+except Exception:
+    TREF = None
+
+
+def _tref():
+    return TREF if (TREF is not None and getattr(TREF, "LOADED", False)) else None
+
 # ---- Reference tables (inlined so no separate file can be missed on deploy) ----
 # distributor (raw from BOM/Wikipedia/Wikidata/IMDb/TMDB) -> LF network label
 _NETWORK_LABEL = {
@@ -227,7 +239,8 @@ def build_youtube_username(company_channel, clean_title, own_channel=""):
     return "\n".join(lines)
 
 
-def generate_search_terms(clean_title, network, year, is_dar, twitter_handle=""):
+def generate_search_terms(clean_title, network, year, is_dar, twitter_handle="",
+                          network_clause=""):
     """Generate twitter_search_terms (AL) and twitter_search_term_keywords (AN).
     When the title has its own @handle, it gets its own leading lines
     (matching the manual Ops pattern)."""
@@ -250,9 +263,12 @@ def generate_search_terms(clean_title, network, year, is_dar, twitter_handle="")
         lines.append(f"#{t_hash}{n_hash}|{label}|{label}")
     terms = "\n".join(lines)
 
-    # twitter_search_term_keywords
+    # twitter_search_term_keywords -- the per-studio clause from the ingest
+    # template wins (lowercased, matching the export format); else generic
     inner = []
-    if network:
+    if network_clause:
+        inner.append(network_clause.lower())
+    elif network:
         inner.append(f'"{network.lower()}" or @{n_hash} or #{n_hash}')
     if year:
         inner.append(f'"{year}"')
@@ -507,25 +523,31 @@ def _tv_search_terms(title, network, is_dar):
     return "\n".join(lines)
 
 
-def _tv_keywords_and_reddit(title, network, year, program_type, is_dar):
+def _tv_keywords_and_reddit(title, network, year, program_type, is_dar,
+                            clause="", reddit_clause=""):
     """twitter_search_term_keywords + reddit_search_terms.
     Base rows of Specials use the short 'tonight' pattern; DAR rows and
-    everything else use the full pattern (per the manual Ops file)."""
+    everything else use the full pattern (per the manual Ops file).
+    `clause`/`reddit_clause` come from the ingest template when available."""
     info = _tv_net(network)
     title = _strip_disambiguator(title)
     tail = "DAR|DAR|2021-01-01" if is_dar else "Operations - Core Title|Operations - Core Title"
     if program_type == "Special" and not is_dar:
         inner = f'tonight OR watch OR tv OR show OR program OR "{network}"'
         kw = f'("{title}")({inner})|{tail}'
+        r_inner = re.sub(r'\s+(?:OR|or)\s+', ' | ', inner)
     else:
-        clause = info.get("clause")
+        clause = clause or info.get("clause")
         if not clause and network:
             clause = f'"{network}" OR @{_camel(network).lower()} OR #{_camel(network)}'
         parts = [p for p in (clause, f'"{year}"' if year else "", _TV_KEYWORD_TAIL) if p]
         inner = " OR ".join(parts)
         kw = f'("{title}") ({inner})|{tail}'
-    # reddit: same content, ' | ' separators, '+' dropped, no Ops label
-    r_inner = re.sub(r'\s+(?:OR|or)\s+', ' | ', inner)
+        # reddit: template's ready-made ' | ' clause when present, else transform
+        r_clause = reddit_clause or re.sub(r'\s+(?:OR|or)\s+', ' | ', clause or '')
+        r_parts = [p for p in (r_clause, f'"{year}"' if year else "",
+                               re.sub(r'\s+(?:OR|or)\s+', ' | ', _TV_KEYWORD_TAIL)) if p]
+        r_inner = " | ".join(r_parts)
     reddit = f'("{title.replace("+", " ")}") ({r_inner.replace("+", " ")})'
     if is_dar:
         reddit += "|2021-01-01"
@@ -541,10 +563,15 @@ def create_tv_row(title, network="", metadata=None):
 
     eff_network = (str(metadata.get('network') or network or '')).strip()
     info = _tv_net(eff_network)
+    # network record from the Ops ingest template (authoritative when present)
+    tinfo = _tref().tv_network(eff_network) if (_tref() and eff_network) else None
 
     # ---- title_sub_category (4 lines) ----
     ptype = str(metadata.get('program_type') or '').strip() or "Series"
-    tier = info.get("tier") or "Streaming"
+    tier = ""
+    if tinfo and tinfo.get("network_type"):
+        tier = re.sub(r'^Network - ', '', tinfo["network_type"]).strip()
+    tier = tier or info.get("tier") or "Streaming"
     daypart = info.get("daypart") or (
         "Prime Time" if tier in ("Broadcast", "Ad Supported Cable") else "Other")
     lang = str(metadata.get('original_language') or 'en').strip().lower()
@@ -564,11 +591,14 @@ def create_tv_row(title, network="", metadata=None):
             film_line = "LF // Film - Majors + Independents\n" if ptype == "TV Movie" else ""
             brand_set = ("LF // TV Universe\nLF // TV // Episodic Plus\n"
                          f"{n} -- Episodic + Roll-Up\n{film_line}Pristine DAR Brands")
-        for extra in (info.get("corp"), info.get("extras")):
-            if extra:
-                brand_set += "\n" + extra
+        # conglomerate roll-up block from the ingest template; inline fallback
+        conglom = (_tref().tv_conglomerate(eff_network) if _tref() else "") or \
+            "\n".join(x for x in (info.get("corp"), info.get("extras")) if x)
+        if conglom:
+            brand_set += "\n" + conglom
     else:
-        companies = info.get("companies") or "Unknown"
+        companies = (tinfo.get("company") if tinfo else "") or \
+            info.get("companies") or "Unknown"
         brand_set = "Competitive View"
 
     # ---- genre / primary ----
@@ -577,17 +607,27 @@ def create_tv_row(title, network="", metadata=None):
         _genre, _ = REF.normalize_genres(_genre)
     _primary = str(metadata.get('primary_genre') or '').strip()
     if not _primary:
-        _primary = _tv_primary_genre([g for g in str(_genre).split("\n") if g])
+        genres_list = [g for g in str(_genre).split("\n") if g]
+        # the template's Order-of-Operations mapping is authoritative
+        _primary = (_tref().tv_primary_genre(genres_list) if _tref() else "") or \
+            _tv_primary_genre(genres_list)
 
     # ---- youtube / search terms ----
+    channels = list(info.get("yt") or [])
+    if tinfo and tinfo.get("youtube"):
+        # template channel wins; the cell may hold several channels
+        # (newline-separated, e.g. Amazon Prime Video)
+        channels = [c.strip() for c in str(tinfo["youtube"]).split("\n") if c.strip()]
     _yt = str(metadata.get('youtube_channel_username') or '').strip()
-    if not _yt and info.get("yt"):
-        _yt = _tv_youtube_username(info["yt"], clean_title)
+    if not _yt and channels:
+        _yt = _tv_youtube_username(channels, clean_title)
     rel = str(metadata.get('released_on') or '')
     year = rel[:4] if rel[:4].isdigit() else ''
     gen_terms = _tv_search_terms(clean_title, eff_network, is_dar)
-    gen_kw, gen_reddit = _tv_keywords_and_reddit(clean_title, eff_network, year,
-                                                 ptype, is_dar)
+    gen_kw, gen_reddit = _tv_keywords_and_reddit(
+        clean_title, eff_network, year, ptype, is_dar,
+        clause=(tinfo.get("twitter_clause") if tinfo else ""),
+        reddit_clause=(tinfo.get("reddit_clause") if tinfo else ""))
 
     def mv(key, default=''):
         v = metadata.get(key, '')
@@ -602,7 +642,8 @@ def create_tv_row(title, network="", metadata=None):
         'genre': _genre,
         'primary_genre': _primary,
         'rovi_id': metadata.get('rovi_id', ''),
-        'ticker_symbol': mv('ticker_symbol', info.get("ticker", "")),
+        'ticker_symbol': mv('ticker_symbol',
+                            (tinfo.get("ticker") if tinfo else "") or info.get("ticker", "")),
         'title_content_windows': metadata.get('title_content_windows', ''),
         'companies': mv('companies', companies),
         'brand_set': mv('brand_set', brand_set),
@@ -663,22 +704,38 @@ def create_row(title, is_movie, network="", metadata=None):
     if REF is not None and eff_network:
         eff_network = REF.normalize_network(eff_network)
 
+    # studio record from the Ops ingest template (authoritative when present)
+    sinfo = _tref().film_studio(eff_network) if (_tref() and eff_network) else None
+
     # sub-category is shared by the base title AND its DAR twin
     _sub_explicit = str(metadata.get('title_sub_category') or '').strip()
     _sub = _sub_explicit
+    _scale = str(metadata.get('release_scale') or '').strip().title()
+    if not _sub and sinfo:
+        # template-driven: Language (when known) + Release scale + Studio Type
+        lang = str(metadata.get('original_language') or '').strip().lower()
+        lang_line = ''
+        if lang:
+            lang_line = 'Language Type - English\n' if lang in ('en', 'english') \
+                else 'Language Type - Other\n'
+        scale = _scale if _scale in ('Wide', 'Limited') else 'Limited'
+        stype = sinfo.get('studio_type') or 'Studio - Independent'
+        _sub = f"{lang_line}Release - {scale}\n{stype}"
     if not _sub and REF is not None:
         _sub = REF.subcategory_for(eff_network)
     if not _sub:
         _sub = 'Release - Limited\nStudio - Independent'
     # the upcoming-release-movies calendar knows the actual Wide/Limited scale;
     # it overrides the per-network default (but never an explicit upload value)
-    _scale = str(metadata.get('release_scale') or '').strip().title()
     if _scale in ('Wide', 'Limited') and not _sub_explicit:
         _sub = re.sub(r'Release - (Wide|Limited)', 'Release - ' + _scale, _sub)
     is_wide = 'release - wide' in _sub.lower()
 
     # curated PARENT company of the network (e.g. Warner Bros. -> Warner Bros. Pictures)
-    parent = REF.companies_for(eff_network) if (REF is not None and eff_network) else ""
+    parent = (sinfo.get('company') if sinfo else '') or \
+        (REF.companies_for(eff_network) if (REF is not None and eff_network) else "")
+    if parent == 'Unknown':
+        parent = ''
 
     if is_dar:
         companies = "Pristine Brand"
@@ -687,7 +744,13 @@ def create_row(title, is_movie, network="", metadata=None):
         else:
             brand_set = "Pristine DAR Brands"
         # major-studio DAR rows also carry the corporate roll-up brand sets
-        rollup = REF.dar_rollup_for(parent) if (REF is not None and parent) else ""
+        # (per-studio block from the ingest template; inline map as fallback)
+        rollup = ""
+        if _tref():
+            # the template's roll-up sheet may key by studio OR parent company
+            rollup = _tref().film_rollup(eff_network) or _tref().film_rollup(parent)
+        if not rollup and REF is not None and parent:
+            rollup = REF.dar_rollup_for(parent)
         if rollup:
             brand_set += "\n" + rollup
     else:
@@ -703,7 +766,8 @@ def create_row(title, is_movie, network="", metadata=None):
 
     gen_terms, gen_keywords = generate_search_terms(
         clean_title, eff_network, year, is_dar,
-        twitter_handle=str(metadata.get('twitter_handle') or ''))
+        twitter_handle=str(metadata.get('twitter_handle') or ''),
+        network_clause=(sinfo.get('twitter_clause') if sinfo else ''))
 
     # normalise genre tokens to the LF taxonomy (Sci-Fi -> Sci Fi, etc.)
     _genre = metadata.get('genre', '')
@@ -716,6 +780,10 @@ def create_row(title, is_movie, network="", metadata=None):
     # YouTube: company channel comes from the network; username lines combine
     # the title's own channel (if any) + '<network channel>|<title>' variants
     _yt_company = str(metadata.get('youtube_channel_company') or '').strip()
+    if not _yt_company and sinfo and sinfo.get('youtube'):
+        # movie schema uses http:// URLs; take the first channel if several
+        _yt_company = re.sub(r'^https://', 'http://',
+                             str(sinfo['youtube']).split('\n')[0].strip())
     if not _yt_company and REF is not None and eff_network:
         _yt_company = REF.youtube_for(eff_network)
     _yt_username = str(metadata.get('youtube_channel_username') or '').strip()
