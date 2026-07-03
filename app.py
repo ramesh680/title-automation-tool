@@ -341,11 +341,17 @@ def create_row(title, is_movie, network="", metadata=None):
         eff_network = REF.normalize_network(eff_network)
 
     # sub-category is shared by the base title AND its DAR twin
-    _sub = str(metadata.get('title_sub_category') or '').strip()
+    _sub_explicit = str(metadata.get('title_sub_category') or '').strip()
+    _sub = _sub_explicit
     if not _sub and REF is not None:
         _sub = REF.subcategory_for(eff_network)
     if not _sub:
         _sub = 'Release - Limited\nStudio - Independent'
+    # the upcoming-release-movies calendar knows the actual Wide/Limited scale;
+    # it overrides the per-network default (but never an explicit upload value)
+    _scale = str(metadata.get('release_scale') or '').strip().title()
+    if _scale in ('Wide', 'Limited') and not _sub_explicit:
+        _sub = re.sub(r'Release - (Wide|Limited)', 'Release - ' + _scale, _sub)
     is_wide = 'release - wide' in _sub.lower()
 
     # curated PARENT company of the network (e.g. Warner Bros. -> Warner Bros. Pictures)
