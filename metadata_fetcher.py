@@ -1,6 +1,6 @@
 """
-metadata_fetcher.py
--------------------
+metadata_fetcher.py (v2)
+------------------------
 Auto-discover title metadata by layering several sources.
 
 RESOLUTION (finding the right title):
@@ -35,7 +35,9 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.parse
+from datetime import date, timedelta
 
 try:
     import requests
@@ -64,6 +66,15 @@ ENTITYDATA = "https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
 IMDB_TITLE = "https://www.imdb.com/title/{tt}/"
 IMDB_SUGGEST = "https://v3.sg.media-imdb.com/suggestion/x/{q}.json"
 BOM_TITLE = "https://www.boxofficemojo.com/title/{tt}/"
+# Our own upcoming-release-movies service (BOM calendar data): authoritative
+# for tt code, US distributor, genres, release date and Wide/Limited scale.
+UPCOMING_API = os.getenv(
+    "UPCOMING_MOVIES_API",
+    "https://upcoming-release-movies.onrender.com/api/upcoming-release-movies")
+try:
+    UPCOMING_TIMEOUT = int(os.getenv("UPCOMING_TIMEOUT_SECONDS", "45"))
+except ValueError:
+    UPCOMING_TIMEOUT = 45
 
 HEADERS = {"User-Agent": "ListenFirstTitleTool/1.0 (" + WIKIMEDIA_CONTACT + ")"}
 HTML_HEADERS = {
@@ -131,6 +142,70 @@ def _strip_tags(s):
 def _norm(s):
     """lowercase, letters+digits only — for title comparisons."""
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+# ---------------- upcoming-release-movies service ----------------
+_UPCOMING = {"fetched": 0.0, "by_title": {}, "by_tt": {}}
+_UPCOMING_TTL = 6 * 3600  # refresh the calendar index every 6h
+
+
+def _upcoming_index():
+    """Cached index of the upcoming-release-movies service, keyed by
+    normalized title and by tt code. Fails soft (empty index) so the
+    pipeline keeps working via the other sources."""
+    now = time.time()
+    if _UPCOMING["by_title"] and now - _UPCOMING["fetched"] < _UPCOMING_TTL:
+        return _UPCOMING
+    if _SESSION is None:
+        return _UPCOMING
+    try:
+        start = (date.today() - timedelta(days=180)).isoformat()
+        end = (date.today() + timedelta(days=730)).isoformat()
+        r = _SESSION.get(UPCOMING_API,
+                         params={"start_date": start, "end_date": end},
+                         headers=HEADERS, timeout=UPCOMING_TIMEOUT)
+        r.raise_for_status()
+        movies = (r.json() or {}).get("movies") or []
+    except Exception as e:  # noqa: BLE001
+        log.warning("upcoming-release-movies fetch failed: %s", e)
+        return _UPCOMING
+    by_title, by_tt = {}, {}
+    for m in movies:
+        k = _norm(m.get("title"))
+        tt = m.get("tt_code")
+        # prefer the entry that actually has a distributor if duplicated
+        if k and (k not in by_title or
+                  (by_title[k].get("distributor_network") or "-") == "-"):
+            by_title[k] = m
+        if tt and (tt not in by_tt or
+                   (by_tt[tt].get("distributor_network") or "-") == "-"):
+            by_tt[tt] = m
+    if by_title:
+        _UPCOMING.update(fetched=now, by_title=by_title, by_tt=by_tt)
+    return _UPCOMING
+
+
+def _upcoming_meta(m):
+    """Map an upcoming-release-movies record to our columns."""
+    if not m:
+        return {}
+    meta = {}
+    dist = str(m.get("distributor_network") or "").strip()
+    if dist and dist != "-":
+        meta["network"] = dist
+    if m.get("release_date"):
+        meta["released_on"] = str(m["release_date"])[:10]
+    gs = m.get("genres") or [g.strip() for g in str(m.get("genre") or "").split(",") if g.strip()]
+    if gs:
+        meta["genre"] = "\n".join(gs)
+        meta["primary_genre"] = gs[0]
+    if str(m.get("release_scale") or "").strip().title() in ("Wide", "Limited"):
+        meta["release_scale"] = str(m["release_scale"]).strip().title()
+    if m.get("tt_code"):
+        meta["imdb_id"] = "http://www.imdb.com/title/" + str(m["tt_code"])
+    if m.get("metacritic_url"):
+        meta["metacritic"] = str(m["metacritic_url"]).replace("https://", "http://")
+    return meta
 
 
 # ---------------- IMDb suggestion API (keyless, reliable) ----------------
@@ -602,6 +677,11 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
     for the field-priority rationale)."""
     meta = {}
 
+    # 0) upcoming-release-movies service (BOM calendar): distributor, genres,
+    #    release date + Wide/Limited scale -- authoritative when present
+    if is_movie:
+        _fill(meta, _upcoming_meta(_upcoming_index()["by_tt"].get(tt)))
+
     # 1) Box Office Mojo -- US Domestic Distributor (released titles only)
     _fill(meta, bom_scrape(tt))
 
@@ -677,7 +757,10 @@ def fetch_metadata(title, is_movie=True):
 
     meta = {}
     try:
-        tt = imdb_suggest(clean, is_movie)
+        # the upcoming-release-movies calendar resolves the tt code by exact
+        # title AND supplies distributor/genre/date/scale in one shot
+        um = _upcoming_index()["by_title"].get(_norm(clean)) if is_movie else None
+        tt = _tt((um or {}).get("tt_code")) or imdb_suggest(clean, is_movie)
         tmdb_meta, wid = ({}, None)
         if not tt:
             tmdb_meta, wid = tmdb_lookup(clean, is_movie)
