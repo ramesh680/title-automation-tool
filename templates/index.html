@@ -179,10 +179,13 @@
                         <option value="movie">Movies</option>
                         <option value="tvshow">TV Shows</option>
                         <option value="talent">Talent (people)</option>
-                        <option value="mixed">Mixed (use type / title_category column)</option>
+                        <option value="game">Video Games</option>
+                        <option value="mixed">Mixed (tag each title / use type column)</option>
                     </select>
-                    <span class="hint">For file uploads this applies to every row that has no
-                    <b>type</b> / <b>title_category</b> column value of its own — rows with one keep it.</span>
+                    <span class="hint">For <b>Mixed</b> manual entry, tag each line:
+                    <b>Title [movie]</b>, <b>[tv]</b>, <b>[talent]</b> or <b>[game]</b> — untagged
+                    lines count as movies. For file uploads the selector applies to rows without a
+                    <b>type</b> / <b>title_category</b> column value — rows with one keep it.</span>
                 </div>
 
                 <div class="form-group">
@@ -252,18 +255,34 @@
             }
         });
 
-        function getTitles() {
+        // Parse manual lines. In Mixed mode each line may end with a type tag:
+        //   "Line of Fire [tv]", "LeBron James [talent]", "Fortnite [game]",
+        //   "Dune 3 [movie]" — untagged lines default to movie.
+        // Returns { titles: [...], types: {title: kind} }.
+        function getTitlesAndTypes() {
             const method = document.getElementById('inputMethod').value;
-            let titles = [];
+            const titleType = document.getElementById('titleType').value;
+            const titles = [], types = {};
+            if (method !== 'manual') return { titles, types };
 
-            if (method === 'manual') {
-                const text = document.getElementById('titlesList').value;
-                titles = text.split('\n')
-                    .map(t => t.trim())
-                    .filter(t => t.length > 0);
-            }
-
-            return titles;
+            const tagRe = /\s*\[\s*(movie|movies|tv|tvshow|tv show|tv shows|talent|game|games|video ?games?)\s*\]\s*$/i;
+            const text = document.getElementById('titlesList').value;
+            text.split('\n').map(t => t.trim()).filter(t => t.length > 0).forEach(line => {
+                let kind = titleType;
+                const m = line.match(tagRe);
+                if (m) {
+                    line = line.replace(tagRe, '').trim();
+                    kind = m[1].toLowerCase();
+                }
+                if (!line) return;
+                if (/talent/.test(kind)) kind = 'talent';
+                else if (/game/.test(kind)) kind = 'game';
+                else if (/tv/.test(kind)) kind = 'tvshow';
+                else kind = 'movie';           // 'mixed' + untagged -> movie
+                titles.push(line);
+                types[line] = kind;
+            });
+            return { titles, types };
         }
 
         // Build the fetch options for /api/preview and /api/generate.
@@ -291,20 +310,16 @@
                 return { method: 'POST', body: fd };
             }
 
-            const titles = getTitles();
+            const parsed = getTitlesAndTypes();
+            const titles = parsed.titles;
             if (titles.length === 0) {
                 showMessage('inputMessage', 'Please enter at least one title', 'error');
                 return null;
             }
 
-            const payload = { titles: titles, includeDar: includeDar, autoFetch: autoFetch, titles_type: {} };
-            if (titleType === 'movie') {
-                titles.forEach(t => payload.titles_type[t] = 'movie');
-            } else if (titleType === 'tvshow') {
-                titles.forEach(t => payload.titles_type[t] = 'tvshow');
-            } else if (titleType === 'talent') {
-                titles.forEach(t => payload.titles_type[t] = 'talent');
-            }
+            // every title always gets an explicit type (fixes mixed runs
+            // silently defaulting to movies)
+            const payload = { titles: titles, includeDar: includeDar, autoFetch: autoFetch, titles_type: parsed.types };
             return {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
