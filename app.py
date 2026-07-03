@@ -323,6 +323,326 @@ def _norm_bool(v):
     return "true"
 
 
+# ======================= TV Shows (BrandIngest schema) =======================
+# TV rows export in the 39-column ApplyBrandDefinitionReport / BrandIngest
+# format (learned from the manual Ops file), NOT the movie schema.
+TV_COLUMNS = [
+    'record_type', 'brand_id', 'title', 'title_category', 'title_sub_category',
+    'genre', 'primary_genre', 'rovi_id', 'ticker_symbol', 'title_content_windows',
+    'companies', 'brand_set', 'active', 'released_on', 'box_office', 'street_date',
+    'gross_screen', 'opening_weekend_box_office', 'network', 'brand_listing_hidden',
+    'facebook_page', 'twitter_handle', 'instagram_user', 'youtube_channel_username',
+    'tiktok_user', 'tumblr_page', 'pinterest_user_username', 'pinterest_board',
+    'wikipedia_page', 'rottentomatoes', 'imdb_id', 'metacritic',
+    'facebook_search_terms', 'twitter_search_terms', 'instagram_search_terms',
+    'tumblr_search_terms', 'twitter_search_term_keywords', 'youtube_search_terms',
+    'reddit_search_terms',
+]
+
+# corporate roll-up brand_set blocks (appended to DAR rows)
+_DISNEY_TV = ("The Walt Disney Company > Overall Roll-up\n"
+              "The Walt Disney Company > TV Roll-up\n"
+              "The Walt Disney Company > TV {kind} Roll-up\n"
+              "The Walt Disney Company > TV + Publishing Roll-up\n"
+              "The Walt Disney Company > Film + TV + Publishing Roll-up")
+_NBCU_TV = ("NBCUniversal > Overall Roll-up\nNBCUniversal > TV Roll-up\n"
+            "NBCUniversal > TV {kind} Roll-up\nNBCUniversal > TV + Publishing Roll-up\n"
+            "NBCUniversal > Film + TV + Publishing Roll-up")
+
+# per-network reference: ticker, parent company, YouTube channel(s), network
+# tier, twitter keyword clause, corporate roll-ups, extra DAR brand sets
+_TV_NETWORK = {
+    "Netflix": dict(
+        ticker="NFLX", companies="Netflix",
+        yt=["https://www.youtube.com/user/NewOnNetflix"], tier="Streaming",
+        clause='"Netflix" OR @netflix OR #Netflix OR #NowonNetflix',
+        extras="Netflix - Emerging Titles\nPV Monthly - Emerging Titles"),
+    "Paramount+": dict(
+        ticker="VIA", companies="Viacom",
+        yt=["https://www.youtube.com/channel/UCrRttZIypNTA1Mrfwo745Sg"], tier="Streaming",
+        clause='"Paramount+" OR "Paramount Plus" OR @paramountplus OR #ParamountPlus',
+        extras="Paramount+ - Emerging Titles\nPV Monthly - Emerging Titles"),
+    "Amazon Prime Video": dict(
+        ticker="AMZN", companies="Amazon Prime Video",
+        yt=["https://www.youtube.com/user/amazonstudios",
+            "https://www.youtube.com/@AmazonMGMStudios"], tier="Streaming",
+        clause=('"prime video" or "amazon studios" or "amazon mgm studios" or '
+                '@primevideo or @amazonmgmstudio or @primemovies OR #primevideo '
+                'or #amazonmgmstudios or #primemovies or #amazonstudios'),
+        extras=("Amazon Prime Video TV Network\nAmazon Prime Video - Emerging Titles\n"
+                "PV Monthly - Emerging Titles")),
+    "NBC": dict(
+        ticker="CMCSA", companies="NBCU Research - Entertainment Networks",
+        yt=["https://www.youtube.com/user/NBC"], tier="Broadcast",
+        clause='"NBC" OR @nbc OR #NBC OR #NBCNetwork',
+        corp=_NBCU_TV.format(kind="Broadcast")),
+    "ABC": dict(
+        ticker="DIS", companies="American Broadcasting Company",
+        yt=["https://www.youtube.com/user/ABCNetwork"], tier="Broadcast",
+        clause='"ABC" OR @ABCNetwork OR #ABC OR #ABCNetwork',
+        corp=_DISNEY_TV.format(kind="Broadcast")),
+    "National Geographic": dict(
+        ticker="DIS", companies="National Geographic",
+        yt=["https://www.youtube.com/user/NationalGeographic"], tier="Ad Supported Cable",
+        clause=('"National Geographic Channel" OR "Nat Geo" OR "NatGeo" OR @NatGeoTV '
+                'OR #NationalGeographicChannel OR #NatGeoTV OR #NatGeo'),
+        corp=_DISNEY_TV.format(kind="Cable")),
+    "FX": dict(
+        ticker="DIS", companies="FX Network",
+        yt=["https://www.youtube.com/user/FXNetworks"], tier="Ad Supported Cable",
+        clause='"FX" OR @FXNetworks OR #FX OR #FXNetwork',
+        corp=_DISNEY_TV.format(kind="Cable"), extras="FX All Brands Roll-Up"),
+    "Bravo": dict(
+        ticker="CMCSA", companies="Bravo!",
+        yt=["https://www.youtube.com/user/VideoByBravo"], tier="Ad Supported Cable",
+        clause='"Bravo" OR @BravoTV OR #BravoTV OR #Bravo',
+        corp=_NBCU_TV.format(kind="Cable")),
+    "Adult Swim": dict(
+        ticker="T", companies="Adult Swim",
+        yt=["https://www.youtube.com/user/adultswim"], tier="Ad Supported Cable",
+        daypart="Other",  # late-night network
+        clause='"Adult Swim" OR @adultswim OR #AdultSwim',
+        corp=("WarnerMedia > Overall Roll-up\nWarnerMedia > TV Roll-up\n"
+              "WarnerMedia > TV Cable Roll-up\nWarnerMedia > TV + Publishing Roll-up\n"
+              "WarnerMedia > Film + TV + Publishing Roll-up\nAT&T Overall Roll-Up")),
+    "Food Network": dict(
+        ticker="DISCB", companies="Unknown",
+        yt=["https://www.youtube.com/user/FoodNetworkTV"], tier="Ad Supported Cable",
+        clause='"Food Network" OR @FoodNetwork OR #foodnetwork',
+        corp=("Discovery > TV Roll-up\nDiscovery > TV + Publishing Roll-up\n"
+              "Discovery > Film + TV + Publishing Roll-up")),
+    "History": dict(
+        ticker="", companies="A&E Television Networks",
+        yt=["https://www.youtube.com/user/historychannel"], tier="Ad Supported Cable",
+        clause=('"History Channel" OR "History Network" OR @HISTORY OR '
+                '#historychannel OR #historytv'),
+        corp=("A+E > TV Roll-up\nA+E > TV + Publishing Roll-up\n"
+              "A+E > Film + TV + Publishing Roll-up")),
+    "BritBox": dict(
+        ticker="", companies="Unknown",
+        yt=["https://www.youtube.com/channel/UC0yD7rYO26CAbkOx4rJkCzg"], tier="Streaming",
+        clause='"BritBox" OR #BritBox OR @BritBox_US'),
+    "Tubi": dict(
+        ticker="", companies="Unknown",
+        yt=["https://www.youtube.com/channel/UCNDsk0uhSlG1-br1Ex2Rgfg"], tier="Streaming",
+        clause='"Tubi" OR #Tubi OR @tubi'),
+    "Shudder": dict(
+        ticker="", companies="Unknown",
+        yt=["https://www.youtube.com/channel/UCcCCIrXmIJOYamxWqeJzI2Q"], tier="Streaming",
+        clause='"Shudder" OR @Shudder OR #Shudder', extras="Shudder TV Network"),
+    "Starz": dict(
+        ticker="LGF.A", companies="Starz Entertainment",
+        yt=["https://www.youtube.com/user/Starz"], tier="Premium Cable",
+        clause='"Starz" OR @STARZ OR #Starz OR #StarzNetwork OR #StarzTV'),
+    "Great American Family": dict(
+        ticker="", companies="Unknown",
+        yt=["https://www.youtube.com/channel/UCjIRUzJ-6-4nyX3GIsfwOOg"],
+        tier="Ad Supported Cable",
+        clause=('"Great American Family" OR "on GAF" OR @GAfamilyTV OR '
+                '#greatamericanfamilychannel OR #GAFTV')),
+}
+
+_TV_KEYWORD_TAIL = ('"All New" OR Episode OR Watch OR tv OR Show OR Series OR season '
+                    'OR binge OR Stream OR Film OR Movie OR Premiere OR Screening OR '
+                    'Feature OR Trailer OR Teaser OR theater OR release')
+
+# unscripted genres win primary_genre, in this priority order; otherwise
+# scripted shows are bucketed Drama unless they are Comedy-without-Drama
+_TV_UNSCRIPTED_PRIORITY = ["Game Show", "Reality", "Sport", "Documentary",
+                           "Talk Show", "News"]
+
+
+def _tv_net(network):
+    return _ref_ci_get(_TV_NETWORK, network) or {}
+
+
+def _tv_primary_genre(genres):
+    for g in _TV_UNSCRIPTED_PRIORITY:
+        if g in genres:
+            return g
+    if "Comedy" in genres and "Drama" not in genres:
+        return "Comedy"
+    return "Drama" if genres else ""
+
+
+def _camel(s):
+    """Hashtag form: keep case, '+' -> 'plus', drop everything non-alnum."""
+    return re.sub(r'[^A-Za-z0-9]', '', str(s or '').replace('+', 'plus'))
+
+
+def _https(u):
+    return re.sub(r'^http://', 'https://', str(u or ''))
+
+
+def _strip_disambiguator(title):
+    """'Steps (Netflix)' -> 'Steps' (used in YouTube username lines)."""
+    return re.sub(r'\s*\([^)]*\)\s*$', '', title).strip()
+
+
+def _tv_youtube_username(channels, clean_title):
+    """One '<channel>|<Title>' line per network channel; titles containing a
+    colon get a second pass with the colon removed (matches the manual file:
+    colon variant lines come AFTER the original lines)."""
+    t = _strip_disambiguator(clean_title)
+    variants = [t]
+    stripped = re.sub(r'\s*:\s*', ' ', t)
+    stripped = re.sub(r'\s+', ' ', stripped).strip()
+    if stripped != t:
+        variants.append(stripped)
+    return "\n".join(f"{ch}|{v}" for v in variants for ch in channels)
+
+
+def _tv_search_terms(title, network, is_dar):
+    label = "DAR" if is_dar else "TV Ops"
+    # base rows hashtag the disambiguator-stripped title; DAR rows keep the
+    # full title (both patterns are consistent in the manual Ops file)
+    t = _camel(title if is_dar else _strip_disambiguator(title))
+    n = _camel(network)
+    lines = [f"#{t}|{label}"]
+    if n:
+        lines.append(f"#{t}{n}|{label}")
+    return "\n".join(lines)
+
+
+def _tv_keywords_and_reddit(title, network, year, program_type, is_dar):
+    """twitter_search_term_keywords + reddit_search_terms.
+    Base rows of Specials use the short 'tonight' pattern; DAR rows and
+    everything else use the full pattern (per the manual Ops file)."""
+    info = _tv_net(network)
+    title = _strip_disambiguator(title)
+    tail = "DAR|DAR|2021-01-01" if is_dar else "Operations - Core Title|Operations - Core Title"
+    if program_type == "Special" and not is_dar:
+        inner = f'tonight OR watch OR tv OR show OR program OR "{network}"'
+        kw = f'("{title}")({inner})|{tail}'
+    else:
+        clause = info.get("clause")
+        if not clause and network:
+            clause = f'"{network}" OR @{_camel(network).lower()} OR #{_camel(network)}'
+        parts = [p for p in (clause, f'"{year}"' if year else "", _TV_KEYWORD_TAIL) if p]
+        inner = " OR ".join(parts)
+        kw = f'("{title}") ({inner})|{tail}'
+    # reddit: same content, ' | ' separators, '+' dropped, no Ops label
+    r_inner = re.sub(r'\s+(?:OR|or)\s+', ' | ', inner)
+    reddit = f'("{title.replace("+", " ")}") ({r_inner.replace("+", " ")})'
+    if is_dar:
+        reddit += "|2021-01-01"
+    return kw, reddit
+
+
+def create_tv_row(title, network="", metadata=None):
+    """Create a TV Shows row in the 39-column BrandIngest schema.
+    Values present in `metadata` always win over computed defaults."""
+    metadata = metadata or {}
+    is_dar = " - DAR" in title
+    clean_title = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
+
+    eff_network = (str(metadata.get('network') or network or '')).strip()
+    info = _tv_net(eff_network)
+
+    # ---- title_sub_category (4 lines) ----
+    ptype = str(metadata.get('program_type') or '').strip() or "Series"
+    tier = info.get("tier") or "Streaming"
+    daypart = info.get("daypart") or (
+        "Prime Time" if tier in ("Broadcast", "Ad Supported Cable") else "Other")
+    lang = str(metadata.get('original_language') or 'en').strip().lower()
+    lang_line = "English" if lang in ("en", "english", "") else "Other"
+    _sub = (f"Daypart - {daypart}\nProgram Type - {ptype}\n"
+            f"Language Type - {lang_line}\nNetwork - {tier}")
+
+    # ---- companies / ticker / brand_set ----
+    if is_dar:
+        companies = "Pristine Brand"
+        n = eff_network
+        if ptype in ("Series", "Mini-Series"):
+            brand_set = (f"{n} -- Episodic + Roll-Up\n{n}-- Episodic Network Roll-Up\n"
+                         "LF // TV Universe\nLF // TV // Episodic\n"
+                         "LF // TV // Episodic Plus\nPristine DAR Brands")
+        else:  # Special / TV Movie
+            film_line = "LF // Film - Majors + Independents\n" if ptype == "TV Movie" else ""
+            brand_set = ("LF // TV Universe\nLF // TV // Episodic Plus\n"
+                         f"{n} -- Episodic + Roll-Up\n{film_line}Pristine DAR Brands")
+        for extra in (info.get("corp"), info.get("extras")):
+            if extra:
+                brand_set += "\n" + extra
+    else:
+        companies = info.get("companies") or "Unknown"
+        brand_set = "Competitive View"
+
+    # ---- genre / primary ----
+    _genre = metadata.get('genre', '')
+    if REF is not None and _genre:
+        _genre, _ = REF.normalize_genres(_genre)
+    _primary = str(metadata.get('primary_genre') or '').strip()
+    if not _primary:
+        _primary = _tv_primary_genre([g for g in str(_genre).split("\n") if g])
+
+    # ---- youtube / search terms ----
+    _yt = str(metadata.get('youtube_channel_username') or '').strip()
+    if not _yt and info.get("yt"):
+        _yt = _tv_youtube_username(info["yt"], clean_title)
+    rel = str(metadata.get('released_on') or '')
+    year = rel[:4] if rel[:4].isdigit() else ''
+    gen_terms = _tv_search_terms(clean_title, eff_network, is_dar)
+    gen_kw, gen_reddit = _tv_keywords_and_reddit(clean_title, eff_network, year,
+                                                 ptype, is_dar)
+
+    def mv(key, default=''):
+        v = metadata.get(key, '')
+        return v if v not in (None, '') else default
+
+    row = {
+        'record_type': mv('record_type', 'INGESTED'),
+        'brand_id': metadata.get('brand_id', ''),
+        'title': title,
+        'title_category': 'TV Shows',
+        'title_sub_category': mv('title_sub_category', _sub),
+        'genre': _genre,
+        'primary_genre': _primary,
+        'rovi_id': metadata.get('rovi_id', ''),
+        'ticker_symbol': mv('ticker_symbol', info.get("ticker", "")),
+        'title_content_windows': metadata.get('title_content_windows', ''),
+        'companies': mv('companies', companies),
+        'brand_set': mv('brand_set', brand_set),
+        'active': mv('active', 't'),
+        'released_on': metadata.get('released_on', ''),
+        'box_office': metadata.get('box_office', ''),
+        'street_date': metadata.get('street_date', ''),
+        'gross_screen': metadata.get('gross_screen', ''),
+        'opening_weekend_box_office': metadata.get('opening_weekend_box_office', ''),
+        'network': eff_network,
+        'brand_listing_hidden': mv('brand_listing_hidden', 'f'),
+        # per the manual file, per-title social handles stay blank for TV
+        # (coverage runs through the network accounts)
+        'facebook_page': metadata.get('facebook_page', ''),
+        'twitter_handle': metadata.get('twitter_handle', ''),
+        'instagram_user': metadata.get('instagram_user', ''),
+        'youtube_channel_username': _yt,
+        'tiktok_user': metadata.get('tiktok_user', ''),
+        'tumblr_page': metadata.get('tumblr_page', ''),
+        'pinterest_user_username': metadata.get('pinterest_user_username', ''),
+        'pinterest_board': metadata.get('pinterest_board', ''),
+        'wikipedia_page': _https(metadata.get('wikipedia_page', '')),
+        'rottentomatoes': _https(metadata.get('rottentomatoes', '')),
+        'imdb_id': _https(metadata.get('imdb_id', '')),
+        'metacritic': _https(metadata.get('metacritic', '')),
+        'facebook_search_terms': metadata.get('facebook_search_terms', ''),
+        'twitter_search_terms': mv('twitter_search_terms', gen_terms),
+        'instagram_search_terms': metadata.get('instagram_search_terms', ''),
+        'tumblr_search_terms': metadata.get('tumblr_search_terms', ''),
+        'twitter_search_term_keywords': mv('twitter_search_term_keywords', gen_kw),
+        'youtube_search_terms': metadata.get('youtube_search_terms', ''),
+        'reddit_search_terms': mv('reddit_search_terms', gen_reddit),
+    }
+    return row
+
+
+def make_row(title, is_movie, network="", metadata=None):
+    """Dispatch: movies use the 42-col schema, TV the 39-col BrandIngest."""
+    if is_movie:
+        return create_row(title, is_movie, network, metadata)
+    return create_tv_row(title, network, metadata)
+
+
 def create_row(title, is_movie, network="", metadata=None):
     """Create a data row for a title - ALL 42 COLUMNS POPULATED.
 
@@ -507,11 +827,10 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None, 
 
     rows = []
     if has_full_schema:
-        rename_map = {lower_cols[c.lower()]: c for c in COLUMNS if c.lower() in lower_cols}
+        all_cols = list(dict.fromkeys(COLUMNS + TV_COLUMNS))
+        rename_map = {lower_cols[c.lower()]: c for c in all_cols if c.lower() in lower_cols}
         df = df.rename(columns=rename_map)
-        df = df.reindex(columns=COLUMNS)
         df = df.where(pd.notnull(df), '')
-        df['record_type'] = df['record_type'].replace('', 'INGESTED')
         records = df.to_dict('records')
         if max_titles:
             records = records[:max_titles]
@@ -525,10 +844,10 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None, 
             is_movie_r = 'tv' not in str(r.get('title_category', '')).lower()
             if auto_fetch:
                 r = _merge_meta(r, t, True, is_movie=is_movie_r)
-            # route through create_row so derived fields (network label, youtube
+            # route through make_row so derived fields (network label, youtube
             # lines, brand sets, search terms) are computed consistently; explicit
-            # values from the upload always win inside create_row
-            rows.append(create_row(t, is_movie_r, str(r.get('network') or ''), r))
+            # values from the upload always win inside the row builders
+            rows.append(make_row(t, is_movie_r, str(r.get('network') or ''), r))
             if progress:
                 progress(i + 1, total)
     else:
@@ -550,9 +869,9 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None, 
         total = len(specs)
         for i, (title, is_movie, network) in enumerate(specs):
             meta = _merge_meta({}, title, auto_fetch, is_movie=is_movie)
-            rows.append(create_row(title, is_movie, network, meta))
+            rows.append(make_row(title, is_movie, network, meta))
             if include_dar and ' - DAR' not in title:
-                rows.append(create_row(f"{title} - DAR", is_movie, network, meta))
+                rows.append(make_row(f"{title} - DAR", is_movie, network, meta))
             if progress:
                 progress(i + 1, total)
     return rows
@@ -571,12 +890,37 @@ def build_rows_from_titles(data, max_titles=None, progress=None):
         is_movie = data.get('titles_type', {}).get(title, 'movie') == 'movie'
         network = data.get('networks', {}).get(title, '')
         metadata = _merge_meta(data.get('metadata', {}).get(title, {}), title, auto_fetch, is_movie=is_movie)
-        rows.append(create_row(title, is_movie, network, metadata))
+        rows.append(make_row(title, is_movie, network, metadata))
         if include_dar and ' - DAR' not in title:
-            rows.append(create_row(f"{title} - DAR", is_movie, network, metadata))
+            rows.append(make_row(f"{title} - DAR", is_movie, network, metadata))
         if progress:
             progress(i + 1, total)
     return rows
+
+
+def _is_tv_row(r):
+    return str(r.get('title_category', '')).lower() == 'tv shows'
+
+
+def _rows_to_workbook(rows):
+    """Write rows to an xlsx BytesIO. Movies use the 42-col schema, TV the
+    39-col BrandIngest schema; mixed runs get one sheet per schema."""
+    movies = [r for r in rows if not _is_tv_row(r)]
+    tv = [r for r in rows if _is_tv_row(r)]
+    if movies and tv:
+        sheets = [('Movies', movies, COLUMNS), ('TV Shows', tv, TV_COLUMNS)]
+    elif tv:
+        sheets = [('BrandIngest', tv, TV_COLUMNS)]
+    else:
+        sheets = [('Sheet1', movies, COLUMNS)]
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine='openpyxl') as xw:
+        for name, rws, cols in sheets:
+            df = pd.DataFrame(rws).reindex(columns=cols)
+            df = df.where(pd.notnull(df), '')
+            df.to_excel(xw, sheet_name=name, index=False)
+    out.seek(0)
+    return out
 
 
 # how many titles Preview samples (keeps auto-discovery fast on free tier)
@@ -620,7 +964,7 @@ def api_lookup():
         meta = fetch_metadata_by_tt(tt, is_movie, title)
     else:
         meta = fetch_metadata(title, is_movie)
-    row = create_row(title or tt, is_movie, '', dict(meta))
+    row = make_row(title or tt, is_movie, '', dict(meta))
     return jsonify({'discovered': meta, 'row': row})
 
 
@@ -630,8 +974,11 @@ def preview_data():
         rows = collect_rows(preview=True)
         if not rows:
             return jsonify({'error': 'No titles provided'}), 400
-        df = pd.DataFrame(rows)
-        df = df.reindex(columns=COLUMNS).where(lambda x: pd.notnull(x), '')
+        # preview shows the schema of the first title's category
+        cols = TV_COLUMNS if _is_tv_row(rows[0]) else COLUMNS
+        same = [r for r in rows if _is_tv_row(r) == _is_tv_row(rows[0])]
+        df = pd.DataFrame(same)
+        df = df.reindex(columns=cols).where(lambda x: pd.notnull(x), '')
         # figure out whether the source had more titles than we sampled
         if request.files.get('file'):
             preview_limited = True
@@ -655,11 +1002,7 @@ def generate_excel():
         rows = collect_rows()
         if not rows:
             return jsonify({'error': 'No titles provided'}), 400
-        df = pd.DataFrame(rows)
-        df = df.reindex(columns=COLUMNS).where(lambda x: pd.notnull(x), '')
-        output = BytesIO()
-        df.to_excel(output, sheet_name='Sheet1', index=False)
-        output.seek(0)
+        output = _rows_to_workbook(rows)
         return send_file(
             output,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -744,11 +1087,8 @@ def _run_generation(jid, kind, payload):
         if not rows:
             _job_set(jid, status='error', error='No titles provided')
             return
-        df = pd.DataFrame(rows).reindex(columns=COLUMNS).where(lambda x: pd.notnull(x), '')
-        out = BytesIO()
-        df.to_excel(out, sheet_name='Sheet1', index=False)
-        out.seek(0)
-        _job_set(jid, status='done', file=out.getvalue(), rows=len(df),
+        out = _rows_to_workbook(rows)
+        _job_set(jid, status='done', file=out.getvalue(), rows=len(rows),
                  filename=f"Titles_Export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
     except Exception as e:  # noqa: BLE001
         logging.error(f"generation job {jid} failed: {e}")
