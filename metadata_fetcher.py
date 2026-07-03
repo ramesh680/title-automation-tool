@@ -707,6 +707,90 @@ def wikidata_meta(title, qid=None, is_movie=True):
     return meta
 
 
+# ---------------- Talent (people) ----------------
+_GENDER_QIDS = {"Q6581097": "Gender - Man", "Q6581072": "Gender - Woman"}
+
+
+def fetch_person(name):
+    """Auto-discover a PERSON (talent) via Wikidata + IMDb suggestion API.
+    Returns: socials, wikipedia_page, imdb_id (nm), gender line, occupation
+    labels, sport labels, us_citizen flag. Fails soft ({})."""
+    if not name:
+        return {}
+    clean = re.sub(r"\s*-\s*DAR\s*$", "", name, flags=re.IGNORECASE).strip()
+    clean, _ = _split_disambiguator(clean)
+    key = ("person:" + clean.lower(),)
+    if key in _CACHE:
+        return dict(_CACHE[key])
+    meta = {}
+    try:
+        entity = None
+        for cand in _search_candidates(clean, limit=6)[:4]:
+            ent = _entity(cand)
+            if not ent:
+                continue
+            claims = ent.get("claims", {})
+            if "Q5" not in set(_claim_values(claims, "P31")):
+                continue  # not a human
+            lbl = (ent.get("labels", {}).get("en", {}) or {}).get("value", "")
+            if _norm(lbl) == _norm(clean) or any(
+                    _norm(a.get("value")) == _norm(clean)
+                    for a in ent.get("aliases", {}).get("en", [])):
+                entity = ent
+                break
+            entity = entity or ent  # weak fallback: first human hit
+        if entity is not None:
+            claims = entity.get("claims", {})
+            raw = {}
+            for prop, k in PROPERTY_MAP.items():
+                v = _claim_values(claims, prop)
+                if v:
+                    raw[k] = v[0]
+            if raw.get("imdb", "").startswith("nm"):
+                meta["imdb_id"] = "https://www.imdb.com/name/" + raw["imdb"]
+            if "twitter" in raw:
+                meta["twitter_handle"] = raw["twitter"]
+            if "instagram" in raw:
+                meta["instagram_user"] = str(raw["instagram"]).lower()
+            if "facebook" in raw:
+                meta["facebook_page"] = "https://www.facebook.com/" + raw["facebook"]
+            if "tiktok" in raw:
+                meta["tiktok_user"] = str(raw["tiktok"]).lstrip("@")
+            yt = None
+            if raw.get("youtube_handle"):
+                yt = "https://www.youtube.com/@" + raw["youtube_handle"].lstrip("@")
+            elif raw.get("youtube_id"):
+                yt = "https://www.youtube.com/channel/" + raw["youtube_id"]
+            if yt:
+                meta["youtube_channel_username"] = yt
+            enwiki = entity.get("sitelinks", {}).get("enwiki")
+            if enwiki and enwiki.get("title"):
+                meta["wikipedia_page"] = ("https://en.wikipedia.org/wiki/"
+                                          + enwiki["title"].replace(" ", "_"))
+            for g in _claim_values(claims, "P21"):
+                if g in _GENDER_QIDS:
+                    meta["gender"] = _GENDER_QIDS[g]
+                    break
+            occ_qids = _claim_values(claims, "P106")[:12]
+            sport_qids = _claim_values(claims, "P641")[:4]
+            labels = _labels(occ_qids + sport_qids)
+            meta["occupations"] = [labels[q] for q in occ_qids if labels.get(q)]
+            meta["sports"] = [labels[q] for q in sport_qids if labels.get(q)]
+            meta["us_citizen"] = "Q30" in set(_claim_values(claims, "P27"))
+        # IMDb nm id fallback via the suggestion API (people come back as nm...)
+        if not meta.get("imdb_id"):
+            q = urllib.parse.quote(clean.strip().lower())
+            data = _get_json(IMDB_SUGGEST.format(q=q), headers=HTML_HEADERS)
+            for it in (data or {}).get("d", []):
+                if str(it.get("id", "")).startswith("nm") and _norm(it.get("l")) == _norm(clean):
+                    meta["imdb_id"] = "https://www.imdb.com/name/" + it["id"]
+                    break
+    except Exception as e:  # noqa: BLE001
+        log.warning("fetch_person failed for %r: %s", name, e)
+    _CACHE[key] = dict(meta)
+    return meta
+
+
 def youtube_channel(title):
     """The title's own channel via the YouTube Data API (optional key)."""
     if not YOUTUBE_API_KEY:
