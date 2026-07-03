@@ -9,13 +9,16 @@ import threading
 import logging
 
 try:
-    from metadata_fetcher import fetch_metadata, fetch_metadata_by_tt
+    from metadata_fetcher import fetch_metadata, fetch_metadata_by_tt, warm_upcoming
 except Exception:  # keep the app running even if the module is missing
     def fetch_metadata(title, is_movie=True):
         return {}
 
     def fetch_metadata_by_tt(tt, is_movie=True, title=""):
         return {}
+
+    def warm_upcoming():
+        pass
 
 import json
 import base64
@@ -947,6 +950,9 @@ def collect_rows(preview=False):
 
 @app.route('/')
 def index():
+    # wake the (free-tier) upcoming-release-movies service in the background
+    # so the calendar index is ready by the time the user hits Generate
+    warm_upcoming()
     return render_template('index.html')
 
 
