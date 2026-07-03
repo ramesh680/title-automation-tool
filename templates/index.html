@@ -160,15 +160,6 @@
                         <label class="lbl">Titles (one per line)</label>
                         <textarea id="titlesList" placeholder="Cookie Queens&#10;Cruel Hands&#10;Elijah Peel&#10;..."></textarea>
                     </div>
-                    <div class="form-group">
-                        <label class="lbl">Title type (applies to all)</label>
-                        <select id="titleType">
-                            <option value="movie">Movies</option>
-                            <option value="tvshow">TV Shows</option>
-                            <option value="talent">Talent (people)</option>
-                            <option value="mixed">Mixed (will ask per title)</option>
-                        </select>
-                    </div>
                 </div>
 
                 <div id="fileInput" style="display:none">
@@ -180,6 +171,18 @@
                         </div>
                         <span class="hint">Single column of title names, or a full export with a <b>title</b> column.</span>
                     </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="lbl">Title type (applies to all)</label>
+                    <select id="titleType">
+                        <option value="movie">Movies</option>
+                        <option value="tvshow">TV Shows</option>
+                        <option value="talent">Talent (people)</option>
+                        <option value="mixed">Mixed (use type / title_category column)</option>
+                    </select>
+                    <span class="hint">For file uploads this applies to every row that has no
+                    <b>type</b> / <b>title_category</b> column value of its own — rows with one keep it.</span>
                 </div>
 
                 <div class="form-group">
