@@ -865,10 +865,175 @@ def create_talent_row(title, metadata=None):
     return row
 
 
-def make_row(title, is_movie, network="", metadata=None, talent=False):
-    """Dispatch: movies (42-col), TV (39-col BrandIngest), Talent (38-col BrandDef)."""
+# ===================== Video Games (BDR schema) =====================
+# Games export in the 39-column Video-Game BDR format. Like movies/TV they
+# get a base row (Operations - Core Title, brand_set 'Competitive View') and
+# a ' - DAR' twin (DAR labels, brand_set 'LF // Video Games // Games').
+GAME_COLUMNS = [
+    'brand_id', 'title', 'title_category', 'title_sub_category', 'genre',
+    'primary_genre', 'rovi_id', 'ticker_symbol', 'title_content_windows',
+    'companies', 'brand_set', 'active', 'released_on', 'box_office',
+    'street_date', 'gross_screen', 'opening_weekend_box_office', 'network',
+    'brand_listing_hidden', 'facebook_page', 'twitter_handle', 'instagram_user',
+    'youtube_channel_username', 'tiktok_user', 'tumblr_page',
+    'pinterest_user_username', 'pinterest_board', 'wikipedia_page',
+    'rottentomatoes', 'imdb_id', 'metacritic', 'facebook_search_terms',
+    'twitter_search_terms', 'instagram_search_terms', 'tumblr_search_terms',
+    'twitter_search_term_keywords', 'youtube_search_terms',
+    'reddit_search_terms', 'url_managers',
+]
+
+GAME_DAR_BRAND_SET = "LF // Video Games // Games"
+# fixed clause tails from the ingest template (incl. its 'Swtich 2' spelling)
+_GAME_KW_TAIL = ('"Video Game" OR Playstation OR iOS OR PS4 OR PS5 OR Xbox OR '
+                 'Switch OR Swtich 2 OR PC')
+_GAME_RD_TAIL = ('"Video Game" | Playstation | iOS | PS4 | PS5 | Xbox | '
+                 'Switch | Switch 2 | PC')
+
+# discovered platform label -> template platform tail
+_GAME_PLATFORM_ALIAS = {
+    'playstation 5': 'PS5', 'playstation 4': 'PS4', 'playstation 2': 'PS2',
+    'playstation': 'PS5', 'xbox series x': 'Xbox Series X',
+    'xbox series x/s': 'Xbox Series X', 'xbox series s': 'Xbox Series X',
+    'xbox one': 'Xbox One', 'nintendo switch 2': 'Switch 2',
+    'nintendo switch': 'Switch', 'microsoft windows': 'PC', 'windows': 'PC',
+    'macos': 'PC', 'linux': 'PC', 'ios': 'Mobile', 'android': 'Mobile',
+    'game boy': 'Game Boy',
+}
+
+
+def _game_hashtag(name):
+    """Template hashtag cleaning: case preserved; '&'->'and', '+'->'plus';
+    removes space : , - ! ' . \\ ( )"""
+    s = str(name or '')
+    for a, b in ((' ', ''), (':', ''), (',', ''), ('-', ''), ('!', ''),
+                 ("'", ''), ('.', ''), ('&', 'and'), ('+', 'plus'),
+                 ('\\', ''), ('(', ''), (')', '')):
+        s = s.replace(a, b)
+    return '#' + s
+
+
+def _game_platform_lines(platforms):
+    out = []
+    for p in (platforms or [])[:6]:
+        pl = str(p).strip()
+        tail = _GAME_PLATFORM_ALIAS.get(pl.lower())
+        line = ''
+        if _tref():
+            line = _tref().game_platform_for(tail or pl)
+        if not line:
+            line = f"Platform - {tail or pl}"
+        if line not in out:
+            out.append(line)
+    return out
+
+
+def create_game_row(title, metadata=None):
+    """Create a Video Game row in the 39-column BDR schema.
+    Values present in `metadata` always win over computed defaults."""
+    metadata = metadata or {}
+    is_dar = " - DAR" in title
+    clean_title = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
+    label = "DAR" if is_dar else "Operations - Core Title"
+
+    developer = str(metadata.get('developer') or '').strip()
+    dev_line = developer if developer.startswith('Developer - ') else \
+        (f"Developer - {developer}" if developer else '')
+    dev_name = dev_line.replace('Developer - ', '', 1)
+    publisher = str(metadata.get('network') or '').strip()
+
+    # sub-category = Developer line + up to 6 Platform lines
+    _sub = str(metadata.get('title_sub_category') or '').strip()
+    if not _sub:
+        _sub = "\n".join(x for x in
+                         [dev_line] + _game_platform_lines(metadata.get('platforms'))
+                         if x)
+
+    # genre (single, per template) + mapped primary
+    _genre = str(metadata.get('genre') or '').split('\n')[0].strip()
+    _primary = str(metadata.get('primary_genre') or '').strip()
+    if not _primary and _genre:
+        _primary = (_tref().game_primary_genre(_genre) if _tref() else '') or _genre
+
+    # publisher YouTube channel ('...|' entries in the template) + title
+    _yt = str(metadata.get('youtube_channel_username') or '').strip()
+    if not _yt and publisher and _tref():
+        pinfo = _tref().game_publisher(publisher)
+        if pinfo and pinfo.get('youtube'):
+            ch = pinfo['youtube']
+            _yt = ch + clean_title if ch.endswith('|') else f"{ch}|{clean_title}"
+
+    # developer keyword clauses (template tables; constructed fallback)
+    dinfo = (_tref().game_developer(dev_name) if (_tref() and dev_name) else None) or {}
+    tw_clause = dinfo.get('twitter_clause') or \
+        (f'{_game_hashtag(dev_name)} OR "{dev_name}"' if dev_name else '"Video Game"')
+    rd_clause = dinfo.get('reddit_clause') or \
+        (f'{_game_hashtag(dev_name)} | "{dev_name}"' if dev_name else '"Video Game"')
+
+    tag = _game_hashtag(clean_title)
+    gen_terms = f"{tag}|{label}\n{tag}videoGame|{label}"
+    kw_tail = "|DAR|DAR|2021-01-01" if is_dar else \
+        "|Operations - Core Title|Operations - Core Title"
+    gen_kw = f'("{clean_title}") ({tw_clause} OR {_GAME_KW_TAIL}){kw_tail}'
+    gen_reddit = f'("{clean_title}") ({rd_clause} | {_GAME_RD_TAIL})' + \
+        ("|2021-01-01" if is_dar else "")
+
+    def mv(key, default=''):
+        v = metadata.get(key, '')
+        return v if v not in (None, '') else default
+
+    row = {
+        'brand_id': metadata.get('brand_id', ''),
+        'title': title,
+        'title_category': 'Video Game',
+        'title_sub_category': _sub,
+        'genre': _genre,
+        'primary_genre': _primary,
+        'rovi_id': metadata.get('rovi_id', ''),
+        'ticker_symbol': metadata.get('ticker_symbol', ''),
+        'title_content_windows': metadata.get('title_content_windows', ''),
+        'companies': mv('companies', 'Pristine Brand' if is_dar else 'Unknown'),
+        'brand_set': mv('brand_set',
+                        GAME_DAR_BRAND_SET if is_dar else 'Competitive View'),
+        'active': mv('active', 't'),
+        'released_on': metadata.get('released_on', ''),
+        'box_office': metadata.get('box_office', ''),
+        'street_date': metadata.get('street_date', ''),
+        'gross_screen': metadata.get('gross_screen', ''),
+        'opening_weekend_box_office': metadata.get('opening_weekend_box_office', ''),
+        'network': publisher,
+        'brand_listing_hidden': mv('brand_listing_hidden', 'f'),
+        'facebook_page': metadata.get('facebook_page', ''),
+        'twitter_handle': metadata.get('twitter_handle', ''),
+        'instagram_user': str(metadata.get('instagram_user') or '').lower(),
+        'youtube_channel_username': _yt,
+        'tiktok_user': metadata.get('tiktok_user', ''),
+        'tumblr_page': metadata.get('tumblr_page', ''),
+        'pinterest_user_username': metadata.get('pinterest_user_username', ''),
+        'pinterest_board': metadata.get('pinterest_board', ''),
+        'wikipedia_page': metadata.get('wikipedia_page', ''),
+        'rottentomatoes': metadata.get('rottentomatoes', ''),
+        'imdb_id': metadata.get('imdb_id', ''),
+        'metacritic': metadata.get('metacritic', ''),
+        'facebook_search_terms': metadata.get('facebook_search_terms', ''),
+        'twitter_search_terms': mv('twitter_search_terms', gen_terms),
+        'instagram_search_terms': metadata.get('instagram_search_terms', ''),
+        'tumblr_search_terms': metadata.get('tumblr_search_terms', ''),
+        'twitter_search_term_keywords': mv('twitter_search_term_keywords', gen_kw),
+        'youtube_search_terms': metadata.get('youtube_search_terms', ''),
+        'reddit_search_terms': mv('reddit_search_terms', gen_reddit),
+        'url_managers': metadata.get('url_managers', ''),
+    }
+    return row
+
+
+def make_row(title, is_movie, network="", metadata=None, talent=False, game=False):
+    """Dispatch: movies (42-col), TV (39-col BrandIngest), Talent (38-col
+    BrandDef), Video Games (39-col BDR)."""
     if talent:
         return create_talent_row(title, metadata)
+    if game:
+        return create_game_row(title, metadata)
     if is_movie:
         return create_row(title, is_movie, network, metadata)
     return create_tv_row(title, network, metadata)
@@ -1077,11 +1242,13 @@ def _merge_meta(base_meta, title, auto_fetch, is_movie=True):
 
 
 def _norm_kind(v, default='movie'):
-    """'tvshow'/'TV Shows' -> 'tv'; 'Talent' -> 'talent'; else 'movie'.
-    'mixed' (or blank) falls back to the given default."""
+    """'tvshow'/'TV Shows' -> 'tv'; 'Talent' -> 'talent'; 'Video Game(s)' ->
+    'game'; else 'movie'. 'mixed' (or blank) falls back to the given default."""
     s = str(v or '').strip().lower()
     if 'talent' in s:
         return 'talent'
+    if 'game' in s:
+        return 'game'
     if 'tv' in s:
         return 'tv'
     if s in ('', 'mixed', 'nan', 'none'):
@@ -1119,14 +1286,17 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
                     progress(i + 1, total)
                 continue
             kind_r = _norm_kind(r.get('title_category'), default_kind)
-            if kind_r == 'talent':
+            if kind_r in ('talent', 'game'):
                 if auto_fetch:
-                    disc = dict(fetch_person(t) or {})
+                    disc = dict((fetch_person(t) if kind_r == 'talent'
+                                 else fetch_game(t)) or {})
                     for k, v in r.items():
                         if v not in (None, ''):
                             disc[k] = v
                     r = disc
-                rows.append(make_row(t, False, '', r, talent=True))
+                rows.append(make_row(t, False, '', r,
+                                     talent=(kind_r == 'talent'),
+                                     game=(kind_r == 'game')))
                 if progress:
                     progress(i + 1, total)
                 continue
@@ -1158,6 +1328,11 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
             if kind == 'talent':
                 meta = dict(fetch_person(title) or {}) if auto_fetch else {}
                 rows.append(make_row(title, False, '', meta, talent=True))
+            elif kind == 'game':
+                meta = dict(fetch_game(title) or {}) if auto_fetch else {}
+                rows.append(make_row(title, False, '', meta, game=True))
+                if include_dar and ' - DAR' not in title:
+                    rows.append(make_row(f"{title} - DAR", False, '', meta, game=True))
             else:
                 is_movie = kind == 'movie'
                 meta = _merge_meta({}, title, auto_fetch, is_movie=is_movie)
@@ -1179,19 +1354,26 @@ def build_rows_from_titles(data, max_titles=None, progress=None):
     total = len(titles)
     rows = []
     for i, title in enumerate(titles):
-        kind = str(data.get('titles_type', {}).get(title, 'movie')).lower()
-        is_talent = 'talent' in kind
-        is_movie = kind == 'movie'
+        kind = _norm_kind(data.get('titles_type', {}).get(title, 'movie'))
         network = data.get('networks', {}).get(title, '')
         base_meta = data.get('metadata', {}).get(title, {})
-        if is_talent:
+        if kind == 'talent':
             metadata = dict(fetch_person(title) or {}) if auto_fetch else {}
             for k, v in (base_meta or {}).items():
                 if v not in (None, ''):
                     metadata[k] = v
             # talent = a single DAR row per person, no twin
             rows.append(make_row(title, False, '', metadata, talent=True))
+        elif kind == 'game':
+            metadata = dict(fetch_game(title) or {}) if auto_fetch else {}
+            for k, v in (base_meta or {}).items():
+                if v not in (None, ''):
+                    metadata[k] = v
+            rows.append(make_row(title, False, '', metadata, game=True))
+            if include_dar and ' - DAR' not in title:
+                rows.append(make_row(f"{title} - DAR", False, '', metadata, game=True))
         else:
+            is_movie = kind == 'movie'
             metadata = _merge_meta(base_meta, title, auto_fetch, is_movie=is_movie)
             rows.append(make_row(title, is_movie, network, metadata))
             if include_dar and ' - DAR' not in title:
@@ -1209,14 +1391,20 @@ def _is_talent_row(r):
     return str(r.get('title_category', '')).lower() == 'talent'
 
 
+def _is_game_row(r):
+    return 'game' in str(r.get('title_category', '')).lower()
+
+
 def _rows_to_workbook(rows):
     """Write rows to an xlsx BytesIO. Movies use the 42-col schema, TV the
-    39-col BrandIngest, Talent the 38-col BrandDef; mixed runs get one sheet
-    per schema."""
+    39-col BrandIngest, Talent the 38-col BrandDef, Video Games the 39-col
+    BDR; mixed runs get one sheet per schema."""
     talent = [r for r in rows if _is_talent_row(r)]
+    games = [r for r in rows if _is_game_row(r)]
     tv = [r for r in rows if _is_tv_row(r)]
-    movies = [r for r in rows if not _is_tv_row(r) and not _is_talent_row(r)]
-    groups = [g for g in (movies, tv, talent) if g]
+    movies = [r for r in rows
+              if not _is_tv_row(r) and not _is_talent_row(r) and not _is_game_row(r)]
+    groups = [g for g in (movies, tv, talent, games) if g]
     if len(groups) > 1:
         sheets = []
         if movies:
@@ -1225,8 +1413,12 @@ def _rows_to_workbook(rows):
             sheets.append(('TV Shows', tv, TV_COLUMNS))
         if talent:
             sheets.append(('Talent', talent, TALENT_COLUMNS))
+        if games:
+            sheets.append(('Video Games', games, GAME_COLUMNS))
     elif talent:
         sheets = [('BrandDef', talent, TALENT_COLUMNS)]
+    elif games:
+        sheets = [('BDR', games, GAME_COLUMNS)]
     elif tv:
         sheets = [('BrandIngest', tv, TV_COLUMNS)]
     else:
@@ -1287,6 +1479,10 @@ def api_lookup():
         meta = fetch_person(title)
         row = make_row(title, False, '', dict(meta), talent=True)
         return jsonify({'discovered': meta, 'row': row})
+    if 'game' in kind:
+        meta = fetch_game(title)
+        row = make_row(title, False, '', dict(meta), game=True)
+        return jsonify({'discovered': meta, 'row': row})
     is_movie = 'tv' not in kind
     if tt:
         meta = fetch_metadata_by_tt(tt, is_movie, title)
@@ -1305,10 +1501,11 @@ def preview_data():
         # preview shows the schema of the first title's category
         def _kind(r):
             return ('talent' if _is_talent_row(r) else
+                    'game' if _is_game_row(r) else
                     'tv' if _is_tv_row(r) else 'movie')
         first = _kind(rows[0])
-        cols = {'talent': TALENT_COLUMNS, 'tv': TV_COLUMNS,
-                'movie': COLUMNS}[first]
+        cols = {'talent': TALENT_COLUMNS, 'game': GAME_COLUMNS,
+                'tv': TV_COLUMNS, 'movie': COLUMNS}[first]
         same = [r for r in rows if _kind(r) == first]
         df = pd.DataFrame(same)
         df = df.reindex(columns=cols).where(lambda x: pd.notnull(x), '')
@@ -1431,8 +1628,45 @@ def build_review(src, auto_fetch=True, progress=None):
         rows_reviewed += 1
         cat = str(r.get(lower_cols.get('title_category', ''), '') or '')
         is_talent = 'talent' in cat.lower()
-        is_movie = (not is_talent) and 'tv' not in cat.lower()
+        is_game = 'game' in cat.lower()
+        is_movie = (not is_talent) and (not is_game) and 'tv' not in cat.lower()
         sub = _sub_parts(r.get(lower_cols.get('title_sub_category', '')))
+
+        if is_game:
+            meta = dict(fetch_game(t) or {}) if auto_fetch else {}
+            # manual sub lines fill discovery gaps (developer / platforms)
+            if not meta.get('developer') and sub.get('Developer'):
+                meta['developer'] = sub['Developer']
+            if not meta.get('platforms'):
+                plats = [l.split(' - ', 1)[1] for l in
+                         str(r.get(lower_cols.get('title_sub_category', ''), '') or '').split('\n')
+                         if l.startswith('Platform - ')]
+                if plats:
+                    meta['platforms'] = plats
+            if not meta.get('network'):
+                meta['network'] = str(r.get(lower_cols.get('network', ''), '') or '').strip()
+            g = str(r.get(lower_cols.get('genre', ''), '') or '').strip()
+            if not meta.get('genre') and g:
+                meta['genre'] = g
+            expected = make_row(t, False, '', meta, game=True)
+            for col in GAME_COLUMNS:
+                if col in REVIEW_SKIP_COLS or col.lower() not in lower_cols:
+                    continue
+                src_col = lower_cols[col.lower()]
+                mval = _review_norm(r.get(src_col))
+                eval_ = _review_norm(expected.get(col))
+                cells_checked += 1
+                if not eval_ or mval == eval_:
+                    continue
+                status = 'Gap' if not mval else 'Mismatch'
+                findings.append(dict(
+                    row=i + 2, title=t, column=src_col, status=status,
+                    current=str(r.get(src_col) if r.get(src_col) is not None else ''),
+                    suggested=str(expected.get(col) or '')))
+                fills[(i, src_col)] = status
+            if progress:
+                progress(i + 1, total)
+            continue
 
         if is_talent:
             meta = dict(fetch_person(t) or {}) if auto_fetch else {}
