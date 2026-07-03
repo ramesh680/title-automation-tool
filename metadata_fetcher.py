@@ -791,6 +791,91 @@ def fetch_person(name):
     return meta
 
 
+# ---------------- Video Games ----------------
+_GAME_TYPES = {"Q7889", "Q116776512", "Q865493"}  # video game (+ expansions)
+
+
+def fetch_game(name):
+    """Auto-discover a VIDEO GAME via Wikidata: developer (P178), publisher
+    (P123), platforms (P400), genres (P136), release (P577), socials,
+    wikipedia, metacritic, imdb. Fails soft ({})."""
+    if not name:
+        return {}
+    clean = re.sub(r"\s*-\s*DAR\s*$", "", name, flags=re.IGNORECASE).strip()
+    clean, _ = _split_disambiguator(clean)
+    key = ("game:" + clean.lower(),)
+    if key in _CACHE:
+        return dict(_CACHE[key])
+    meta = {}
+    try:
+        entity = None
+        fallback = None
+        for cand in _search_candidates(clean, limit=8)[:6]:
+            ent = _entity(cand)
+            if not ent:
+                continue
+            claims = ent.get("claims", {})
+            is_game = bool(set(_claim_values(claims, "P31")) & _GAME_TYPES)
+            has_gamey = bool(_claim_values(claims, "P178") or _claim_values(claims, "P400"))
+            lbl = (ent.get("labels", {}).get("en", {}) or {}).get("value", "")
+            if (is_game or has_gamey) and _norm(lbl) == _norm(clean):
+                entity = ent
+                break
+            if is_game and fallback is None:
+                fallback = ent
+        entity = entity or fallback
+        if entity is not None:
+            claims = entity.get("claims", {})
+            raw = {}
+            for prop, k in PROPERTY_MAP.items():
+                v = _claim_values(claims, prop)
+                if v:
+                    raw[k] = v[0]
+            dev_qids = _claim_values(claims, "P178")[:2]
+            pub_qids = _claim_values(claims, "P123", prefer_us=True)[:2]
+            plat_qids = _claim_values(claims, "P400")[:6]
+            genre_qids = _claim_values(claims, "P136")[:4]
+            labels = _labels(dev_qids + pub_qids + plat_qids + genre_qids)
+            if dev_qids and labels.get(dev_qids[0]):
+                meta["developer"] = labels[dev_qids[0]]
+            if pub_qids and labels.get(pub_qids[0]):
+                meta["network"] = labels[pub_qids[0]]  # publisher
+            plats = [labels[q] for q in plat_qids if labels.get(q)]
+            if plats:
+                meta["platforms"] = plats
+            gnames = [labels[q] for q in genre_qids if labels.get(q)]
+            if gnames:
+                g0 = re.sub(r"\s+(video )?game$", "", gnames[0].strip(),
+                            flags=re.IGNORECASE).strip().title()
+                meta["genre"] = g0
+            for v in _claim_values(claims, "P577", prefer_us=True):
+                d = _parse_time(v)
+                if d:
+                    meta["released_on"] = d
+                    break
+            if raw.get("imdb"):
+                meta["imdb_id"] = "https://www.imdb.com/title/" + raw["imdb"]
+            if raw.get("metacritic"):
+                meta["metacritic"] = ("https://www.metacritic.com/"
+                                      + raw["metacritic"].strip("/") + "/")
+            if "twitter" in raw:
+                meta["twitter_handle"] = raw["twitter"]
+            if "instagram" in raw:
+                meta["instagram_user"] = str(raw["instagram"]).lower()
+            if "facebook" in raw:
+                meta["facebook_page"] = "https://www.facebook.com/" + raw["facebook"]
+            if "tiktok" in raw:
+                meta["tiktok_user"] = str(raw["tiktok"]).lstrip("@")
+            enwiki = entity.get("sitelinks", {}).get("enwiki")
+            if enwiki and enwiki.get("title"):
+                meta["wikipedia_page"] = ("https://en.wikipedia.org/wiki/"
+                                          + enwiki["title"].replace(" ", "_"))
+    except Exception as e:  # noqa: BLE001
+        log.warning("fetch_game failed for %r: %s", name, e)
+    _CACHE[key] = dict(meta)
+    return meta
+
+
 def youtube_channel(title):
     """The title's own channel via the YouTube Data API (optional key)."""
     if not YOUTUBE_API_KEY:
