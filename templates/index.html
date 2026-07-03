@@ -165,6 +165,7 @@
                         <select id="titleType">
                             <option value="movie">Movies</option>
                             <option value="tvshow">TV Shows</option>
+                            <option value="talent">Talent (people)</option>
                             <option value="mixed">Mixed (will ask per title)</option>
                         </select>
                     </div>
@@ -298,6 +299,8 @@
                 titles.forEach(t => payload.titles_type[t] = 'movie');
             } else if (titleType === 'tvshow') {
                 titles.forEach(t => payload.titles_type[t] = 'tvshow');
+            } else if (titleType === 'talent') {
+                titles.forEach(t => payload.titles_type[t] = 'talent');
             }
             return {
                 method: 'POST',
