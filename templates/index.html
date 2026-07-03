@@ -85,7 +85,7 @@
         .file-upload-label{display:flex;flex-direction:column;align-items:center;gap:8px;padding:34px 20px;border:1.5px dashed rgba(124,92,255,.45);
             border-radius:var(--radius-sm);text-align:center;cursor:pointer;transition:.2s;background:rgba(124,92,255,.05);color:var(--muted);font-size:.9rem}
         .file-upload-label:hover{background:rgba(124,92,255,.1);border-color:var(--brand1);color:var(--text)}
-        
+
         .hint{color:var(--faint);font-size:.78rem;margin-top:9px;display:block;line-height:1.5}
         /* buttons */
         .button-group{display:flex;gap:12px;margin-top:24px}
@@ -128,6 +128,7 @@
             <div class="nav-links">
                 <a class="nav-pill" href="/" style="text-decoration:none;color:#fff;background:linear-gradient(135deg,var(--brand1),var(--brand3));border:none">Generator</a>
                 <a class="nav-pill" href="/validator" style="text-decoration:none">Validator</a>
+                <a class="nav-pill" href="/review" style="text-decoration:none">Review</a>
                 <span class="nav-pill">Ramesh Goswami</span>
             </div>
         </nav>
@@ -239,9 +240,9 @@
                 fileUpload.addEventListener('change', function () {
                     const label = document.querySelector('.file-upload-label');
                     if (this.files && this.files[0]) {
-                        label.textContent = '\uD83D\uDCC4 ' + this.files[0].name;
+                        label.textContent = '📄 ' + this.files[0].name;
                     } else {
-                        label.textContent = '\uD83D\uDCC1 Click to select or drag file here';
+                        label.textContent = '📁 Click to select or drag file here';
                     }
                 });
             }
@@ -365,7 +366,7 @@
                     let val = row[col];
                     if (val === null || val === undefined) val = '';
                     val = String(val).replace(/\n/g, ' ');
-                    const display = val.length > 40 ? val.substring(0, 40) + '\u2026' : val;
+                    const display = val.length > 40 ? val.substring(0, 40) + '…' : val;
                     html += `<td title="${escapeHtml(val)}">${escapeHtml(display)}</td>`;
                 });
                 html += '</tr>';
