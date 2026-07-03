@@ -1076,11 +1076,27 @@ def _merge_meta(base_meta, title, auto_fetch, is_movie=True):
     return merged
 
 
-def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None, progress=None):
+def _norm_kind(v, default='movie'):
+    """'tvshow'/'TV Shows' -> 'tv'; 'Talent' -> 'talent'; else 'movie'.
+    'mixed' (or blank) falls back to the given default."""
+    s = str(v or '').strip().lower()
+    if 'talent' in s:
+        return 'talent'
+    if 'tv' in s:
+        return 'tv'
+    if s in ('', 'mixed', 'nan', 'none'):
+        return default
+    return 'movie'
+
+
+def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
+                           progress=None, default_kind='movie'):
     """Turn an uploaded file into fully-populated rows.
 
     max_titles caps titles processed BEFORE lookups (keeps Preview fast).
     progress(done, total) is called after each source title (for job progress).
+    default_kind (movie/tv/talent) comes from the UI's Title-type selector and
+    applies to rows that don't declare their own type/title_category.
     """
     df = _read_upload(src)
     lower_cols = {c.lower(): c for c in df.columns}
@@ -1102,8 +1118,8 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None, 
                 if progress:
                     progress(i + 1, total)
                 continue
-            cat = str(r.get('title_category', '')).lower()
-            if 'talent' in cat:
+            kind_r = _norm_kind(r.get('title_category'), default_kind)
+            if kind_r == 'talent':
                 if auto_fetch:
                     disc = dict(fetch_person(t) or {})
                     for k, v in r.items():
@@ -1114,7 +1130,7 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None, 
                 if progress:
                     progress(i + 1, total)
                 continue
-            is_movie_r = 'tv' not in cat
+            is_movie_r = kind_r == 'movie'
             if auto_fetch:
                 r = _merge_meta(r, t, True, is_movie=is_movie_r)
             # route through make_row so derived fields (network label, youtube
@@ -1134,13 +1150,7 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None, 
                 continue
             if max_titles and len(specs) >= max_titles:
                 break
-            kind = str(r[type_col]).strip().lower() if type_col else 'movie'
-            if 'talent' in kind:
-                kind = 'talent'
-            elif 'tv' in kind:
-                kind = 'tv'
-            else:
-                kind = 'movie'
+            kind = _norm_kind(r[type_col] if type_col else '', default_kind)
             network = str(r[network_col]).strip() if network_col else ''
             specs.append((title, kind, network))
         total = len(specs)
@@ -1245,8 +1255,10 @@ def collect_rows(preview=False):
     if request.files.get('file'):
         include_dar = request.form.get('includeDar', 'true').lower() != 'false'
         auto_fetch = request.form.get('autoFetch', 'false').lower() == 'true'
+        default_kind = _norm_kind(request.form.get('titleType'))
         rows = build_rows_from_upload(request.files['file'], include_dar, auto_fetch,
-                                      max_titles=max_titles)
+                                      max_titles=max_titles,
+                                      default_kind=default_kind)
     else:
         data = request.get_json(silent=True) or {}
         rows = build_rows_from_titles(data, max_titles=max_titles)
@@ -1656,7 +1668,8 @@ def _run_generation(jid, kind, payload):
         if kind == 'file':
             rows = build_rows_from_upload(
                 (payload['bytes'], payload['filename']),
-                payload['include_dar'], payload['auto_fetch'], progress=prog)
+                payload['include_dar'], payload['auto_fetch'], progress=prog,
+                default_kind=payload.get('title_type', 'movie'))
         else:
             rows = build_rows_from_titles(payload['data'], progress=prog)
 
@@ -1682,6 +1695,7 @@ def generate_async():
             'bytes': f.read(), 'filename': f.filename,
             'include_dar': request.form.get('includeDar', 'true').lower() != 'false',
             'auto_fetch': request.form.get('autoFetch', 'false').lower() == 'true',
+            'title_type': _norm_kind(request.form.get('titleType')),
         }
         kind = 'file'
     else:
