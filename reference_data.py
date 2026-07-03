@@ -1,174 +1,173 @@
 """
 reference_data.py
 -----------------
-ListenFirst internal reference tables, learned from the manually-prepared
-BrandDefinition report. These encode conventions that are NOT available from any
-public API:
+Loads the Ops ingest templates as AUTHORITATIVE reference data:
 
-  * NETWORK_TO_COMPANIES  : LF network label -> parent "companies" value
-  * NETWORK_TO_YOUTUBE    : LF network label -> distributor YouTube channel
-  * NETWORK_TO_MANAGER    : LF network label -> url_managers team
-  * NETWORK_LABEL         : raw distributor (IMDb/BOM/TMDB) -> LF network label
-  * GENRE_FIX             : IMDb/TMDB genre token -> LF genre token
+  reference/film_ingest_template.xlsx  ("NEW Ingest Template - Film w/ Language")
+    - DropDown sheet: 271 studios -> Studio Type, YouTube (Company), parent
+      Company, Twitter Keyword String, Reddit Keyword String
+    - 'Media Conglomerate Brand Sets' sheet: per-studio DAR roll-up lines
 
-Extend these as new distributors appear. Keys are matched case-insensitively.
+  reference/tv_ingest_template.xlsx    ("New Brand Definitions Ingest Template - TV")
+    - DropdownLists sheet: 228 networks -> Network Type, Ticker, YouTube,
+      Twitter/Reddit Keyword Strings; primary-genre Order of Operations
+    - 'Conglomerate Brand Sets' sheet: per-network DAR roll-up block
+
+To update the tool's logic, Ops replaces these files in the repo's
+reference/ folder -- no code change needed. Paths can be overridden with the
+REFERENCE_DIR / FILM_TEMPLATE / TV_TEMPLATE environment variables.
+
+Everything fails soft: if the files are missing or unreadable, the app falls
+back to its built-in tables.
 """
 
-# raw distributor name (as returned by BOM / IMDb / TMDB) -> LF network label
-NETWORK_LABEL = {
-    "lionsgate": "Lionsgate / Summit",
-    "summit entertainment": "Lionsgate / Summit",
-    "lionsgate films": "Lionsgate / Summit",
-    "columbia pictures": "Sony / Columbia",
-    "sony pictures releasing": "Sony / Columbia",
-    "sony pictures": "Sony / Columbia",
-    "sony pictures entertainment": "Sony / Columbia",
-    "sony pictures classics": "Sony Classics",
-    "20th century fox": "20th Century Studios",
-    "20th century studios": "20th Century Studios",
-    "walt disney studios motion pictures": "Disney",
-    "walt disney pictures": "Disney",
-    "amazon mgm studios": "Amazon MGM Studios",
-    "amazon studios": "Amazon MGM Studios",
-    "warner bros.": "Warner Bros.",
-    "warner bros. pictures": "Warner Bros.",
-    "pbs": "PBS network",
-}
+import logging
+import os
 
-# LF network label -> parent company ("companies" column). Absent -> "Unknown".
-NETWORK_TO_COMPANIES = {
-    "20th Century Studios": "Walt Disney Pictures",
-    "Amazon MGM Studios": "Amazon Studios",
-    "Disney": "Walt Disney Pictures",
-    "Lionsgate / Summit": "Lionsgate",
-    "Neon": "Neon",
-    "Sony / Columbia": "Sony Pictures",
-    "Sony Classics": "Sony Pictures",
-    "Warner Bros.": "Warner Bros. Pictures",
-}
+log = logging.getLogger(__name__)
 
-# LF network label -> distributor YouTube channel (youtube_channel_company)
-NETWORK_TO_YOUTUBE = {
-    "20th Century Studios": "http://www.youtube.com/user/FoxMovies",
-    "Amazon MGM Studios": "http://www.youtube.com/channel/UCf5CjDJvsFvtVIhkfmKAwAA",
-    "Atlas Distribution": "http://www.youtube.com/channel/UCMLA_XtSbnfjXHL2An8zfGg",
-    "Aura Entertainment": "http://www.youtube.com/@AuraEntFilms",
-    "Big World Pictures": "http://www.youtube.com/channel/UCx1mHWMsCO96ungWSwS5Udg",
-    "Blue Fox": "http://www.youtube.com/channel/UCmHYPCM_h8Tw9JkI3UnrCvA",
-    "Dark Sky Films": "http://www.youtube.com/user/dsf2006",
-    "Disney": "http://www.youtube.com/@pixar",
-    "Fathom Events": "http://www.youtube.com/user/FathomEvents",
-    "Fin & Fur Films": "http://www.youtube.com/@finfurfilms/videos",
-    "GKIDS": "http://www.youtube.com/user/GKIDStv",
-    "Giant Pictures": "http://www.youtube.com/@GiantPictures",
-    "Greenwich Entertainment": "http://www.youtube.com/channel/UCLFmfzQaJE_YlgXtnkr3e_Q",
-    "IFC Films": "http://www.youtube.com/user/IFCFilmsTube",
-    "Iconic Events": "http://www.youtube.com/@iconicreleasing",
-    "Independent Film Company": "http://www.youtube.com/@IndependentFilmCompany",
-    "Indican Pictures": "http://www.youtube.com/user/IndicanPictures",
-    "Janus Films": "http://www.youtube.com/user/janusfilmsnyc",
-    "Kani Releasing": "http://www.youtube.com/@kani-releasing",
-    "Kino Lorber": "http://www.youtube.com/user/kinolorber",
-    "Lionsgate / Summit": "http://www.youtube.com/user/LionsgateLIVE",
-    "MUBI": "http://www.youtube.com/@mubi",
-    "Magnolia": "http://www.youtube.com/user/MagnoliaPictures",
-    "Neon": "http://www.youtube.com/channel/UCpy5dRhZd-JbZP4NsrnLt1w",
-    "Oscilloscope Pictures": "http://www.youtube.com/user/oscopelabs",
-    "PBS network": "http://www.youtube.com/@PBS",
-    "Persimmon": "http://www.youtube.com/@persimmonpresents",
-    "Roadside Attractions": "http://www.youtube.com/user/RoadsideFlix",
-    "Row K Entertainment": "http://youtube.com/@rowkpresents",
-    "Sandbox Films": "http://www.youtube.com/@sandboxdocs",
-    "Sony / Columbia": "http://www.youtube.com/@sonypictures",
-    "Sony Classics": "http://www.youtube.com/user/SonyPicturesClassics",
-    "Strand Releasing": "http://www.youtube.com/user/StrandReleasing",
-    "Sumerian Pictures": "http://www.youtube.com/@SumerianRecords",
-    "Trafalgar Releasing": "http://www.youtube.com/channel/UC_0NZhyl9KH0aMWXRnAKM4g",
-    "Warner Bros.": "http://www.youtube.com/user/WarnerBrosPictures",
-    "Watermelon Pictures": "http://www.youtube.com/@watermelonpicturesco",
-    "Well Go USA": "http://www.youtube.com/user/wellgousa",
-}
+try:
+    import openpyxl
+except Exception:  # pragma: no cover
+    openpyxl = None
 
-# LF network label -> url_managers team (3rd pipe field)
-NETWORK_TO_MANAGER = {
-    "20th Century Studios": "Disney Insights & Analytics + Disney Theatrical Research + Disney Ad Sales",
-    "Disney": "Disney Insights & Analytics + Disney Theatrical Research + Disney Ad Sales",
-    "Amazon MGM Studios": "Amazon PV Enterprise",
-    "Lionsgate / Summit": "Lionsgate",
-    "Neon": "Neon",
-    "Sony / Columbia": "Sony Enterprise",
-    "Sony Classics": "Sony Enterprise",
-    "Warner Bros.": "Warner Bros.",
-}
+REF_DIR = os.getenv("REFERENCE_DIR",
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference"))
+FILM_TEMPLATE = os.getenv("FILM_TEMPLATE", os.path.join(REF_DIR, "film_ingest_template.xlsx"))
+TV_TEMPLATE = os.getenv("TV_TEMPLATE", os.path.join(REF_DIR, "tv_ingest_template.xlsx"))
 
-# IMDb / TMDB genre token -> LF genre token
-GENRE_FIX = {
-    "Sci-Fi": "Sci Fi",
-    "Science Fiction": "Sci Fi",
-    "Film-Noir": "Film Noir",
-    "Rom-Com": "Romance",
-}
+FILM_STUDIOS = {}       # studio(lower) -> dict(studio_type, youtube, company, twitter_clause, reddit_clause)
+FILM_ROLLUPS = {}       # studio(lower) -> "Roll-Up 1\nRoll-Up 2[\nRoll-Up 3]"
+TV_NETWORKS = {}        # network(lower) -> dict(network_type, ticker, youtube, twitter_clause, reddit_clause)
+TV_CONGLOMERATES = {}   # network(lower) -> multi-line brand_set block
+TV_PRIMARY_ORDER = []   # [(genre, mapped_primary), ...] in Order of Operations
+
+LOADED = False
 
 
-def _ci_get(mapping, key):
-    if key is None:
-        return None
-    k = str(key).strip()
-    if k in mapping:
-        return mapping[k]
-    kl = k.lower()
-    for mk, mv in mapping.items():
-        if mk.lower() == kl:
-            return mv
-    return None
+def _s(v):
+    return str(v).strip() if v is not None else ""
 
 
-def normalize_network(raw):
-    """Map a raw distributor name to the LF network label (else pass through)."""
-    if not raw:
-        return raw
-    return _ci_get(NETWORK_LABEL, raw) or str(raw).strip()
+def _load_film():
+    wb = openpyxl.load_workbook(FILM_TEMPLATE, data_only=True)
+    ws = wb["DropDown"]
+    # main studio table: J=Studio, K=Studio Type, L=YouTube, M=Company, N=Twitter
+    for r in range(2, ws.max_row + 1):
+        s = _s(ws.cell(r, 10).value)
+        if not s:
+            continue
+        FILM_STUDIOS[s.lower()] = dict(
+            name=s,
+            studio_type=_s(ws.cell(r, 11).value),
+            youtube=_s(ws.cell(r, 12).value),
+            company=_s(ws.cell(r, 13).value),
+            twitter_clause=_s(ws.cell(r, 14).value),
+            reddit_clause="",
+        )
+    # parallel reddit table: R=Studio ... V=Reddit Keyword String
+    for r in range(2, ws.max_row + 1):
+        s = _s(ws.cell(r, 18).value)
+        if s and s.lower() in FILM_STUDIOS:
+            FILM_STUDIOS[s.lower()]["reddit_clause"] = _s(ws.cell(r, 22).value)
+    # per-studio conglomerate roll-ups (column-oriented)
+    ws2 = wb["Media Conglomerate Brand Sets"]
+    for c in range(2, ws2.max_column + 1):
+        studio = _s(ws2.cell(2, c).value)
+        if not studio:
+            continue
+        lines = [_s(ws2.cell(rr, c).value) for rr in (3, 4, 5)]
+        lines = [l for l in lines if l]
+        if lines:
+            FILM_ROLLUPS[studio.lower()] = "\n".join(lines)
 
 
-def companies_for(network):
-    """Parent company for a network label, or '' if not a known parent."""
-    return _ci_get(NETWORK_TO_COMPANIES, network) or ""
+def _load_tv():
+    wb = openpyxl.load_workbook(TV_TEMPLATE, data_only=True)
+    ws = wb["DropdownLists"]
+    # B=Companies, C=Network, D=Network Type, E=Ticker, F=YouTube, G=Twitter
+    for r in range(2, ws.max_row + 1):
+        n = _s(ws.cell(r, 3).value)
+        if not n:
+            continue
+        TV_NETWORKS[n.lower()] = dict(
+            name=n,
+            company=_s(ws.cell(r, 2).value),
+            network_type=_s(ws.cell(r, 4).value),
+            ticker=_s(ws.cell(r, 5).value),
+            youtube=_s(ws.cell(r, 6).value),
+            twitter_clause=_s(ws.cell(r, 7).value),
+            reddit_clause="",
+        )
+    # parallel reddit table: R=Network ... V=Reddit Keyword String
+    for r in range(2, ws.max_row + 1):
+        n = _s(ws.cell(r, 18).value)
+        if n and n.lower() in TV_NETWORKS:
+            TV_NETWORKS[n.lower()]["reddit_clause"] = _s(ws.cell(r, 22).value)
+    # primary-genre Order of Operations: N=genre, O=Mapped Primary Genre
+    for r in range(2, ws.max_row + 1):
+        g, m = _s(ws.cell(r, 14).value), _s(ws.cell(r, 15).value)
+        if g and m:
+            TV_PRIMARY_ORDER.append((g, m))
+    # per-network conglomerate brand-set block
+    ws2 = wb["Conglomerate Brand Sets"]
+    for r in range(2, ws2.max_row + 1):
+        n, b = _s(ws2.cell(r, 1).value), _s(ws2.cell(r, 2).value)
+        if not n or b in ("", "None"):
+            continue
+        for key in (n.lower(), n.split("\n")[0].strip().lower()):
+            TV_CONGLOMERATES.setdefault(key, b)
 
 
-def youtube_for(network):
-    return _ci_get(NETWORK_TO_YOUTUBE, network) or ""
+def load():
+    """(Re)load both templates. Returns True when any reference data loaded."""
+    global LOADED
+    if openpyxl is None:
+        return False
+    try:
+        if os.path.exists(FILM_TEMPLATE):
+            _load_film()
+        else:
+            log.warning("film template not found: %s", FILM_TEMPLATE)
+        if os.path.exists(TV_TEMPLATE):
+            _load_tv()
+        else:
+            log.warning("tv template not found: %s", TV_TEMPLATE)
+        LOADED = bool(FILM_STUDIOS or TV_NETWORKS)
+        log.info("reference templates loaded: %d studios, %d networks, "
+                 "%d film roll-ups, %d tv conglomerates, %d genre mappings",
+                 len(FILM_STUDIOS), len(TV_NETWORKS), len(FILM_ROLLUPS),
+                 len(TV_CONGLOMERATES), len(TV_PRIMARY_ORDER))
+    except Exception as e:  # noqa: BLE001
+        log.warning("reference template load failed: %s", e)
+    return LOADED
 
 
-def manager_for(network):
-    return _ci_get(NETWORK_TO_MANAGER, network) or ""
+# ---------------- lookups ----------------
+def film_studio(studio):
+    return FILM_STUDIOS.get(_s(studio).lower())
 
 
-def normalize_genres(genre_multiline):
-    """Apply GENRE_FIX token substitutions to a newline-joined genre string."""
-    if not genre_multiline:
-        return genre_multiline, ""
-    parts = [p.strip() for p in str(genre_multiline).split("\n") if p.strip()]
-    fixed = []
-    for p in parts:
-        fixed.append(GENRE_FIX.get(p, p))
-    # de-dupe preserving order (Sci-Fi + Science Fiction can both map to Sci Fi)
-    seen = set()
-    uniq = [g for g in fixed if not (g in seen or seen.add(g))]
-    return "\n".join(uniq), (uniq[0] if uniq else "")
+def film_rollup(studio):
+    return FILM_ROLLUPS.get(_s(studio).lower(), "")
 
 
-# LF network label -> title_sub_category (only networks that are CONSISTENT in the
-# manual file; networks whose scale varies per-title are omitted and fall back to
-# the "Release - Limited / Studio - Independent" default). Learned from the manual
-# report -- validate/extend from your master reference.
-NETWORK_TO_SUBCATEGORY = {
-    "Disney": "Release - Wide\nStudio - Major",
-    "Warner Bros.": "Release - Limited\nStudio - Major",
-    "Sony / Columbia": "Release - Wide\nStudio - Independent",
-    "Amazon MGM Studios": "Release - Wide\nStudio - Independent",
-    "AMC Network": "Release - Wide\nStudio - Independent",
-}
+def tv_network(network):
+    return TV_NETWORKS.get(_s(network).lower())
 
 
-def subcategory_for(network):
-    return _ci_get(NETWORK_TO_SUBCATEGORY, network) or ""
+def tv_conglomerate(network):
+    return TV_CONGLOMERATES.get(_s(network).lower(), "")
+
+
+def tv_primary_genre(genres):
+    """First genre in the Order-of-Operations list that the title has wins;
+    its Mapped Primary Genre is the answer ('' when nothing matches)."""
+    gs = {_s(g) for g in genres}
+    for g, mapped in TV_PRIMARY_ORDER:
+        if g in gs and mapped != "N/A":
+            return mapped
+    return ""
+
+
+load()
