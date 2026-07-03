@@ -151,23 +151,31 @@ _UPCOMING_TTL = 6 * 3600  # refresh the calendar index every 6h
 
 def _upcoming_index():
     """Cached index of the upcoming-release-movies service, keyed by
-    normalized title and by tt code. Fails soft (empty index) so the
+    normalized title and by tt code. The service runs on a free Render
+    instance that sleeps when idle, so a failed fetch is retried once after
+    a short pause (waking service). Fails soft (empty index) so the
     pipeline keeps working via the other sources."""
     now = time.time()
     if _UPCOMING["by_title"] and now - _UPCOMING["fetched"] < _UPCOMING_TTL:
         return _UPCOMING
     if _SESSION is None:
         return _UPCOMING
-    try:
-        start = (date.today() - timedelta(days=180)).isoformat()
-        end = (date.today() + timedelta(days=730)).isoformat()
-        r = _SESSION.get(UPCOMING_API,
-                         params={"start_date": start, "end_date": end},
-                         headers=HEADERS, timeout=UPCOMING_TIMEOUT)
-        r.raise_for_status()
-        movies = (r.json() or {}).get("movies") or []
-    except Exception as e:  # noqa: BLE001
-        log.warning("upcoming-release-movies fetch failed: %s", e)
+    start = (date.today() - timedelta(days=180)).isoformat()
+    end = (date.today() + timedelta(days=730)).isoformat()
+    movies = []
+    for attempt in (1, 2):
+        try:
+            r = _SESSION.get(UPCOMING_API,
+                             params={"start_date": start, "end_date": end},
+                             headers=HEADERS, timeout=UPCOMING_TIMEOUT)
+            r.raise_for_status()
+            movies = (r.json() or {}).get("movies") or []
+            break
+        except Exception as e:  # noqa: BLE001
+            log.warning("upcoming-release-movies fetch failed (try %d): %s", attempt, e)
+            if attempt == 1:
+                time.sleep(10)  # give the free instance time to wake
+    if not movies:
         return _UPCOMING
     by_title, by_tt = {}, {}
     for m in movies:
@@ -183,6 +191,13 @@ def _upcoming_index():
     if by_title:
         _UPCOMING.update(fetched=now, by_title=by_title, by_tt=by_tt)
     return _UPCOMING
+
+
+def warm_upcoming():
+    """Fire-and-forget warm-up of the calendar index (called when the tool's
+    page loads, so the sleeping service is awake before Generate is hit)."""
+    import threading
+    threading.Thread(target=_upcoming_index, daemon=True).start()
 
 
 def _upcoming_meta(m):
@@ -656,7 +671,18 @@ def wikidata_meta(title, qid=None, is_movie=True):
     labels = _labels(([net_qid] if net_qid else []) + genre_qids)
     if net_qid and labels.get(net_qid):
         meta["network"] = labels[net_qid]
-    gnames = [labels[q] for q in genre_qids if labels.get(q)]
+    # Wikidata genre labels are lowercase and suffixed ('science fiction
+    # film') -- clean them into Title Case tokens the LF taxonomy expects
+    gnames = []
+    for q in genre_qids:
+        lbl = labels.get(q)
+        if not lbl:
+            continue
+        lbl = re.sub(r"\s+(film|television series|tv series|series)$", "",
+                     lbl.strip(), flags=re.IGNORECASE).strip()
+        lbl = lbl.title().replace("Science Fiction", "Sci Fi")
+        if lbl and lbl not in gnames:
+            gnames.append(lbl)
     if gnames:
         meta["genre"] = "\n".join(gnames)
         meta["primary_genre"] = gnames[0]
