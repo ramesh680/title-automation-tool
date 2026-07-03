@@ -9,12 +9,16 @@ import threading
 import logging
 
 try:
-    from metadata_fetcher import fetch_metadata, fetch_metadata_by_tt, warm_upcoming
+    from metadata_fetcher import (fetch_metadata, fetch_metadata_by_tt,
+                                  fetch_person, warm_upcoming)
 except Exception:  # keep the app running even if the module is missing
     def fetch_metadata(title, is_movie=True):
         return {}
 
     def fetch_metadata_by_tt(tt, is_movie=True, title=""):
+        return {}
+
+    def fetch_person(name):
         return {}
 
     def warm_upcoming():
@@ -680,8 +684,191 @@ def create_tv_row(title, network="", metadata=None):
     return row
 
 
-def make_row(title, is_movie, network="", metadata=None):
-    """Dispatch: movies use the 42-col schema, TV the 39-col BrandIngest."""
+# ======================= Talent (BrandDef schema) =======================
+# Talent rows export in the 38-column BrandDef format (from the Talent ingest
+# template): ONE row per person, title suffixed ' - DAR', companies 'Pristine
+# Brand', brand_set 'LF // Talent\nPristine DAR Brands', a single
+# '#name|DAR|DAR' twitter search term, and a 3-line sub-category
+# (Talent Subtype / Gender / Talent Type).
+TALENT_COLUMNS = [
+    'brand_id', 'title', 'title_category', 'title_sub_category', 'genre',
+    'primary_genre', 'rovi_id', 'ticker_symbol', 'title_content_windows',
+    'companies', 'brand_set', 'active', 'released_on', 'box_office',
+    'street_date', 'gross_screen', 'opening_weekend_box_office', 'network',
+    'facebook_page', 'twitter_handle', 'instagram_user',
+    'youtube_channel_username', 'tiktok_user', 'linkedin_page', 'tumblr_page',
+    'pinterest_user_username', 'pinterest_board', 'wikipedia_page',
+    'rottentomatoes', 'imdb_id', 'metacritic', 'facebook_search_terms',
+    'twitter_search_terms', 'instagram_search_terms', 'tumblr_search_terms',
+    'twitter_search_term_keywords', 'youtube_search_terms', 'url_managers',
+]
+
+TALENT_DEFAULT_BRAND_SET = "LF // Talent\nPristine DAR Brands"
+
+# discovered occupation keyword -> (Talent Type, subtype kind, subtype term)
+# checked in order; 'Actor' becomes 'Actress' for Gender - Woman
+_TALENT_OCC_MAP = [
+    ('television presenter', 'Media Personality', 'Media Personality', 'TV'),
+    ('television host', 'Media Personality', 'Media Personality', 'TV'),
+    ('radio personality', 'Media Personality', 'Media Personality', 'Radio'),
+    ('radio host', 'Media Personality', 'Media Personality', 'Radio'),
+    ('podcaster', 'Media Personality', 'Media Personality', 'Podcaster'),
+    ('youtuber', 'Internet Personality', 'Internet Personality', 'Content Creator'),
+    ('internet celebrity', 'Internet Personality', 'Internet Personality', 'Influencer'),
+    ('influencer', 'Internet Personality', 'Internet Personality', 'Influencer'),
+    ('streamer', 'Internet Personality', 'Internet Personality', 'Streamer'),
+    ('rapper', 'Musician', 'Musician', 'Rapper'),
+    ('singer', 'Musician', 'Musician', 'Singer'),
+    ('composer', 'Musician', 'Musician', 'Composer'),
+    ('disc jockey', 'Musician', 'Musician', 'DJ / Producer'),
+    ('record producer', 'Musician', 'Musician', 'DJ / Producer'),
+    ('musician', 'Musician', '', ''),
+    ('actor', 'Actor', '', ''),
+    ('film director', 'Director', '', ''),
+    ('director', 'Director', '', ''),
+    ('comedian', 'Comedian', '', ''),
+    ('politician', 'Politician', '', ''),
+    ('journalist', 'Journalist', '', ''),
+    ('chef', 'Chef', '', ''),
+    ('model', 'Model', '', ''),
+    ('dancer', 'Dancer', '', ''),
+    ('choreographer', 'Dancer', '', ''),
+    ('screenwriter', 'Writer', '', ''),
+    ('author', 'Writer', '', ''),
+    ('writer', 'Writer', '', ''),
+    ('film producer', 'Producer', '', ''),
+    ('producer', 'Producer', '', ''),
+    ('activist', 'Activist', '', ''),
+    ('entrepreneur', 'Entrepreneur', '', ''),
+    ('businessperson', 'Entrepreneur', '', ''),
+    ('scientist', 'Scientist', '', ''),
+    ('photographer', 'Photographer', '', ''),
+    ('fashion designer', 'Designer', '', ''),
+    ('designer', 'Designer', '', ''),
+    ('magician', 'Magician', '', ''),
+    ('physician', 'Doctor', '', ''),
+    ('teacher', 'Education', '', ''),
+    ('professor', 'Education', '', ''),
+    ('athlete', 'Athlete', '', ''),
+]
+
+# discovered sport label -> template subtype term (rest matched literally)
+_TALENT_SPORT_ALIAS = {
+    'association football': 'Soccer', 'american football': 'Football',
+    'track and field': 'Running / Track & Field',
+    'athletics': 'Running / Track & Field',
+    'mixed martial arts': 'MMA', 'auto racing': 'Racing',
+    'motorsport': 'Motorsports', 'professional wrestling': 'Pro Wrestling',
+    'ice hockey': 'Ice Hockey', 'basketball': 'Basketball',
+    'baseball': 'Baseball', 'tennis': 'Tennis', 'golf': 'Golf',
+    'boxing': 'Boxing', 'swimming': 'Swimming', 'gymnastics': 'Gymnastics',
+    'cricket': 'Cricket', 'surfing': 'Surfer', 'skateboarding': 'Skateboarding',
+}
+
+
+def _talent_classify(metadata):
+    """(talent_type_line, subtype_line) from discovered occupations/sports."""
+    occs = [str(o).lower() for o in (metadata.get('occupations') or [])]
+    sports = [str(s).lower() for s in (metadata.get('sports') or [])]
+    gender = str(metadata.get('gender') or '')
+    ttype = subtype = ''
+    if sports:
+        ttype = 'Athlete'
+        term = _TALENT_SPORT_ALIAS.get(sports[0], sports[0].title())
+        if _tref():
+            subtype = _tref().talent_subtype_for('Athlete', term)
+        if not subtype:
+            subtype = f"Talent Subtype - Athlete - {term}"
+    else:
+        for kw, typ, skind, sterm in _TALENT_OCC_MAP:
+            if any(kw in o for o in occs):
+                ttype = typ
+                if skind and sterm:
+                    subtype = (_tref().talent_subtype_for(skind, sterm)
+                               if _tref() else '') or \
+                        f"Talent Subtype - {skind} - {sterm}"
+                break
+    if ttype == 'Actor' and gender == 'Gender - Woman':
+        ttype = 'Actress'
+    if ttype == 'Politician':
+        subtype = ('Talent Subtype - Politician - United States'
+                   if metadata.get('us_citizen')
+                   else 'Talent Subtype - Politician - International')
+    return (f"Talent Type - {ttype}" if ttype else '', subtype)
+
+
+def create_talent_row(title, metadata=None):
+    """Create a Talent row in the 38-column BrandDef schema.
+    Values present in `metadata` always win over computed defaults."""
+    metadata = metadata or {}
+    clean_name = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
+    out_title = f"{clean_name} - DAR"   # talent brands are DAR rows
+
+    # sub-category: Subtype \n Gender \n Talent Type (template CONCAT order)
+    _sub = str(metadata.get('title_sub_category') or '').strip()
+    if not _sub:
+        ttype_line, subtype_line = _talent_classify(metadata)
+        if not ttype_line:
+            ttype_line = 'Talent Type - Media Personality'  # template default
+        gender_line = str(metadata.get('gender') or '').strip()
+        _sub = "\n".join(x for x in (subtype_line, gender_line, ttype_line) if x)
+
+    # twitter search term: template formula — lowercase name, strip
+    # [space - . " ' ( )], single '#name|DAR|DAR' line
+    tag = re.sub(r"[ \-.\"'()]", "", clean_name).lower()
+    gen_terms = f"#{tag}|DAR|DAR" if tag else ""
+
+    def mv(key, default=''):
+        v = metadata.get(key, '')
+        return v if v not in (None, '') else default
+
+    row = {
+        'brand_id': metadata.get('brand_id', ''),
+        'title': out_title,
+        'title_category': 'Talent',
+        'title_sub_category': _sub,
+        'genre': metadata.get('genre', ''),
+        'primary_genre': metadata.get('primary_genre', ''),
+        'rovi_id': metadata.get('rovi_id', ''),
+        'ticker_symbol': metadata.get('ticker_symbol', ''),
+        'title_content_windows': metadata.get('title_content_windows', ''),
+        'companies': mv('companies', 'Pristine Brand'),
+        'brand_set': mv('brand_set', TALENT_DEFAULT_BRAND_SET),
+        'active': mv('active', 't'),
+        'released_on': metadata.get('released_on', ''),
+        'box_office': metadata.get('box_office', ''),
+        'street_date': metadata.get('street_date', ''),
+        'gross_screen': metadata.get('gross_screen', ''),
+        'opening_weekend_box_office': metadata.get('opening_weekend_box_office', ''),
+        'network': metadata.get('network', ''),
+        'facebook_page': metadata.get('facebook_page', ''),
+        'twitter_handle': metadata.get('twitter_handle', ''),
+        'instagram_user': str(metadata.get('instagram_user') or '').lower(),
+        'youtube_channel_username': metadata.get('youtube_channel_username', ''),
+        'tiktok_user': metadata.get('tiktok_user', ''),
+        'linkedin_page': metadata.get('linkedin_page', ''),
+        'tumblr_page': metadata.get('tumblr_page', ''),
+        'pinterest_user_username': metadata.get('pinterest_user_username', ''),
+        'pinterest_board': metadata.get('pinterest_board', ''),
+        'wikipedia_page': metadata.get('wikipedia_page', ''),
+        'rottentomatoes': metadata.get('rottentomatoes', ''),
+        'imdb_id': metadata.get('imdb_id', ''),
+        'metacritic': metadata.get('metacritic', ''),
+        'facebook_search_terms': metadata.get('facebook_search_terms', ''),
+        'twitter_search_terms': mv('twitter_search_terms', gen_terms),
+        'instagram_search_terms': metadata.get('instagram_search_terms', ''),
+        'tumblr_search_terms': metadata.get('tumblr_search_terms', ''),
+        'twitter_search_term_keywords': metadata.get('twitter_search_term_keywords', ''),
+        'youtube_search_terms': metadata.get('youtube_search_terms', ''),
+        'url_managers': metadata.get('url_managers', ''),
+    }
+    return row
+
+
+def make_row(title, is_movie, network="", metadata=None, talent=False):
+    """Dispatch: movies (42-col), TV (39-col BrandIngest), Talent (38-col BrandDef)."""
+    if talent:
+        return create_talent_row(title, metadata)
     if is_movie:
         return create_row(title, is_movie, network, metadata)
     return create_tv_row(title, network, metadata)
@@ -901,7 +1088,7 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None, 
 
     rows = []
     if has_full_schema:
-        all_cols = list(dict.fromkeys(COLUMNS + TV_COLUMNS))
+        all_cols = list(dict.fromkeys(COLUMNS + TV_COLUMNS + TALENT_COLUMNS))
         rename_map = {lower_cols[c.lower()]: c for c in all_cols if c.lower() in lower_cols}
         df = df.rename(columns=rename_map)
         df = df.where(pd.notnull(df), '')
@@ -915,7 +1102,19 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None, 
                 if progress:
                     progress(i + 1, total)
                 continue
-            is_movie_r = 'tv' not in str(r.get('title_category', '')).lower()
+            cat = str(r.get('title_category', '')).lower()
+            if 'talent' in cat:
+                if auto_fetch:
+                    disc = dict(fetch_person(t) or {})
+                    for k, v in r.items():
+                        if v not in (None, ''):
+                            disc[k] = v
+                    r = disc
+                rows.append(make_row(t, False, '', r, talent=True))
+                if progress:
+                    progress(i + 1, total)
+                continue
+            is_movie_r = 'tv' not in cat
             if auto_fetch:
                 r = _merge_meta(r, t, True, is_movie=is_movie_r)
             # route through make_row so derived fields (network label, youtube
@@ -935,17 +1134,26 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None, 
                 continue
             if max_titles and len(specs) >= max_titles:
                 break
-            is_movie = True
-            if type_col:
-                is_movie = 'tv' not in str(r[type_col]).strip().lower()
+            kind = str(r[type_col]).strip().lower() if type_col else 'movie'
+            if 'talent' in kind:
+                kind = 'talent'
+            elif 'tv' in kind:
+                kind = 'tv'
+            else:
+                kind = 'movie'
             network = str(r[network_col]).strip() if network_col else ''
-            specs.append((title, is_movie, network))
+            specs.append((title, kind, network))
         total = len(specs)
-        for i, (title, is_movie, network) in enumerate(specs):
-            meta = _merge_meta({}, title, auto_fetch, is_movie=is_movie)
-            rows.append(make_row(title, is_movie, network, meta))
-            if include_dar and ' - DAR' not in title:
-                rows.append(make_row(f"{title} - DAR", is_movie, network, meta))
+        for i, (title, kind, network) in enumerate(specs):
+            if kind == 'talent':
+                meta = dict(fetch_person(title) or {}) if auto_fetch else {}
+                rows.append(make_row(title, False, '', meta, talent=True))
+            else:
+                is_movie = kind == 'movie'
+                meta = _merge_meta({}, title, auto_fetch, is_movie=is_movie)
+                rows.append(make_row(title, is_movie, network, meta))
+                if include_dar and ' - DAR' not in title:
+                    rows.append(make_row(f"{title} - DAR", is_movie, network, meta))
             if progress:
                 progress(i + 1, total)
     return rows
@@ -961,12 +1169,23 @@ def build_rows_from_titles(data, max_titles=None, progress=None):
     total = len(titles)
     rows = []
     for i, title in enumerate(titles):
-        is_movie = data.get('titles_type', {}).get(title, 'movie') == 'movie'
+        kind = str(data.get('titles_type', {}).get(title, 'movie')).lower()
+        is_talent = 'talent' in kind
+        is_movie = kind == 'movie'
         network = data.get('networks', {}).get(title, '')
-        metadata = _merge_meta(data.get('metadata', {}).get(title, {}), title, auto_fetch, is_movie=is_movie)
-        rows.append(make_row(title, is_movie, network, metadata))
-        if include_dar and ' - DAR' not in title:
-            rows.append(make_row(f"{title} - DAR", is_movie, network, metadata))
+        base_meta = data.get('metadata', {}).get(title, {})
+        if is_talent:
+            metadata = dict(fetch_person(title) or {}) if auto_fetch else {}
+            for k, v in (base_meta or {}).items():
+                if v not in (None, ''):
+                    metadata[k] = v
+            # talent = a single DAR row per person, no twin
+            rows.append(make_row(title, False, '', metadata, talent=True))
+        else:
+            metadata = _merge_meta(base_meta, title, auto_fetch, is_movie=is_movie)
+            rows.append(make_row(title, is_movie, network, metadata))
+            if include_dar and ' - DAR' not in title:
+                rows.append(make_row(f"{title} - DAR", is_movie, network, metadata))
         if progress:
             progress(i + 1, total)
     return rows
@@ -976,13 +1195,28 @@ def _is_tv_row(r):
     return str(r.get('title_category', '')).lower() == 'tv shows'
 
 
+def _is_talent_row(r):
+    return str(r.get('title_category', '')).lower() == 'talent'
+
+
 def _rows_to_workbook(rows):
     """Write rows to an xlsx BytesIO. Movies use the 42-col schema, TV the
-    39-col BrandIngest schema; mixed runs get one sheet per schema."""
-    movies = [r for r in rows if not _is_tv_row(r)]
+    39-col BrandIngest, Talent the 38-col BrandDef; mixed runs get one sheet
+    per schema."""
+    talent = [r for r in rows if _is_talent_row(r)]
     tv = [r for r in rows if _is_tv_row(r)]
-    if movies and tv:
-        sheets = [('Movies', movies, COLUMNS), ('TV Shows', tv, TV_COLUMNS)]
+    movies = [r for r in rows if not _is_tv_row(r) and not _is_talent_row(r)]
+    groups = [g for g in (movies, tv, talent) if g]
+    if len(groups) > 1:
+        sheets = []
+        if movies:
+            sheets.append(('Movies', movies, COLUMNS))
+        if tv:
+            sheets.append(('TV Shows', tv, TV_COLUMNS))
+        if talent:
+            sheets.append(('Talent', talent, TALENT_COLUMNS))
+    elif talent:
+        sheets = [('BrandDef', talent, TALENT_COLUMNS)]
     elif tv:
         sheets = [('BrandIngest', tv, TV_COLUMNS)]
     else:
@@ -1034,9 +1268,14 @@ def api_lookup():
     would be generated from it. Use this to verify enrichment after a deploy."""
     title = request.args.get('title', '').strip()
     tt = request.args.get('tt', '').strip()
-    is_movie = request.args.get('type', 'movie').lower() != 'tv'
+    kind = request.args.get('type', 'movie').lower()
     if not (title or tt):
         return jsonify({'error': 'pass ?title= or ?tt='}), 400
+    if 'talent' in kind:
+        meta = fetch_person(title)
+        row = make_row(title, False, '', dict(meta), talent=True)
+        return jsonify({'discovered': meta, 'row': row})
+    is_movie = 'tv' not in kind
     if tt:
         meta = fetch_metadata_by_tt(tt, is_movie, title)
     else:
@@ -1052,8 +1291,13 @@ def preview_data():
         if not rows:
             return jsonify({'error': 'No titles provided'}), 400
         # preview shows the schema of the first title's category
-        cols = TV_COLUMNS if _is_tv_row(rows[0]) else COLUMNS
-        same = [r for r in rows if _is_tv_row(r) == _is_tv_row(rows[0])]
+        def _kind(r):
+            return ('talent' if _is_talent_row(r) else
+                    'tv' if _is_tv_row(r) else 'movie')
+        first = _kind(rows[0])
+        cols = {'talent': TALENT_COLUMNS, 'tv': TV_COLUMNS,
+                'movie': COLUMNS}[first]
+        same = [r for r in rows if _kind(r) == first]
         df = pd.DataFrame(same)
         df = df.reindex(columns=cols).where(lambda x: pd.notnull(x), '')
         # figure out whether the source had more titles than we sampled
@@ -1174,8 +1418,41 @@ def build_review(src, auto_fetch=True, progress=None):
             continue
         rows_reviewed += 1
         cat = str(r.get(lower_cols.get('title_category', ''), '') or '')
-        is_movie = 'tv' not in cat.lower()
+        is_talent = 'talent' in cat.lower()
+        is_movie = (not is_talent) and 'tv' not in cat.lower()
         sub = _sub_parts(r.get(lower_cols.get('title_sub_category', '')))
+
+        if is_talent:
+            meta = dict(fetch_person(t) or {}) if auto_fetch else {}
+            # manual sub-category lines fill classification gaps
+            if not meta.get('gender') and sub.get('Gender'):
+                meta['gender'] = 'Gender - ' + sub['Gender']
+            if sub.get('Talent Type') or sub.get('Talent Subtype'):
+                lines = [x for x in (
+                    ('Talent Subtype - ' + sub['Talent Subtype']) if sub.get('Talent Subtype') else '',
+                    ('Gender - ' + sub['Gender']) if sub.get('Gender') else '',
+                    ('Talent Type - ' + sub['Talent Type']) if sub.get('Talent Type') else '') if x]
+                if not (meta.get('occupations') or meta.get('sports')):
+                    meta['title_sub_category'] = '\n'.join(lines)
+            expected = make_row(t, False, '', meta, talent=True)
+            for col in TALENT_COLUMNS:
+                if col in REVIEW_SKIP_COLS or col.lower() not in lower_cols:
+                    continue
+                src_col = lower_cols[col.lower()]
+                mval = _review_norm(r.get(src_col))
+                eval_ = _review_norm(expected.get(col))
+                cells_checked += 1
+                if not eval_ or mval == eval_:
+                    continue
+                status = 'Gap' if not mval else 'Mismatch'
+                findings.append(dict(
+                    row=i + 2, title=t, column=src_col, status=status,
+                    current=str(r.get(src_col) if r.get(src_col) is not None else ''),
+                    suggested=str(expected.get(col) or '')))
+                fills[(i, src_col)] = status
+            if progress:
+                progress(i + 1, total)
+            continue
 
         # soft hints from the manual row: fill discovery gaps, never override
         hints = {}
