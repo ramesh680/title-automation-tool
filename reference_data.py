@@ -35,12 +35,16 @@ REF_DIR = os.getenv("REFERENCE_DIR",
                     os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference"))
 FILM_TEMPLATE = os.getenv("FILM_TEMPLATE", os.path.join(REF_DIR, "film_ingest_template.xlsx"))
 TV_TEMPLATE = os.getenv("TV_TEMPLATE", os.path.join(REF_DIR, "tv_ingest_template.xlsx"))
+TALENT_TEMPLATE = os.getenv("TALENT_TEMPLATE", os.path.join(REF_DIR, "talent_ingest_template.xlsx"))
 
 FILM_STUDIOS = {}       # studio(lower) -> dict(studio_type, youtube, company, twitter_clause, reddit_clause)
 FILM_ROLLUPS = {}       # studio(lower) -> "Roll-Up 1\nRoll-Up 2[\nRoll-Up 3]"
 TV_NETWORKS = {}        # network(lower) -> dict(network_type, ticker, youtube, twitter_clause, reddit_clause)
 TV_CONGLOMERATES = {}   # network(lower) -> multi-line brand_set block
 TV_PRIMARY_ORDER = []   # [(genre, mapped_primary), ...] in Order of Operations
+TALENT_TYPES = []       # ['Talent Type - Actor', ...]
+TALENT_SUBTYPES = []    # ['Talent Subtype - Athlete - Basketball', ...]
+TALENT_BRAND_SETS = []  # optional extra talent brand sets
 
 LOADED = False
 
@@ -119,8 +123,23 @@ def _load_tv():
             TV_CONGLOMERATES.setdefault(key, b)
 
 
+def _load_talent():
+    wb = openpyxl.load_workbook(TALENT_TEMPLATE, data_only=True)
+    ws = wb["DropDown"]
+    for r in range(2, ws.max_row + 1):
+        sub = _s(ws.cell(r, 6).value)     # 'Talent Subtype - ...'
+        typ = _s(ws.cell(r, 7).value)     # 'Talent Type - ...'
+        bs = _s(ws.cell(r, 4).value)      # brand sets
+        if sub and sub not in TALENT_SUBTYPES:
+            TALENT_SUBTYPES.append(sub)
+        if typ and typ not in TALENT_TYPES:
+            TALENT_TYPES.append(typ)
+        if bs and bs not in TALENT_BRAND_SETS:
+            TALENT_BRAND_SETS.append(bs)
+
+
 def load():
-    """(Re)load both templates. Returns True when any reference data loaded."""
+    """(Re)load the templates. Returns True when any reference data loaded."""
     global LOADED
     if openpyxl is None:
         return False
@@ -133,6 +152,10 @@ def load():
             _load_tv()
         else:
             log.warning("tv template not found: %s", TV_TEMPLATE)
+        if os.path.exists(TALENT_TEMPLATE):
+            _load_talent()
+        else:
+            log.warning("talent template not found: %s", TALENT_TEMPLATE)
         LOADED = bool(FILM_STUDIOS or TV_NETWORKS)
         log.info("reference templates loaded: %d studios, %d networks, "
                  "%d film roll-ups, %d tv conglomerates, %d genre mappings",
@@ -167,6 +190,22 @@ def tv_primary_genre(genres):
     for g, mapped in TV_PRIMARY_ORDER:
         if g in gs and mapped != "N/A":
             return mapped
+    return ""
+
+
+def talent_subtype_for(kind, term):
+    """Find the canonical 'Talent Subtype - <kind> - <x>' entry matching a
+    discovered term (e.g. kind='Athlete', term='Basketball')."""
+    t = _s(term).lower()
+    if not t:
+        return ""
+    prefix = f"talent subtype - {_s(kind).lower()} - "
+    for sub in TALENT_SUBTYPES:
+        sl = sub.lower()
+        if sl.startswith(prefix):
+            tail = sl[len(prefix):]
+            if tail == t or t in tail or tail in t:
+                return sub
     return ""
 
 
