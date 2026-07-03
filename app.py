@@ -23,16 +23,22 @@ import base64
 import types as _types
 
 # ---- Reference tables (inlined so no separate file can be missed on deploy) ----
-# distributor (raw from BOM/IMDb/TMDB) -> LF network label
+# distributor (raw from BOM/Wikipedia/Wikidata/IMDb/TMDB) -> LF network label
 _NETWORK_LABEL = {
     "lionsgate": "Lionsgate / Summit", "summit entertainment": "Lionsgate / Summit",
-    "lionsgate films": "Lionsgate / Summit", "columbia pictures": "Sony / Columbia",
+    "lionsgate films": "Lionsgate / Summit", "lionsgate premiere": "Lionsgate / Summit",
+    "columbia pictures": "Sony / Columbia",
     "sony pictures releasing": "Sony / Columbia", "sony pictures": "Sony / Columbia",
     "sony pictures entertainment": "Sony / Columbia", "sony pictures classics": "Sony Classics",
     "20th century fox": "20th Century Studios", "20th century studios": "20th Century Studios",
     "walt disney studios motion pictures": "Disney", "walt disney pictures": "Disney",
     "amazon mgm studios": "Amazon MGM Studios", "amazon studios": "Amazon MGM Studios",
-    "warner bros.": "Warner Bros.", "warner bros. pictures": "Warner Bros.", "pbs": "PBS network",
+    "warner bros.": "Warner Bros.", "warner bros. pictures": "Warner Bros.",
+    "warner bros. discovery": "Warner Bros.",
+    "neon rated": "Neon",
+    "pbs": "PBS network", "public broadcasting service": "PBS network",
+    "pbs distribution": "PBS network",
+    "cineverse entertainment": "Cineverse", "cineverse corp.": "Cineverse",
 }
 _NETWORK_TO_COMPANIES = {
     "20th Century Studios": "Walt Disney Pictures", "Amazon MGM Studios": "Amazon Studios",
@@ -47,6 +53,7 @@ _NETWORK_TO_YOUTUBE = {
     "Aura Entertainment": "http://www.youtube.com/@AuraEntFilms",
     "Big World Pictures": "http://www.youtube.com/channel/UCx1mHWMsCO96ungWSwS5Udg",
     "Blue Fox": "http://www.youtube.com/channel/UCmHYPCM_h8Tw9JkI3UnrCvA",
+    "Cineverse": "http://www.youtube.com/@cineverse_ent",
     "Dark Sky Films": "http://www.youtube.com/user/dsf2006",
     "Disney": "http://www.youtube.com/@pixar",
     "Fathom Events": "http://www.youtube.com/user/FathomEvents",
@@ -76,7 +83,7 @@ _NETWORK_TO_YOUTUBE = {
     "Strand Releasing": "http://www.youtube.com/user/StrandReleasing",
     "Sumerian Pictures": "http://www.youtube.com/@SumerianRecords",
     "Trafalgar Releasing": "http://www.youtube.com/channel/UC_0NZhyl9KH0aMWXRnAKM4g",
-    "Warner Bros.": "http://www.youtube.com/user/WarnerBrosPictures",
+    "Warner Bros.": "http://www.youtube.com/@WarnerBros",
     "Watermelon Pictures": "http://www.youtube.com/@watermelonpicturesco",
     "Well Go USA": "http://www.youtube.com/user/wellgousa",
 }
@@ -89,10 +96,23 @@ _NETWORK_TO_MANAGER = {
 }
 _NETWORK_TO_SUBCATEGORY = {
     "Disney": "Release - Wide\nStudio - Major",
-    "Warner Bros.": "Release - Limited\nStudio - Major",
+    "Warner Bros.": "Language Type - English\nRelease - Wide\nStudio - Major",
     "Sony / Columbia": "Release - Wide\nStudio - Independent",
     "Amazon MGM Studios": "Release - Wide\nStudio - Independent",
     "AMC Network": "Release - Wide\nStudio - Independent",
+    "Neon": "Language Type - English\nRelease - Wide\nStudio - Independent",
+    "Cineverse": "Release - Wide\nStudio - Independent",
+}
+# extra brand_set lines a DAR row carries when its network's parent company
+# has corporate roll-ups (learned from the manual file)
+_DAR_ROLLUPS = {
+    "Walt Disney Pictures": ("The Walt Disney Company > Film Roll-up\n"
+                             "The Walt Disney Company > Film + TV + Publishing Roll-up\n"
+                             "The Walt Disney Company > Overall Roll-up"),
+    "Warner Bros. Pictures": ("Warner Bros. Pictures Films\n"
+                              "WarnerMedia > Film Roll-up\n"
+                              "WarnerMedia > Film + TV + Publishing Roll-up\n"
+                              "WarnerMedia > Overall Roll-up"),
 }
 _GENRE_FIX = {"Sci-Fi": "Sci Fi", "Science Fiction": "Sci Fi", "Film-Noir": "Film Noir", "Rom-Com": "Romance"}
 
@@ -132,6 +152,7 @@ REF = _types.SimpleNamespace(
     companies_for=lambda n: _ref_ci_get(_NETWORK_TO_COMPANIES, n) or "",
     youtube_for=lambda n: _ref_ci_get(_NETWORK_TO_YOUTUBE, n) or "",
     subcategory_for=lambda n: _ref_ci_get(_NETWORK_TO_SUBCATEGORY, n) or "",
+    dar_rollup_for=lambda c: _ref_ci_get(_DAR_ROLLUPS, c) or "",
     normalize_genres=_ref_normalize_genres,
 )
 
@@ -156,7 +177,6 @@ COLUMNS = [
     'youtube_channel_username', 'youtube_channel_company', 'tiktok_user', 'linkedin_page',
     'threads_page', 'pinterest_user_username', 'pinterest_board', 'wikipedia_page',
     'rottentomatoes', 'imdb_id', 'metacritic',
-    # --- previously missing columns (AL -> AP) ---
     'twitter_search_terms', 'instagram_business_hashtags', 'twitter_search_term_keywords',
     'url_managers', 'last_reviewed'
 ]
@@ -180,16 +200,49 @@ def _alnum(s):
     return re.sub(r'[^a-z0-9]', '', (s or '').lower())
 
 
-def generate_search_terms(clean_title, network, year, is_dar):
-    """Generate twitter_search_terms (AL) and twitter_search_term_keywords (AN)
-    following the exact pattern observed in the Test_Run export.
+def _title_variants(clean_title):
+    """Lowercase title variants used in youtube_channel_username lines.
+    Titles with a colon get TWO lines: punctuation-stripped first, then the
+    original (matches the manual Ops format, e.g. the PBS documentary case)."""
+    tl = clean_title.lower()
+    stripped = re.sub(r'\s*:\s*', ' ', tl)
+    stripped = re.sub(r'\s+', ' ', stripped).strip()
+    return [stripped, tl] if stripped != tl else [tl]
+
+
+def build_youtube_username(company_channel, clean_title, own_channel=""):
+    """youtube_channel_username lines:
+      - the title's OWN channel URL alone on the first line (if it has one)
+      - then '<network channel>|<title variant>' for each title variant
     """
+    lines = []
+    own = (own_channel or "").strip()
+    if own and own != (company_channel or "").strip():
+        lines.append(own)
+    if company_channel:
+        lines.extend(f"{company_channel}|{v}" for v in _title_variants(clean_title))
+    return "\n".join(lines)
+
+
+def generate_search_terms(clean_title, network, year, is_dar, twitter_handle=""):
+    """Generate twitter_search_terms (AL) and twitter_search_term_keywords (AN).
+    When the title has its own @handle, it gets its own leading lines
+    (matching the manual Ops pattern)."""
     label = "DAR" if is_dar else "Operations - Core Title"
     t_hash = _alnum(clean_title)
     n_hash = _alnum(network)
 
     # twitter_search_terms
-    lines = [f"#{t_hash}|{label}|{label}"]
+    lines = []
+    handle = (twitter_handle or "").strip().lstrip("@").lower()
+    if handle:
+        if is_dar:
+            lines.append(f"@{handle}|DAR|DAR")
+        else:
+            lines.append(f"@{handle}|TV Ops|TV Ops")
+            lines.append(f"@{handle}|Film Ops|Film Ops")
+            lines.append(f"@{handle}|Operations - Core Title|Operations - Core Title")
+    lines.append(f"#{t_hash}|{label}|{label}")
     if n_hash:
         lines.append(f"#{t_hash}{n_hash}|{label}|{label}")
     terms = "\n".join(lines)
@@ -260,7 +313,6 @@ def generate_url_managers(row):
     return "\n".join(entries)
 
 
-
 def _norm_bool(v):
     """Normalise a truthiness/string into the lowercase 'true'/'false' the feed expects."""
     if isinstance(v, bool):
@@ -276,8 +328,6 @@ def create_row(title, is_movie, network="", metadata=None):
 
     Any value present in `metadata` overrides the computed default, so an
     uploaded row's channels (and every other field) are preserved.
-    `companies` follows the effective network; search-term columns are
-    generated when not already supplied.
     """
     metadata = metadata or {}
     is_dar = " - DAR" in title
@@ -290,31 +340,41 @@ def create_row(title, is_movie, network="", metadata=None):
     if REF is not None and eff_network:
         eff_network = REF.normalize_network(eff_network)
 
+    # sub-category is shared by the base title AND its DAR twin
+    _sub = str(metadata.get('title_sub_category') or '').strip()
+    if not _sub and REF is not None:
+        _sub = REF.subcategory_for(eff_network)
+    if not _sub:
+        _sub = 'Release - Limited\nStudio - Independent'
+    is_wide = 'release - wide' in _sub.lower()
+
+    # curated PARENT company of the network (e.g. Warner Bros. -> Warner Bros. Pictures)
+    parent = REF.companies_for(eff_network) if (REF is not None and eff_network) else ""
+
     if is_dar:
         companies = "Pristine Brand"
         if is_movie:
             brand_set = "LF // Film - Majors + Independents\nPristine DAR Brands"
         else:
             brand_set = "Pristine DAR Brands"
+        # major-studio DAR rows also carry the corporate roll-up brand sets
+        rollup = REF.dar_rollup_for(parent) if (REF is not None and parent) else ""
+        if rollup:
+            brand_set += "\n" + rollup
     else:
-        # companies = curated PARENT of the network (not the network itself); else Unknown
-        parent = REF.companies_for(eff_network) if (REF and eff_network) else ""
         companies = parent or "Unknown"
         brand_set = "Competitive View"
         # Wide theatrical releases carry an extra brand_set line
-        _sub = str(metadata.get('title_sub_category') or '').strip()
-        if not _sub and REF is not None:
-            _sub = REF.subcategory_for(eff_network)
-        if not _sub:
-            _sub = 'Release - Limited\nStudio - Independent'
-        if 'release - wide' in _sub.lower():
-            brand_set = "Competitive View\n[Data Feed] Film - Wide Release + Custom Requests"
+        if is_wide:
+            brand_set += "\n[Data Feed] Film - Wide Release + Custom Requests"
 
     # Release year for search-term generation
     rel = str(metadata.get('released_on') or metadata.get('title_created_date') or '')
     year = rel[:4] if rel[:4].isdigit() else ''
 
-    gen_terms, gen_keywords = generate_search_terms(clean_title, eff_network, year, is_dar)
+    gen_terms, gen_keywords = generate_search_terms(
+        clean_title, eff_network, year, is_dar,
+        twitter_handle=str(metadata.get('twitter_handle') or ''))
 
     # normalise genre tokens to the LF taxonomy (Sci-Fi -> Sci Fi, etc.)
     _genre = metadata.get('genre', '')
@@ -323,14 +383,17 @@ def create_row(title, is_movie, network="", metadata=None):
         _genre, _primary_fix = REF.normalize_genres(_genre)
         if not _primary:            # keep a provided primary_genre; else derive
             _primary = _primary_fix
-    # distributor YouTube channel from reference when not already present
-    _yt_company = metadata.get('youtube_channel_company', '')
-    _yt_username = metadata.get('youtube_channel_username', '')
-    if REF is not None and not _yt_company and eff_network:
-        ch = REF.youtube_for(eff_network)
-        if ch:
-            _yt_company = ch
-            _yt_username = ch + "|" + clean_title.lower()
+
+    # YouTube: company channel comes from the network; username lines combine
+    # the title's own channel (if any) + '<network channel>|<title>' variants
+    _yt_company = str(metadata.get('youtube_channel_company') or '').strip()
+    if not _yt_company and REF is not None and eff_network:
+        _yt_company = REF.youtube_for(eff_network)
+    _yt_username = str(metadata.get('youtube_channel_username') or '').strip()
+    if not _yt_username:
+        _yt_username = build_youtube_username(
+            _yt_company, clean_title,
+            own_channel=str(metadata.get('youtube_own_channel') or ''))
 
     def mv(key, default=''):
         """metadata value, falling back to default when missing OR blank."""
@@ -343,7 +406,7 @@ def create_row(title, is_movie, network="", metadata=None):
         'title': title,
         'title_created_date': mv('title_created_date', datetime.now().strftime('%Y-%m-%d')),
         'title_category': mv('title_category', title_category),
-        'title_sub_category': mv('title_sub_category', _sub if not is_dar else 'Release - Limited\nStudio - Independent'),
+        'title_sub_category': _sub,
         'genre': _genre,
         'primary_genre': _primary,
         'iso_mic': metadata.get('iso_mic', ''),
@@ -448,10 +511,18 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None, 
             records = records[:max_titles]
         total = len(records)
         for i, r in enumerate(records):
+            t = str(r.get('title', '')).strip()
+            if not t:
+                if progress:
+                    progress(i + 1, total)
+                continue
+            is_movie_r = 'tv' not in str(r.get('title_category', '')).lower()
             if auto_fetch:
-                r = _merge_meta(r, str(r.get('title', '')), True,
-                                is_movie=('tv' not in str(r.get('title_category', '')).lower()))
-            rows.append(r)
+                r = _merge_meta(r, t, True, is_movie=is_movie_r)
+            # route through create_row so derived fields (network label, youtube
+            # lines, brand sets, search terms) are computed consistently; explicit
+            # values from the upload always win inside create_row
+            rows.append(create_row(t, is_movie_r, str(r.get('network') or ''), r))
             if progress:
                 progress(i + 1, total)
     else:
@@ -527,6 +598,24 @@ def collect_rows(preview=False):
 @app.route('/')
 def index():
     return render_template('index.html')
+
+
+@app.route('/api/lookup')
+def api_lookup():
+    """Debug helper: /api/lookup?title=Animal+Friends&type=movie[&tt=tt1234567]
+    Shows exactly what auto-discovery finds for one title, plus the row that
+    would be generated from it. Use this to verify enrichment after a deploy."""
+    title = request.args.get('title', '').strip()
+    tt = request.args.get('tt', '').strip()
+    is_movie = request.args.get('type', 'movie').lower() != 'tv'
+    if not (title or tt):
+        return jsonify({'error': 'pass ?title= or ?tt='}), 400
+    if tt:
+        meta = fetch_metadata_by_tt(tt, is_movie, title)
+    else:
+        meta = fetch_metadata(title, is_movie)
+    row = create_row(title or tt, is_movie, '', dict(meta))
+    return jsonify({'discovered': meta, 'row': row})
 
 
 @app.route('/api/preview', methods=['POST'])
