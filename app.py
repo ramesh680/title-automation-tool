@@ -1126,6 +1126,221 @@ def api_validate():
         return jsonify({'error': f"Error: {str(e)}"}), 500
 
 
+# ========================= manual-file review ============================
+# Reviews a manually prepared workbook against what the tool would generate
+# (ingest-template logic + auto-discovery) and returns a highlighted copy
+# with a Findings sheet (gaps + mismatches + suggested values) and a Summary.
+
+# columns that are inherently manual / not derivable -> never flagged
+REVIEW_SKIP_COLS = {
+    'record_type', 'brand_id', 'title', 'title_category', 'title_created_date',
+    'active', 'brand_listing_hidden', 'last_reviewed', 'rovi_id',
+    'title_content_windows', 'composite_brand_set', 'iso_mic', 'stock_exchange',
+    'box_office', 'street_date', 'gross_screen', 'opening_weekend_box_office',
+    'domestic_opening_weekend_box_office', 'domestic_opening_weekend_screens',
+    'domestic_opening_weekend_rank', 'facebook_verified', 'twitter_verified',
+}
+
+
+def _review_norm(v):
+    """Comparison form: trimmed lines, scheme-insensitive URLs, no blanks."""
+    s = str(v if v is not None else '').strip()
+    if s.lower() in ('nan', 'none'):
+        return ''
+    s = s.replace('\r\n', '\n')
+    s = '\n'.join(ln.strip() for ln in s.split('\n') if ln.strip())
+    return re.sub(r'^https://', 'http://', s, flags=re.M)
+
+
+def _sub_parts(sub):
+    return {l.split(' - ', 1)[0].strip(): l.split(' - ', 1)[1].strip()
+            for l in str(sub or '').split('\n') if ' - ' in l}
+
+
+def build_review(src, auto_fetch=True, progress=None):
+    """Review an uploaded manual workbook. Returns (xlsx_bytes, summary)."""
+    df = _read_upload(src)
+    lower_cols = {c.lower(): c for c in df.columns}
+    records = df.to_dict('records')
+    findings, fills = [], {}
+    rows_reviewed = cells_checked = 0
+    total = len(records)
+
+    for i, r in enumerate(records):
+        t = str(r.get(lower_cols.get('title', 'title'), '') or '').strip()
+        if not t:
+            if progress:
+                progress(i + 1, total)
+            continue
+        rows_reviewed += 1
+        cat = str(r.get(lower_cols.get('title_category', ''), '') or '')
+        is_movie = 'tv' not in cat.lower()
+        sub = _sub_parts(r.get(lower_cols.get('title_sub_category', '')))
+
+        # soft hints from the manual row: fill discovery gaps, never override
+        hints = {}
+        if is_movie:
+            if sub.get('Release'):
+                hints['release_scale'] = sub['Release']
+        else:
+            if sub.get('Program Type'):
+                hints['program_type'] = sub['Program Type']
+        if sub.get('Language Type'):
+            hints['original_language'] = 'en' if sub['Language Type'] == 'English' else 'xx'
+        rel = str(r.get(lower_cols.get('released_on', ''), '') or '').strip()
+        if rel and rel.lower() != 'nan':
+            hints['released_on'] = rel[:10]
+
+        meta = {}
+        if auto_fetch:
+            tt = re.search(r'tt\d{5,}', str(r.get(lower_cols.get('imdb_id', ''), '') or ''))
+            if tt:
+                meta = dict(fetch_metadata_by_tt(tt.group(0), is_movie, t) or {})
+            else:
+                meta = dict(fetch_metadata(t, is_movie) or {})
+        for k, v in hints.items():
+            if meta.get(k) in (None, ''):
+                meta[k] = v
+
+        exp_net = str(meta.get('network') or
+                      r.get(lower_cols.get('network', ''), '') or '').strip()
+        if exp_net and not meta.get('network'):
+            meta['network'] = exp_net
+        expected = make_row(t, is_movie, exp_net, meta)
+
+        for col in (COLUMNS if is_movie else TV_COLUMNS):
+            if col in REVIEW_SKIP_COLS or col.lower() not in lower_cols:
+                continue
+            src_col = lower_cols[col.lower()]
+            mval = _review_norm(r.get(src_col))
+            eval_ = _review_norm(expected.get(col))
+            cells_checked += 1
+            if not eval_ or mval == eval_:
+                continue
+            status = 'Gap' if not mval else 'Mismatch'
+            findings.append(dict(
+                row=i + 2, title=t, column=src_col, status=status,
+                current=str(r.get(src_col) if r.get(src_col) is not None else ''),
+                suggested=str(expected.get(col) or '')))
+            fills[(i, src_col)] = status
+        if progress:
+            progress(i + 1, total)
+
+    # ---------------- build the output workbook ----------------
+    import openpyxl as _oxl
+    from openpyxl.styles import PatternFill, Font, Alignment
+    from openpyxl.utils import get_column_letter
+
+    RED = PatternFill('solid', start_color='FFFFC7CE')      # mismatch
+    AMBER = PatternFill('solid', start_color='FFFFEB9C')    # gap
+    HDR = PatternFill('solid', start_color='FF1F2A44')
+    HDR_FONT = Font(color='FFFFFFFF', bold=True)
+
+    wb = _oxl.Workbook()
+
+    # Summary
+    ws = wb.active
+    ws.title = 'Summary'
+    gaps = sum(1 for f in findings if f['status'] == 'Gap')
+    mism = len(findings) - gaps
+    ws.append(['Manual File Review — Findings Summary'])
+    ws['A1'].font = Font(bold=True, size=14)
+    ws.append([])
+    for k, v in [('Reviewed at', datetime.now().strftime('%Y-%m-%d %H:%M')),
+                 ('Auto-discovery', 'ON' if auto_fetch else 'OFF'),
+                 ('Rows reviewed', rows_reviewed),
+                 ('Cells checked', cells_checked),
+                 ('Cells OK', cells_checked - len(findings)),
+                 ('Gaps (empty, value suggested)', gaps),
+                 ('Mismatches (differs from expected)', mism)]:
+        ws.append([k, v])
+        ws.cell(ws.max_row, 1).font = Font(bold=True)
+    ws.append([])
+    ws.append(['Legend'])
+    ws.cell(ws.max_row, 1).font = Font(bold=True)
+    ws.append(['Amber cell', 'Gap — the tool found a value your file is missing'])
+    ws.cell(ws.max_row, 1).fill = AMBER
+    ws.append(['Red cell', 'Mismatch — differs from template/discovered value (see Findings)'])
+    ws.cell(ws.max_row, 1).fill = RED
+    from collections import Counter as _Counter
+    by_col = _Counter(f['column'] for f in findings)
+    if by_col:
+        ws.append([])
+        ws.append(['Findings by column'])
+        ws.cell(ws.max_row, 1).font = Font(bold=True)
+        for col, n in by_col.most_common():
+            ws.append([col, n])
+    ws.column_dimensions['A'].width = 36
+    ws.column_dimensions['B'].width = 64
+
+    # Reviewed copy with highlights
+    ws2 = wb.create_sheet('Reviewed')
+    cols = list(df.columns)
+    ws2.append(cols)
+    for c in range(1, len(cols) + 1):
+        cell = ws2.cell(1, c)
+        cell.fill, cell.font = HDR, HDR_FONT
+    for i, r in enumerate(records):
+        ws2.append(['' if (r.get(c) is None or str(r.get(c)) == 'nan') else r.get(c)
+                    for c in cols])
+        for j, c in enumerate(cols, start=1):
+            st = fills.get((i, c))
+            if st:
+                ws2.cell(i + 2, j).fill = RED if st == 'Mismatch' else AMBER
+    ws2.freeze_panes = 'A2'
+
+    # Findings detail
+    ws3 = wb.create_sheet('Findings')
+    ws3.append(['Row', 'Title', 'Column', 'Type', 'Current Value', 'Suggested Value'])
+    for c in range(1, 7):
+        cell = ws3.cell(1, c)
+        cell.fill, cell.font = HDR, HDR_FONT
+    for f in findings:
+        ws3.append([f['row'], f['title'], f['column'], f['status'],
+                    f['current'], f['suggested']])
+        ws3.cell(ws3.max_row, 4).fill = RED if f['status'] == 'Mismatch' else AMBER
+        for c in (5, 6):
+            ws3.cell(ws3.max_row, c).alignment = Alignment(wrap_text=True, vertical='top')
+    widths = [6, 34, 26, 11, 60, 60]
+    for c, w in enumerate(widths, start=1):
+        ws3.column_dimensions[get_column_letter(c)].width = w
+    ws3.freeze_panes = 'A2'
+    ws3.auto_filter.ref = f"A1:F{max(ws3.max_row, 1)}"
+
+    out = BytesIO()
+    wb.save(out)
+    summary = {'rows': rows_reviewed, 'cells_checked': cells_checked,
+               'gaps': gaps, 'mismatches': mism, 'ok': cells_checked - len(findings)}
+    return out.getvalue(), summary
+
+
+@app.route('/review')
+def review_page():
+    warm_upcoming()
+    return render_template('review.html')
+
+
+@app.route('/api/review_async', methods=['POST'])
+def review_async():
+    """Kick off a manual-file review in the background; returns a job id."""
+    _prune_jobs()
+    if not request.files.get('file'):
+        return jsonify({'error': 'Please upload the manually prepared .xlsx or .csv file.'}), 400
+    f = request.files['file']
+    payload = {
+        'bytes': f.read(), 'filename': f.filename,
+        'auto_fetch': request.form.get('autoFetch', 'true').lower() != 'false',
+    }
+    jid = uuid.uuid4().hex[:12]
+    with _JOBS_LOCK:
+        _JOBS[jid] = {'status': 'running', 'done': 0, 'total': 0, 'error': None,
+                      'file': None, 'filename': None, 'rows': None,
+                      'summary': None, 'created': time.time()}
+    threading.Thread(target=_run_generation, args=(jid, 'review', payload),
+                     daemon=True).start()
+    return jsonify({'job_id': jid})
+
+
 # ============================ background jobs =============================
 # In-memory job store for full-file generation. Runs in a daemon thread so long
 # auto-discovery runs don't hit the request timeout. IMPORTANT: run gunicorn with
@@ -1154,6 +1369,13 @@ def _run_generation(jid, kind, payload):
         def prog(done, total):
             _job_set(jid, done=done, total=total)
 
+        if kind == 'review':
+            data, summary = build_review((payload['bytes'], payload['filename']),
+                                         payload['auto_fetch'], progress=prog)
+            _job_set(jid, status='done', file=data, rows=summary['rows'],
+                     summary=summary,
+                     filename=f"Reviewed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+            return
         if kind == 'file':
             rows = build_rows_from_upload(
                 (payload['bytes'], payload['filename']),
@@ -1202,7 +1424,8 @@ def job_status(jid):
         if not j:
             return jsonify({'error': 'Unknown or expired job'}), 404
         return jsonify({'status': j['status'], 'done': j['done'], 'total': j['total'],
-                        'error': j['error'], 'rows': j.get('rows')})
+                        'error': j['error'], 'rows': j.get('rows'),
+                        'summary': j.get('summary')})
 
 
 @app.route('/api/job/<jid>/download')
