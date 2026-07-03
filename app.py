@@ -696,6 +696,9 @@ def create_row(title, is_movie, network="", metadata=None):
     metadata = metadata or {}
     is_dar = " - DAR" in title
     clean_title = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
+    # a trailing '(2026)' / '(Studio)' disambiguator stays in the title column
+    # but is ignored for social fields and search terms
+    social_title = _strip_disambiguator(clean_title)
     title_category = "Movies" if is_movie else "TV Shows"
 
     # Effective network = discovered/explicit network, else the passed arg;
@@ -765,7 +768,7 @@ def create_row(title, is_movie, network="", metadata=None):
     year = rel[:4] if rel[:4].isdigit() else ''
 
     gen_terms, gen_keywords = generate_search_terms(
-        clean_title, eff_network, year, is_dar,
+        social_title, eff_network, year, is_dar,
         twitter_handle=str(metadata.get('twitter_handle') or ''),
         network_clause=(sinfo.get('twitter_clause') if sinfo else ''))
 
@@ -789,7 +792,7 @@ def create_row(title, is_movie, network="", metadata=None):
     _yt_username = str(metadata.get('youtube_channel_username') or '').strip()
     if not _yt_username:
         _yt_username = build_youtube_username(
-            _yt_company, clean_title,
+            _yt_company, social_title,
             own_channel=str(metadata.get('youtube_own_channel') or ''))
 
     def mv(key, default=''):
