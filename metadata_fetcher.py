@@ -144,6 +144,18 @@ def _norm(s):
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
+def _split_disambiguator(title):
+    """Titles may carry a trailing '(...)' disambiguator that is NOT part of
+    the real name — a year or a network/studio, e.g. 'Buddy (2026)' or
+    'Steps (Netflix)'. Returns (lookup_title, hint): the bracket value is
+    ignored for all lookups, but a 4-digit year is kept as a hint to pick
+    the right same-named title."""
+    m = re.search(r"\s*\(([^)]*)\)\s*$", title or "")
+    if not m:
+        return (title or "").strip(), ""
+    return title[:m.start()].strip(), m.group(1).strip()
+
+
 # ---------------- upcoming-release-movies service ----------------
 _UPCOMING = {"fetched": 0.0, "by_title": {}, "by_tt": {}}
 _UPCOMING_TTL = 6 * 3600  # refresh the calendar index every 6h
@@ -231,10 +243,11 @@ _IMDB_QID_PROGRAM_TYPE = {
 }
 
 
-def imdb_suggest_item(title, is_movie=True):
+def imdb_suggest_item(title, is_movie=True, year_hint=""):
     """Best-matching item from IMDb's suggestion API (keyless), or None.
     Handles apostrophes/colons and titles that have no release yet.
-    Prefers an exact title match of the right type, then the most recent year
+    Prefers an exact title match of the right type; when the input carried a
+    '(year)' disambiguator that exact year wins, else the most recent year
     (these are upcoming titles, so avoid older same-named films)."""
     q = urllib.parse.quote(title.strip().lower())
     data = _get_json(IMDB_SUGGEST.format(q=q), headers=HTML_HEADERS)
@@ -244,6 +257,7 @@ def imdb_suggest_item(title, is_movie=True):
         return None
     tl = _norm(title)
     want_tv = not is_movie
+    want_year = int(year_hint) if str(year_hint).isdigit() and len(str(year_hint)) == 4 else None
 
     def type_ok(it):
         qid = str(it.get("qid") or "").lower()
@@ -254,6 +268,7 @@ def imdb_suggest_item(title, is_movie=True):
 
     def score(it):
         return (1 if _norm(it.get("l")) == tl else 0,
+                1 if (want_year and it.get("y") == want_year) else 0,
                 1 if type_ok(it) else 0,
                 it.get("y") or 0)
 
@@ -785,7 +800,9 @@ def fetch_metadata_by_tt(tt, is_movie=True, title=""):
         return dict(_CACHE[key])
     meta = {}
     try:
-        meta = _enrich_by_tt(tt, is_movie, title or tt)
+        hint_title, _ = _split_disambiguator(
+            re.sub(r"\s*-\s*DAR\s*$", "", title or "", flags=re.IGNORECASE).strip())
+        meta = _enrich_by_tt(tt, is_movie, hint_title or tt)
     except Exception as e:  # noqa: BLE001
         log.warning("fetch_metadata_by_tt failed for %s: %s", tt, e)
     _CACHE[key] = dict(meta)
@@ -802,22 +819,28 @@ def fetch_metadata(title, is_movie=True):
     if key in _CACHE:
         return dict(_CACHE[key])
 
+    # a trailing '(2026)' / '(Netflix)' disambiguator is NOT part of the real
+    # name -- all lookups use the stripped title; a year hint helps pick the
+    # right same-named title
+    lookup, hint = _split_disambiguator(clean)
+    year_hint = hint if (hint.isdigit() and len(hint) == 4) else ""
+
     meta = {}
     try:
         # the upcoming-release-movies calendar resolves the tt code by exact
         # title AND supplies distributor/genre/date/scale in one shot
-        um = _upcoming_index()["by_title"].get(_norm(clean)) if is_movie else None
-        sug = imdb_suggest_item(clean, is_movie) if not um else None
+        um = _upcoming_index()["by_title"].get(_norm(lookup)) if is_movie else None
+        sug = imdb_suggest_item(lookup, is_movie, year_hint) if not um else None
         tt = _tt((um or {}).get("tt_code")) or (sug or {}).get("id")
         # the IMDb item type gives the TV Program Type (Series / Mini-Series /
         # TV Movie / Special) used by the BrandIngest schema
         sug_ptype = _IMDB_QID_PROGRAM_TYPE.get(str((sug or {}).get("qid") or "").lower())
         tmdb_meta, wid = ({}, None)
         if not tt:
-            tmdb_meta, wid = tmdb_lookup(clean, is_movie)
-            tt = _tt(tmdb_meta.get("imdb_id")) or _tt(omdb_lookup(clean).get("imdb_id"))
+            tmdb_meta, wid = tmdb_lookup(lookup, is_movie)
+            tt = _tt(tmdb_meta.get("imdb_id")) or _tt(omdb_lookup(lookup).get("imdb_id"))
         if tt:
-            meta = _enrich_by_tt(tt, is_movie, clean, wikidata_id=wid)
+            meta = _enrich_by_tt(tt, is_movie, lookup, wikidata_id=wid)
             tmdb_meta.pop("production_company", None)
             tmdb_meta.pop("released_on_us", None)
             _fill(meta, tmdb_meta)
@@ -825,8 +848,8 @@ def fetch_metadata(title, is_movie=True):
             tmdb_meta.pop("production_company", None)
             tmdb_meta.pop("released_on_us", None)
             _fill(meta, tmdb_meta)
-            _fill(meta, wikidata_meta(clean, qid=wid, is_movie=is_movie))
-            _fill(meta, omdb_lookup(clean))
+            _fill(meta, wikidata_meta(lookup, qid=wid, is_movie=is_movie))
+            _fill(meta, omdb_lookup(lookup))
         if sug_ptype:
             meta["program_type"] = sug_ptype  # IMDb's own type beats TMDB's
     except Exception as e:  # noqa: BLE001
