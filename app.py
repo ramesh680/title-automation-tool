@@ -44,6 +44,9 @@ try:
     import os as _os
     from titleforge_ingest_ext import (detect_schema as _tfx_detect,
                                        fill_category as _tfx_fill,
+                                       build_branddef_row as _tfx_build,
+                                       BRANDDEF_COLUMNS as _TFX_COLUMNS,
+                                       SCHEMAS as _TFX_SCHEMAS,
                                        GENERAL_TITLE_CATEGORIES as _TFX_MASTER)
     from titleforge_validator import (load_rules as _tfx_load_rules,
                                       validate_row as _tfx_validate)
@@ -56,6 +59,8 @@ except Exception as _e:  # pragma: no cover
     TFX_OK = False
     _TFX_MASTER = []
     _TFX_RULES = {}
+    _TFX_COLUMNS = {}
+    _TFX_SCHEMAS = {}
 
 
 def _tref():
@@ -1263,17 +1268,54 @@ def _merge_meta(base_meta, title, auto_fetch, is_movie=True):
 
 def _norm_kind(v, default='movie'):
     """'tvshow'/'TV Shows' -> 'tv'; 'Talent' -> 'talent'; 'Video Game(s)' ->
-    'game'; else 'movie'. 'mixed' (or blank) falls back to the given default."""
+    'game'; Beauty/Beverages/Sports/General -> their tfx kind;
+    else 'movie'. 'mixed' (or blank) falls back to the given default."""
     s = str(v or '').strip().lower()
     if 'talent' in s:
         return 'talent'
     if 'game' in s:
         return 'game'
+    if 'beauty' in s:               # 'beauty', 'Health & Beauty'
+        return 'beauty'
+    if 'beverage' in s:             # 'beverages', 'Beverages'
+        return 'beverages'
+    if 'sport' in s:                # 'sports', 'Sports Franchise'
+        return 'sports'
+    if s == 'general':
+        return 'general'
     if 'tv' in s:
         return 'tv'
     if s in ('', 'mixed', 'nan', 'none'):
         return default
     return 'movie'
+
+
+# kinds handled by the titleforge extension (Beauty/Beverages/Sports/General)
+TFX_KINDS = {'beauty', 'beverages', 'sports', 'general'}
+_TFX_SHEET_LABELS = {'beauty': 'Beauty', 'beverages': 'Beverages',
+                     'sports': 'Sports Teams', 'general': 'General'}
+
+
+def create_tfx_row(title, kind, seed=None):
+    """Build a BrandDef row for one of the four new schemas via the template
+    logic in titleforge_ingest_ext. Explicit values from an uploaded row (seed)
+    always win over derived ones, matching the app's other row builders."""
+    seed = dict(seed or {})
+    # drop blank/nan values so they don't mask derivation
+    seed = {k: v for k, v in seed.items()
+            if v is not None and str(v).strip() not in ('', 'nan', 'none', 'None')}
+    seed.setdefault('Title', title)
+    row = _tfx_build(kind, seed)
+    row['title'] = row.get('title') or title
+    # uploaded explicit values win
+    cols = set(_TFX_COLUMNS.get(kind, []))
+    low = {c.lower(): c for c in cols}
+    for k, v in seed.items():
+        col = low.get(str(k).strip().lower())
+        if col:
+            row[col] = v
+    row['_tfx_schema'] = kind   # internal routing marker; stripped on output
+    return row
 
 
 def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
@@ -1306,6 +1348,11 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
                     progress(i + 1, total)
                 continue
             kind_r = _norm_kind(r.get('title_category'), default_kind)
+            if kind_r in TFX_KINDS and TFX_OK:
+                rows.append(create_tfx_row(t, kind_r, r))
+                if progress:
+                    progress(i + 1, total)
+                continue
             if kind_r in ('talent', 'game'):
                 if auto_fetch:
                     disc = dict((fetch_person(t) if kind_r == 'talent'
@@ -1345,7 +1392,11 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
             specs.append((title, kind, network))
         total = len(specs)
         for i, (title, kind, network) in enumerate(specs):
-            if kind == 'talent':
+            if kind in TFX_KINDS and TFX_OK:
+                rows.append(create_tfx_row(title, kind))
+                if include_dar and ' - DAR' not in title:
+                    rows.append(create_tfx_row(f"{title} - DAR", kind))
+            elif kind == 'talent':
                 meta = dict(fetch_person(title) or {}) if auto_fetch else {}
                 rows.append(make_row(title, False, '', meta, talent=True))
             elif kind == 'game':
@@ -1377,7 +1428,11 @@ def build_rows_from_titles(data, max_titles=None, progress=None):
         kind = _norm_kind(data.get('titles_type', {}).get(title, 'movie'))
         network = data.get('networks', {}).get(title, '')
         base_meta = data.get('metadata', {}).get(title, {})
-        if kind == 'talent':
+        if kind in TFX_KINDS and TFX_OK:
+            rows.append(create_tfx_row(title, kind, base_meta))
+            if include_dar and ' - DAR' not in title:
+                rows.append(create_tfx_row(f"{title} - DAR", kind, base_meta))
+        elif kind == 'talent':
             metadata = dict(fetch_person(title) or {}) if auto_fetch else {}
             for k, v in (base_meta or {}).items():
                 if v not in (None, ''):
@@ -1418,13 +1473,19 @@ def _is_game_row(r):
 def _rows_to_workbook(rows):
     """Write rows to an xlsx BytesIO. Movies use the 42-col schema, TV the
     39-col BrandIngest, Talent the 38-col BrandDef, Video Games the 39-col
-    BDR; mixed runs get one sheet per schema."""
-    talent = [r for r in rows if _is_talent_row(r)]
-    games = [r for r in rows if _is_game_row(r)]
-    tv = [r for r in rows if _is_tv_row(r)]
-    movies = [r for r in rows
-              if not _is_tv_row(r) and not _is_talent_row(r) and not _is_game_row(r)]
-    groups = [g for g in (movies, tv, talent, games) if g]
+    BDR; Beauty/Beverages/Sports/General use their template BrandDef layouts;
+    mixed runs get one sheet per schema."""
+    tfx = {}
+    for r in rows:
+        k = r.get('_tfx_schema')
+        if k:
+            tfx.setdefault(k, []).append(r)
+    talent = [r for r in rows if not r.get('_tfx_schema') and _is_talent_row(r)]
+    games = [r for r in rows if not r.get('_tfx_schema') and _is_game_row(r)]
+    tv = [r for r in rows if not r.get('_tfx_schema') and _is_tv_row(r)]
+    movies = [r for r in rows if not r.get('_tfx_schema')
+              and not _is_tv_row(r) and not _is_talent_row(r) and not _is_game_row(r)]
+    groups = [g for g in (movies, tv, talent, games, *tfx.values()) if g]
     if len(groups) > 1:
         sheets = []
         if movies:
@@ -1435,6 +1496,12 @@ def _rows_to_workbook(rows):
             sheets.append(('Talent', talent, TALENT_COLUMNS))
         if games:
             sheets.append(('Video Games', games, GAME_COLUMNS))
+        for k, rws in tfx.items():
+            sheets.append((_TFX_SHEET_LABELS.get(k, k.title()), rws,
+                           _TFX_COLUMNS[k]))
+    elif tfx:
+        k, rws = next(iter(tfx.items()))
+        sheets = [('BrandDef', rws, _TFX_COLUMNS[k])]
     elif talent:
         sheets = [('BrandDef', talent, TALENT_COLUMNS)]
     elif games:
@@ -1520,12 +1587,14 @@ def preview_data():
             return jsonify({'error': 'No titles provided'}), 400
         # preview shows the schema of the first title's category
         def _kind(r):
-            return ('talent' if _is_talent_row(r) else
-                    'game' if _is_game_row(r) else
-                    'tv' if _is_tv_row(r) else 'movie')
+            return (r.get('_tfx_schema') or
+                    ('talent' if _is_talent_row(r) else
+                     'game' if _is_game_row(r) else
+                     'tv' if _is_tv_row(r) else 'movie'))
         first = _kind(rows[0])
         cols = {'talent': TALENT_COLUMNS, 'game': GAME_COLUMNS,
-                'tv': TV_COLUMNS, 'movie': COLUMNS}[first]
+                'tv': TV_COLUMNS, 'movie': COLUMNS,
+                **({k: v for k, v in _TFX_COLUMNS.items()} if TFX_OK else {})}[first]
         same = [r for r in rows if _kind(r) == first]
         df = pd.DataFrame(same)
         df = df.reindex(columns=cols).where(lambda x: pd.notnull(x), '')

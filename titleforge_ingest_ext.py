@@ -411,7 +411,9 @@ def build_branddef_row(schema_key: str, ingest_row: Dict[str, Any]) -> Dict[str,
         "brand_set": brand_set,
         "active": "t",
         "wikipedia_page": _get(r, "Wikipedia"),
-        "twitter_search_terms": _hashtag(raw_title),
+        # hashtag derives from the BASE title, never the ' - DAR' suffix
+        "twitter_search_terms": _hashtag(
+            raw_title[:-6].strip() if raw_title.endswith(" - DAR") else raw_title),
     }
 
     # social handles (column names vary a little per template)
@@ -444,6 +446,37 @@ def build_branddef_row(schema_key: str, ingest_row: Dict[str, Any]) -> Dict[str,
 
 # convenience: expose the full category list your existing detector should know about
 ALL_TITLE_CATEGORIES = sorted(set(GENERAL_TITLE_CATEGORIES))
+
+# BrandDef output column layouts, taken verbatim from each template's BrandDef
+# header row. Beauty/Beverages share a 34-col layout; Sports/General a 38-col.
+_BB_COLS = [
+    'brand_id', 'title', 'title_category', 'title_sub_category', 'genre',
+    'primary_genre', 'rovi_id', 'ticker_symbol', 'companies', 'brand_set',
+    'active', 'released_on', 'box_office', 'street_date', 'gross_screen',
+    'opening_weekend_box_office', 'network', 'brand_listing_hidden',
+    'facebook_page', 'twitter_handle', 'instagram_user',
+    'youtube_channel_username', 'tiktok_user', 'tumblr_page',
+    'pinterest_user_username', 'pinterest_board', 'wikipedia_page',
+    'facebook_search_terms', 'twitter_search_terms', 'instagram_search_terms',
+    'tumblr_search_terms', 'twitter_search_term_keywords',
+    'youtube_search_terms', 'url_managers',
+]
+_SG_COLS = [
+    'brand_id', 'title', 'title_category', 'title_sub_category', 'genre',
+    'primary_genre', 'rovi_id', 'ticker_symbol', 'title_content_windows',
+    'companies', 'brand_set', 'active', 'released_on', 'box_office',
+    'street_date', 'gross_screen', 'opening_weekend_box_office', 'network',
+    'facebook_page', 'twitter_handle', 'instagram_user',
+    'youtube_channel_username', 'tiktok_user', 'linkedin_page', 'tumblr_page',
+    'pinterest_user_username', 'pinterest_board', 'wikipedia_page',
+    'rottentomatoes', 'imdb_id', 'metacritic', 'facebook_search_terms',
+    'twitter_search_terms', 'instagram_search_terms', 'tumblr_search_terms',
+    'twitter_search_term_keywords', 'youtube_search_terms', 'url_managers',
+]
+BRANDDEF_COLUMNS = {
+    'beauty': _BB_COLS, 'beverages': _BB_COLS,
+    'sports': _SG_COLS, 'general': _SG_COLS,
+}
 
 
 if __name__ == "__main__":

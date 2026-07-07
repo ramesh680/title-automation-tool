@@ -180,6 +180,10 @@
                         <option value="tvshow">TV Shows</option>
                         <option value="talent">Talent (people)</option>
                         <option value="game">Video Games</option>
+                        <option value="beauty">Beauty (Health &amp; Beauty)</option>
+                        <option value="beverages">Beverages</option>
+                        <option value="sports">Sports Teams (Sports Franchise)</option>
+                        <option value="general">General (any brand category)</option>
                         <option value="mixed">Mixed (tag each title / use type column)</option>
                     </select>
                     <span class="hint">For <b>Mixed</b> manual entry, tag each line:
@@ -265,7 +269,7 @@
             const titles = [], types = {};
             if (method !== 'manual') return { titles, types };
 
-            const tagRe = /\s*\[\s*(movie|movies|tv|tvshow|tv show|tv shows|talent|game|games|video ?games?)\s*\]\s*$/i;
+            const tagRe = /\s*\[\s*(movie|movies|tv|tvshow|tv show|tv shows|talent|game|games|video ?games?|beauty|beverages?|sports?|general)\s*\]\s*$/i;
             const text = document.getElementById('titlesList').value;
             text.split('\n').map(t => t.trim()).filter(t => t.length > 0).forEach(line => {
                 let kind = titleType;
@@ -277,6 +281,10 @@
                 if (!line) return;
                 if (/talent/.test(kind)) kind = 'talent';
                 else if (/game/.test(kind)) kind = 'game';
+                else if (/beauty/.test(kind)) kind = 'beauty';
+                else if (/beverage/.test(kind)) kind = 'beverages';
+                else if (/sport/.test(kind)) kind = 'sports';
+                else if (/general/.test(kind)) kind = 'general';
                 else if (/tv/.test(kind)) kind = 'tvshow';
                 else kind = 'movie';           // 'mixed' + untagged -> movie
                 titles.push(line);
