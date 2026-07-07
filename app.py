@@ -37,6 +37,26 @@ try:
 except Exception:
     TREF = None
 
+# Four additional ingest schemas (Beauty / Beverages / Sports Teams / General)
+# with category+sub-category auto-detection and dropdown validation rules.
+# Fails soft: if the modules/JSON are missing the app behaves exactly as before.
+try:
+    import os as _os
+    from titleforge_ingest_ext import (detect_schema as _tfx_detect,
+                                       fill_category as _tfx_fill,
+                                       GENERAL_TITLE_CATEGORIES as _TFX_MASTER)
+    from titleforge_validator import (load_rules as _tfx_load_rules,
+                                      validate_row as _tfx_validate)
+    _TFX_RULES = _tfx_load_rules(_os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)),
+        'titleforge_validation_rules.json'))
+    TFX_OK = True
+except Exception as _e:  # pragma: no cover
+    logging.warning(f"titleforge ingest extension unavailable: {_e}")
+    TFX_OK = False
+    _TFX_MASTER = []
+    _TFX_RULES = {}
+
 
 def _tref():
     return TREF if (TREF is not None and getattr(TREF, "LOADED", False)) else None
@@ -1610,6 +1630,28 @@ def _sub_parts(sub):
             for l in str(sub or '').split('\n') if ' - ' in l}
 
 
+# categories handled by the original four review branches
+_TFX_LEGACY_CATS = {'movies', 'tv shows', 'talent', 'video game'}
+
+
+def _tfx_schema_for_row(r, cat):
+    """Return 'beauty'/'beverages'/'sports'/'general' when the row belongs to one
+    of the four NEW ingest schemas, else None (row keeps its legacy handling).
+    Works even when title_category is blank, via sub_category/brand_set signals."""
+    if not TFX_OK:
+        return None
+    c = str(cat or '').strip()
+    if c.lower() in _TFX_LEGACY_CATS or 'game' in c.lower():
+        return None
+    key = _tfx_detect(r)
+    if key:
+        return key
+    # category is present and belongs to the General master list
+    if c and c in _TFX_MASTER:
+        return 'general'
+    return None
+
+
 def build_review(src, auto_fetch=True, progress=None):
     """Review an uploaded manual workbook. Returns (xlsx_bytes, summary)."""
     df = _read_upload(src)
@@ -1627,6 +1669,54 @@ def build_review(src, auto_fetch=True, progress=None):
             continue
         rows_reviewed += 1
         cat = str(r.get(lower_cols.get('title_category', ''), '') or '')
+
+        # ---- NEW SCHEMAS: Beauty / Beverages / Sports Teams / General ----
+        tfx_key = _tfx_schema_for_row(r, cat)
+        if tfx_key:
+            fcat, fsub = _tfx_fill(r)
+            cat_col = lower_cols.get('title_category')
+            sub_col = lower_cols.get('title_sub_category')
+            # backfill a MISSING category (auto-understood from the row) as a Gap
+            if cat_col is not None:
+                cells_checked += 1
+                if not str(r.get(cat_col) or '').strip() and fcat:
+                    findings.append(dict(row=i + 2, title=t, column=cat_col,
+                                         status='Gap', current='', suggested=fcat))
+                    fills[(i, cat_col)] = 'Gap'
+                    r[cat_col] = fcat   # validate the rest against the filled value
+            # backfill a MISSING sub-category the same way
+            if sub_col is not None:
+                cells_checked += 1
+                if not str(r.get(sub_col) or '').strip() and fsub:
+                    findings.append(dict(row=i + 2, title=t, column=sub_col,
+                                         status='Gap', current='', suggested=fsub))
+                    fills[(i, sub_col)] = 'Gap'
+                    r[sub_col] = fsub
+            # dropdown / template-logic validation
+            try:
+                tfx_findings = _tfx_validate(r, tfx_key, _TFX_RULES)
+            except Exception as _e:
+                logging.warning(f"tfx validate failed on row {i + 2}: {_e}")
+                tfx_findings = []
+            n_rules = len(_TFX_RULES.get('schemas', {}).get(tfx_key, {}).get('rules', []))
+            cells_checked += max(n_rules - 2, 0)  # category+sub already counted
+            for fd in tfx_findings:
+                src_col = lower_cols.get(str(fd.get('field', '')).lower())
+                if not src_col:
+                    continue
+                if fills.get((i, src_col)):
+                    continue  # already flagged by the backfill above
+                status = 'Gap' if fd.get('status') == 'gap' else 'Mismatch'
+                findings.append(dict(
+                    row=i + 2, title=t, column=src_col, status=status,
+                    current=str(r.get(src_col) if r.get(src_col) is not None else ''),
+                    suggested=str(fd.get('expected') or '')))
+                fills[(i, src_col)] = status
+            if progress:
+                progress(i + 1, total)
+            continue
+        # -------------------------------------------------------------------
+
         is_talent = 'talent' in cat.lower()
         is_game = 'game' in cat.lower()
         is_movie = (not is_talent) and (not is_game) and 'tv' not in cat.lower()

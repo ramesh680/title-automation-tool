@@ -31,6 +31,13 @@ FILL_WARN = PatternFill("solid", fgColor="FFFFE8A3")   # soft amber
 FILL_HEAD = PatternFill("solid", fgColor="FF7C5CFF")   # brand violet
 
 APPROVED_CATEGORIES = {"movies", "tv shows"}
+# extend with the master Title Category list from the General ingest template
+# (Health & Beauty, Beverages, Sports Franchise, Talent, Video Game, + 44 more)
+try:
+    from titleforge_ingest_ext import ALL_TITLE_CATEGORIES as _TFX_ALL
+    APPROVED_CATEGORIES |= {c.lower() for c in _TFX_ALL}
+except Exception:  # fail soft: keep the original two if the module is absent
+    pass
 
 # Default rules, tailored to THIS app's export schema (column names differ from
 # the upstream tool: instagram_user / twitter_handle / tiktok_user / threads_page,
@@ -40,7 +47,9 @@ DEFAULT_RULES = {
         {"sheet": "*", "column": "title", "check": "not_blank_and_not_placeholder",
          "tokens": ["#NA", "N/A"], "message": "Title cannot be blank, #NA, or N/A."},
         {"sheet": "*", "column": "title_category", "check": "approved_category",
-         "message": "title_category must be present and one of: Movies, TV Shows."},
+         "message": "title_category must be present and one of the approved categories "
+                    "(Movies, TV Shows, Talent, Video Game, Health & Beauty, Beverages, "
+                    "Sports Franchise, or the General master list)."},
         {"sheet": "*", "column": "brand_set", "check": "dar_or_competitive_brand_set",
          "message": "DAR titles need 'Pristine DAR Brands'; other titles need 'Competitive View'."},
         {"sheet": "*", "column": "companies", "check": "dar_company_rule",
