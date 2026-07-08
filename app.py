@@ -10,7 +10,8 @@ import logging
 
 try:
     from metadata_fetcher import (fetch_metadata, fetch_metadata_by_tt,
-                                  fetch_person, warm_upcoming)
+                                  fetch_person, fetch_game, fetch_brand,
+                                  warm_upcoming)
 except Exception:  # keep the app running even if the module is missing
     def fetch_metadata(title, is_movie=True):
         return {}
@@ -19,6 +20,12 @@ except Exception:  # keep the app running even if the module is missing
         return {}
 
     def fetch_person(name):
+        return {}
+
+    def fetch_game(name):
+        return {}
+
+    def fetch_brand(name):
         return {}
 
     def warm_upcoming():
@@ -1349,7 +1356,15 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
                 continue
             kind_r = _norm_kind(r.get('title_category'), default_kind)
             if kind_r in TFX_KINDS and TFX_OK:
-                rows.append(create_tfx_row(t, kind_r, r))
+                seed = r
+                if auto_fetch:
+                    # discovered socials/wikipedia fill blanks only --
+                    # explicit values from the upload always win
+                    seed = dict(fetch_brand(t) or {})
+                    for k, v in r.items():
+                        if v not in (None, ''):
+                            seed[k] = v
+                rows.append(create_tfx_row(t, kind_r, seed))
                 if progress:
                     progress(i + 1, total)
                 continue
@@ -1393,9 +1408,10 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
         total = len(specs)
         for i, (title, kind, network) in enumerate(specs):
             if kind in TFX_KINDS and TFX_OK:
-                rows.append(create_tfx_row(title, kind))
+                seed = dict(fetch_brand(title) or {}) if auto_fetch else None
+                rows.append(create_tfx_row(title, kind, seed))
                 if include_dar and ' - DAR' not in title:
-                    rows.append(create_tfx_row(f"{title} - DAR", kind))
+                    rows.append(create_tfx_row(f"{title} - DAR", kind, seed))
             elif kind == 'talent':
                 meta = dict(fetch_person(title) or {}) if auto_fetch else {}
                 rows.append(make_row(title, False, '', meta, talent=True))
@@ -1429,9 +1445,17 @@ def build_rows_from_titles(data, max_titles=None, progress=None):
         network = data.get('networks', {}).get(title, '')
         base_meta = data.get('metadata', {}).get(title, {})
         if kind in TFX_KINDS and TFX_OK:
-            rows.append(create_tfx_row(title, kind, base_meta))
+            seed = base_meta
+            if auto_fetch:
+                # discovered socials/wikipedia fill blanks only --
+                # explicit metadata from the payload always wins
+                seed = dict(fetch_brand(title) or {})
+                for k, v in (base_meta or {}).items():
+                    if v not in (None, ''):
+                        seed[k] = v
+            rows.append(create_tfx_row(title, kind, seed))
             if include_dar and ' - DAR' not in title:
-                rows.append(create_tfx_row(f"{title} - DAR", kind, base_meta))
+                rows.append(create_tfx_row(f"{title} - DAR", kind, seed))
         elif kind == 'talent':
             metadata = dict(fetch_person(title) or {}) if auto_fetch else {}
             for k, v in (base_meta or {}).items():
@@ -1562,6 +1586,12 @@ def api_lookup():
     kind = request.args.get('type', 'movie').lower()
     if not (title or tt):
         return jsonify({'error': 'pass ?title= or ?tt='}), 400
+    kind_n = _norm_kind(kind)
+    if kind_n in TFX_KINDS and TFX_OK:
+        meta = fetch_brand(title)
+        row = create_tfx_row(title, kind_n, dict(meta))
+        row.pop('_tfx_schema', None)
+        return jsonify({'discovered': meta, 'row': row})
     if 'talent' in kind:
         meta = fetch_person(title)
         row = make_row(title, False, '', dict(meta), talent=True)
