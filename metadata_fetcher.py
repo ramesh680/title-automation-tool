@@ -1031,6 +1031,110 @@ def fetch_game(name):
     return meta
 
 
+# ---------------- Brands (Beauty / Beverages / Sports Teams / General) ---------------
+# P31 values that identify a brand / company / organization / sports team.
+_BRAND_TYPES = {
+    "Q431289",    # brand
+    "Q4830453",   # business
+    "Q783794",    # company
+    "Q891723",    # public company
+    "Q167037",    # corporation
+    "Q6881511",   # enterprise
+    "Q43229",     # organization
+    "Q4438121",   # sports organization
+    "Q12973014",  # sports team
+    "Q476028",    # association football club
+}
+# never accept these as a brand match
+_NOT_BRAND_TYPES = {"Q5", "Q4167410"}  # human, disambiguation page
+
+
+def fetch_brand(name):
+    """Auto-discover a BRAND (Beauty / Beverages / Sports / General) via
+    Wikidata: social accounts, Wikipedia page, ticker symbol.
+
+    Unlike the film/TV path, candidates are NOT filtered to FILM_TV_TYPES --
+    that filter is exactly why brand lookups used to come back empty. Returns
+    keys named after the BrandDef columns so create_tfx_row can map them
+    straight onto the row. Fails soft ({})."""
+    if not name:
+        return {}
+    clean = re.sub(r"\s*-\s*DAR\s*$", "", name, flags=re.IGNORECASE).strip()
+    clean, _ = _split_disambiguator(clean)
+    key = ("brand:" + clean.lower(),)
+    if key in _CACHE:
+        return dict(_CACHE[key])
+    meta = {}
+    try:
+        skip = FILM_TV_TYPES | _GAME_TYPES | _NOT_BRAND_TYPES
+        entity = brand_fb = name_fb = None
+        for cand in _search_candidates(clean, limit=8)[:6]:
+            ent = _entity(cand)
+            if not ent:
+                continue
+            claims = ent.get("claims", {})
+            p31 = set(_claim_values(claims, "P31"))
+            if p31 & skip:
+                continue  # a film/show/game/person, not a brand
+            has_social = any(p in claims for p in _SOCIAL_PROPS)
+            is_brandish = bool(p31 & _BRAND_TYPES)
+            lbl = (ent.get("labels", {}).get("en", {}) or {}).get("value", "")
+            name_match = _norm(lbl) == _norm(clean) or any(
+                _norm(a.get("value")) == _norm(clean)
+                for a in ent.get("aliases", {}).get("en", []))
+            if name_match and (is_brandish or has_social):
+                entity = ent  # exact name + clearly a brand: take it
+                break
+            if brand_fb is None and is_brandish and has_social:
+                brand_fb = ent  # right shape, name didn't match exactly
+            if name_fb is None and name_match:
+                name_fb = ent   # weakest: name-only match
+        entity = entity or brand_fb or name_fb
+        if entity is not None:
+            claims = entity.get("claims", {})
+            raw = {}
+            for prop, k in PROPERTY_MAP.items():
+                v = _claim_values(claims, prop)
+                if v:
+                    raw[k] = v[0]
+            if "facebook" in raw:
+                meta["facebook_page"] = ("http://www.facebook.com/"
+                                         + str(raw["facebook"]).strip("/"))
+            if "twitter" in raw:
+                meta["twitter_handle"] = str(raw["twitter"]).lstrip("@")
+            if "instagram" in raw:
+                meta["instagram_user"] = str(raw["instagram"]).lower().lstrip("@")
+            if "tiktok" in raw:
+                meta["tiktok_user"] = str(raw["tiktok"]).lstrip("@")
+            if "pinterest" in raw:
+                meta["pinterest_user_username"] = str(raw["pinterest"]).strip("/")
+            if "linkedin_co" in raw:
+                meta["linkedin_page"] = ("http://www.linkedin.com/company/"
+                                         + str(raw["linkedin_co"]).strip("/"))
+            yt = None
+            if raw.get("youtube_handle"):
+                yt = "http://www.youtube.com/@" + str(raw["youtube_handle"]).lstrip("@")
+            elif raw.get("youtube_id"):
+                yt = "http://www.youtube.com/channel/" + raw["youtube_id"]
+            if yt:
+                meta["youtube_channel_username"] = yt
+            tumblr = _claim_values(claims, "P3943")  # Tumblr username
+            if tumblr:
+                meta["tumblr_page"] = str(tumblr[0]).strip("/")
+            ticker = _claim_values(claims, "P249")   # ticker symbol
+            if ticker:
+                meta["ticker_symbol"] = str(ticker[0])
+            enwiki = entity.get("sitelinks", {}).get("enwiki")
+            if enwiki and enwiki.get("title"):
+                meta["wikipedia_page"] = ("http://en.wikipedia.org/wiki/"
+                                          + enwiki["title"].replace(" ", "_"))
+    except Exception as e:  # noqa: BLE001
+        log.warning("fetch_brand failed for %r: %s", name, e)
+    verify_socials(meta)
+    _CACHE[key] = dict(meta)
+    return meta
+
+
 def youtube_channel(title):
     """The title's own channel via the YouTube Data API (optional key)."""
     if not YOUTUBE_API_KEY:
