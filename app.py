@@ -247,8 +247,13 @@ _KEYWORDS = ('"all new" or episode or watch or tv or show or series or season or
 
 
 def _alnum(s):
-    """Lowercase and strip everything except letters/digits (for hashtags)."""
-    return re.sub(r'[^a-z0-9]', '', (s or '').lower())
+    """Lowercase and strip everything except letters/digits (for hashtags).
+    Accented characters are transliterated (é -> e) rather than dropped, so
+    brand names like L'Oréal hash to 'loreal' instead of 'loral'."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(s or "")).encode(
+        "ascii", "ignore").decode("ascii")
+    return re.sub(r'[^a-z0-9]', '', s.lower())
 
 
 def _title_variants(clean_title):
@@ -845,10 +850,10 @@ def create_talent_row(title, metadata=None):
         gender_line = str(metadata.get('gender') or '').strip()
         _sub = "\n".join(x for x in (subtype_line, gender_line, ttype_line) if x)
 
-    # twitter search term: template formula — lowercase name, strip
-    # [space - . " ' ( )], single '#name|DAR|DAR' line
-    tag = re.sub(r"[ \-.\"'()]", "", clean_name).lower()
-    gen_terms = f"#{tag}|DAR|DAR" if tag else ""
+    # twitter_search_terms: same logic as Movies/TV Shows (talent = DAR row)
+    gen_terms, _ = generate_search_terms(
+        clean_name, '', None, True,
+        twitter_handle=str(metadata.get('twitter_handle') or ''))
 
     def mv(key, default=''):
         v = metadata.get(key, '')
@@ -1002,8 +1007,11 @@ def create_game_row(title, metadata=None):
     rd_clause = dinfo.get('reddit_clause') or \
         (f'{_game_hashtag(dev_name)} | "{dev_name}"' if dev_name else '"Video Game"')
 
-    tag = _game_hashtag(clean_title)
-    gen_terms = f"{tag}|{label}\n{tag}videoGame|{label}"
+    # twitter_search_terms: same logic as Movies/TV Shows (publisher plays
+    # the network role for the '#<title><network>' line)
+    gen_terms, _ = generate_search_terms(
+        clean_title, publisher, None, is_dar,
+        twitter_handle=str(metadata.get('twitter_handle') or ''))
     kw_tail = "|DAR|DAR|2021-01-01" if is_dar else \
         "|Operations - Core Title|Operations - Core Title"
     gen_kw = f'("{clean_title}") ({tw_clause} OR {_GAME_KW_TAIL}){kw_tail}'
@@ -1321,6 +1329,21 @@ def create_tfx_row(title, kind, seed=None):
         col = low.get(str(k).strip().lower())
         if col:
             row[col] = v
+    # twitter_search_terms: same logic as Movies/TV Shows (an explicit value
+    # from the upload/payload still wins -- only the derived default changes)
+    if not any(str(k).strip().lower() == 'twitter_search_terms' for k in seed):
+        out_title = str(row.get('title') or title)
+        base_title = re.sub(r"\s*-\s*DAR\s*$", "", out_title,
+                            flags=re.IGNORECASE).strip()
+        handle = str(row.get('twitter_handle') or '').strip()
+        if 'twitter.com' in handle or 'x.com' in handle:
+            handle = handle.rstrip('/').rsplit('/', 1)[-1]  # URL -> handle
+        terms, _ = generate_search_terms(base_title,
+                                         str(row.get('network') or ''),
+                                         None, ' - DAR' in out_title,
+                                         twitter_handle=handle)
+        if terms:
+            row['twitter_search_terms'] = terms
     row['_tfx_schema'] = kind   # internal routing marker; stripped on output
     return row
 
