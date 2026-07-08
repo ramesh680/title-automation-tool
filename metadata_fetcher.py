@@ -1,5 +1,5 @@
 """
-metadata_fetcher.py (v2)
+metadata_fetcher.py (v3)
 ------------------------
 Auto-discover title metadata by layering several sources.
 
@@ -130,6 +130,35 @@ def _get_html(url):
         return None
 
 
+# Set VALIDATE_URLS=0 to skip the live URL/account checks (faster, less strict)
+VALIDATE_URLS = os.getenv("VALIDATE_URLS", "1").strip().lower() not in ("0", "false", "no")
+try:
+    VALIDATE_TIMEOUT = int(os.getenv("VALIDATE_TIMEOUT_SECONDS", "6"))
+except ValueError:
+    VALIDATE_TIMEOUT = 6
+
+_URL_STATUS_CACHE = {}
+
+
+def _url_status(url):
+    """Final HTTP status code for a URL (browser headers, redirects followed).
+    None on network failure/timeout. Cached for the process lifetime."""
+    if not url or _SESSION is None:
+        return None
+    if url in _URL_STATUS_CACHE:
+        return _URL_STATUS_CACHE[url]
+    status = None
+    try:
+        r = _SESSION.get(url, headers=HTML_HEADERS, timeout=VALIDATE_TIMEOUT,
+                         allow_redirects=True, stream=True)
+        status = r.status_code
+        r.close()
+    except Exception as e:  # noqa: BLE001
+        log.warning("url status check failed (%s): %s", url, e)
+    _URL_STATUS_CACHE[url] = status
+    return status
+
+
 def _tt(imdb_url_or_id):
     m = re.search(r"tt\d{5,}", str(imdb_url_or_id or ""))
     return m.group(0) if m else None
@@ -154,6 +183,108 @@ def _split_disambiguator(title):
     if not m:
         return (title or "").strip(), ""
     return title[:m.start()].strip(), m.group(1).strip()
+
+
+# ---------------- Metacritic URL validation ----------------
+def _mc_slug(title):
+    """Slug the way Metacritic builds movie/tv paths (best-effort guess)."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", title or "").encode("ascii", "ignore").decode("ascii")
+    s = s.replace("&", " and ").replace("'", "")
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+
+def _mc_alive(url):
+    """True (page exists), False (definitive 404/410) or None (can't tell:
+    blocked, throttled, network error)."""
+    status = _url_status(url.replace("http://", "https://"))
+    if status is None:
+        return None
+    if status == 200:
+        return True
+    if status in (404, 410):
+        return False
+    return None  # 403/429/5xx: fail open, we can't tell
+
+
+def resolve_metacritic(title, is_movie=True, candidate=None, curated=False):
+    """Return a Metacritic URL that is known (or safely presumed) valid, or ''.
+
+    * curated candidate (Wikidata P1712): trusted -- dropped ONLY on a
+      definitive 404/410.
+    * guessed candidate (slugged title, e.g. from the BOM calendar service):
+      kept ONLY when the page verifiably returns 200.
+    * fallback: slug the title and try /movie/ then /tv/ (order depends on
+      the title type); again only a verified 200 is accepted.
+    """
+    if not VALIDATE_URLS:
+        return candidate or ""
+    if candidate:
+        alive = _mc_alive(candidate)
+        if alive or (curated and alive is None):
+            return candidate
+    slug = _mc_slug(title)
+    if not slug:
+        return ""
+    sections = ("movie", "tv") if is_movie else ("tv", "movie")
+    for sec in sections:
+        url = "https://www.metacritic.com/%s/%s/" % (sec, slug)
+        if candidate and url.rstrip("/") == str(candidate).replace(
+                "http://", "https://").rstrip("/"):
+            continue  # already tried above
+        if _mc_alive(url):
+            return "http://www.metacritic.com/%s/%s/" % (sec, slug)
+    return ""
+
+
+# ---------------- social account liveness ----------------
+def _twitter_alive(handle):
+    """Keyless check via Twitter's oEmbed endpoint: a 404 means the account
+    does not exist or is suspended. Anything ambiguous fails open (True)."""
+    h = str(handle or "").strip().lstrip("@")
+    if not h:
+        return False
+    status = _url_status("https://publish.twitter.com/oembed?url="
+                         + urllib.parse.quote("https://twitter.com/" + h, safe=""))
+    return status != 404
+
+
+def _instagram_alive(user):
+    """404 on instagram.com/<user>/ means the account is gone. Login walls /
+    throttling (200/302/429...) fail open (True)."""
+    u = str(user or "").strip().lstrip("@")
+    if not u:
+        return False
+    return _url_status("https://www.instagram.com/" + u + "/") not in (404, 410)
+
+
+def _facebook_alive(page):
+    """`page` is a facebook.com URL or a bare page name. 404/410 means the
+    page is gone; login redirects fail open (True)."""
+    p = str(page or "").strip()
+    if not p:
+        return False
+    if "facebook.com" not in p:
+        p = "https://www.facebook.com/" + p.lstrip("/")
+    return _url_status(p.replace("http://", "https://")) not in (404, 410)
+
+
+def verify_socials(meta):
+    """Drop social handles that verifiably no longer exist (deleted, renamed
+    or suspended). Checks fail OPEN: a handle is only removed on a definitive
+    404 -- bot walls and rate limits never strip a valid account."""
+    if not VALIDATE_URLS or not meta:
+        return meta
+    if meta.get("twitter_handle") and not _twitter_alive(meta["twitter_handle"]):
+        log.info("dropping dead twitter handle %r", meta["twitter_handle"])
+        meta.pop("twitter_handle")
+    if meta.get("instagram_user") and not _instagram_alive(meta["instagram_user"]):
+        log.info("dropping dead instagram user %r", meta["instagram_user"])
+        meta.pop("instagram_user")
+    if meta.get("facebook_page") and not _facebook_alive(meta["facebook_page"]):
+        log.info("dropping dead facebook page %r", meta["facebook_page"])
+        meta.pop("facebook_page")
+    return meta
 
 
 # ---------------- upcoming-release-movies service ----------------
@@ -231,7 +362,9 @@ def _upcoming_meta(m):
     if m.get("tt_code"):
         meta["imdb_id"] = "http://www.imdb.com/title/" + str(m["tt_code"])
     if m.get("metacritic_url"):
-        meta["metacritic"] = str(m["metacritic_url"]).replace("https://", "http://")
+        # the calendar service GUESSES this URL by slugging the title --
+        # hold it as a candidate; _enrich_by_tt only keeps it if it verifies
+        meta["_metacritic_guess"] = str(m["metacritic_url"]).replace("https://", "http://")
     return meta
 
 
@@ -582,11 +715,25 @@ def _labels(qids):
     return out
 
 
+# social-account properties where an 'end time' qualifier means the account
+# is closed / renamed / suspended -- such claims must never be used
+_SOCIAL_PROPS = {"P2002", "P2003", "P2013", "P2397", "P11245",
+                 "P7085", "P4264", "P3836", "P11892"}
+
+
 def _claim_values(claims, prop, prefer_us=False):
     """Values for a property. With prefer_us=True, claims qualified with
-    'place of publication'/'applies to' = United States (Q30) come first."""
-    vals, us_vals = [], []
+    'place of publication'/'applies to' = United States (Q30) come first.
+    Deprecated-rank claims are skipped; social claims carrying an 'end time'
+    (P582) qualifier (defunct/suspended accounts) are skipped; within each
+    group, preferred-rank claims come first."""
+    groups = {(u, p): [] for u in (0, 1) for p in (0, 1)}  # (is_us, is_pref)
     for c in claims.get(prop, []):
+        if c.get("rank") == "deprecated":
+            continue
+        quals = c.get("qualifiers", {}) or {}
+        if prop in _SOCIAL_PROPS and "P582" in quals:
+            continue  # account no longer active
         snak = c.get("mainsnak", {})
         if snak.get("snaktype") != "value":
             continue
@@ -595,14 +742,16 @@ def _claim_values(claims, prop, prefer_us=False):
             val = val["id"]
         if val is None:
             continue
-        is_us = False
+        is_us = 0
         for qprop in ("P291", "P518", "P3005", "P1001"):
-            for q in (c.get("qualifiers", {}) or {}).get(qprop, []):
+            for q in quals.get(qprop, []):
                 qv = (q.get("datavalue", {}) or {}).get("value")
                 if isinstance(qv, dict) and qv.get("id") == US_QID:
-                    is_us = True
-        (us_vals if is_us else vals).append(val)
-    return us_vals + vals if prefer_us else vals + us_vals
+                    is_us = 1
+        groups[(is_us, 1 if c.get("rank") == "preferred" else 0)].append(val)
+    us = groups[(1, 1)] + groups[(1, 0)]
+    other = groups[(0, 1)] + groups[(0, 0)]
+    return us + other if prefer_us else other + us
 
 
 def _parse_time(val):
@@ -787,6 +936,7 @@ def fetch_person(name):
                     break
     except Exception as e:  # noqa: BLE001
         log.warning("fetch_person failed for %r: %s", name, e)
+    verify_socials(meta)
     _CACHE[key] = dict(meta)
     return meta
 
@@ -872,6 +1022,11 @@ def fetch_game(name):
                                           + enwiki["title"].replace(" ", "_"))
     except Exception as e:  # noqa: BLE001
         log.warning("fetch_game failed for %r: %s", name, e)
+    if meta.get("metacritic"):
+        alive = _mc_alive(meta["metacritic"]) if VALIDATE_URLS else True
+        if alive is False:
+            meta.pop("metacritic")
+    verify_socials(meta)
     _CACHE[key] = dict(meta)
     return meta
 
@@ -956,6 +1111,22 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
     if not meta.get("youtube_own_channel"):
         _fill(meta, youtube_channel(title_hint))
     meta.setdefault("imdb_id", "http://www.imdb.com/title/" + tt)
+
+    # metacritic: verify what we found. A Wikidata URL is curated (kept unless
+    # definitively 404); the calendar service's slug guess is only kept when
+    # the page really exists; otherwise a verified slug fallback is tried.
+    guess = meta.pop("_metacritic_guess", None)
+    curated = bool(meta.get("metacritic"))
+    mc = resolve_metacritic(title_hint, is_movie,
+                            candidate=meta.get("metacritic") or guess,
+                            curated=curated)
+    if mc:
+        meta["metacritic"] = mc
+    else:
+        meta.pop("metacritic", None)
+
+    # drop social accounts that verifiably no longer exist / are suspended
+    verify_socials(meta)
     return meta
 
 
@@ -1019,6 +1190,14 @@ def fetch_metadata(title, is_movie=True):
             _fill(meta, tmdb_meta)
             _fill(meta, wikidata_meta(lookup, qid=wid, is_movie=is_movie))
             _fill(meta, omdb_lookup(lookup))
+            mc = resolve_metacritic(lookup, is_movie,
+                                    candidate=meta.get("metacritic"),
+                                    curated=bool(meta.get("metacritic")))
+            if mc:
+                meta["metacritic"] = mc
+            else:
+                meta.pop("metacritic", None)
+            verify_socials(meta)
         if sug_ptype:
             meta["program_type"] = sug_ptype  # IMDb's own type beats TMDB's
     except Exception as e:  # noqa: BLE001
