@@ -1752,6 +1752,134 @@ def _sub_parts(sub):
             for l in str(sub or '').split('\n') if ' - ' in l}
 
 
+# ============ column-aware review rules (reviewer feedback, Jul 2026) ============
+# Encodes the reviewed-file comments so curated values that are valid
+# alternatives are no longer flagged as Mismatch.
+
+_FANPAGE_RE = re.compile(r'fan[\s_-]?(page|club)|fanpage', re.I)
+# never valid in a manual value (reviewer: /p/ and /people/ URLs are not valid)
+_BAD_FB_MANUAL_RE = re.compile(r'facebook\.com/(p/|people/)', re.I)
+# additionally never offered as a suggestion (unhelpful discovered URLs)
+_BAD_FB_SUGG_RE = re.compile(
+    r'facebook\.com/(p/|people/|profile\.php|pages/|\d+/*$)', re.I)
+
+
+def _review_lines_ci(v):
+    """Case-folded set of lines; any '||suffix' (added-date etc.) stripped."""
+    out = set()
+    for ln in str(v or '').split('\n'):
+        ln = ln.strip()
+        if ln:
+            out.add(ln.split('||', 1)[0].strip().lower())
+    return out
+
+
+def _review_slug(s):
+    return re.sub(r'[^a-z0-9]+', '', str(s or '').lower())
+
+
+def _review_compare(col, manual_raw, expected_raw, title='', cat='',
+                    manual_genre='', sub_raw=''):
+    """Column-aware comparison. Returns (ok, suggested_str).
+
+    Rules from the reviewed-file feedback:
+      * title_sub_category / brand_set  - extra values are fine; only flag
+        when an expected value is missing (order-insensitive subset check).
+      * twitter_search_terms / youtube_channel_username / -company - curated
+        terms and channels are valid alternatives ("both values are
+        correct"); never flag as Mismatch (gap only).
+      * genre                           - must not be blank for Movies / TV /
+        video games; any curated non-blank set is fine; suggestions trimmed
+        to the top 3.
+      * primary_genre                   - valid if it is any one of the values
+        in the row's own genre column.
+      * released_on                     - discovery may pick a same-named
+        title; a well-formed manual date wins.
+      * wikipedia_page                  - page slug must match the title and
+        must not conflict with the title/sub-category (e.g. an
+        '(American_football)' page for an Actor is still an error).
+      * facebook_page                   - /p/ and /people/ URLs are never
+        valid (flagged in the manual value); 'Fanpage', profile.php and bare
+        numeric-id URLs are additionally never offered as suggestions.
+      * instagram_user                  - 'Fanpage' handles are ignored.
+    """
+    c = str(col or '').strip().lower()
+    mval = _review_norm(manual_raw)
+    eval_ = _review_norm(expected_raw)
+    sugg = str(expected_raw if expected_raw is not None else '')
+
+    if c == 'genre' and sugg:          # top-3 genres only in suggestions
+        sugg = '\n'.join([l.strip() for l in sugg.split('\n') if l.strip()][:3])
+
+    if not eval_ or mval == eval_:
+        return True, sugg
+
+    man_lines, exp_lines = _review_lines_ci(mval), _review_lines_ci(eval_)
+
+    if c in ('title_sub_category', 'brand_set'):
+        return exp_lines <= man_lines, sugg
+
+    if c in ('twitter_search_terms', 'youtube_channel_username',
+             'youtube_channel_company'):
+        # reviewer: "both values are correct" -- curated terms/channels are
+        # valid alternatives; only flag when the cell is empty (gap)
+        return bool(mval), sugg
+
+    if c == 'genre':
+        return bool(mval), sugg
+
+    if c == 'primary_genre':
+        return bool(mval) and mval.strip().lower() in _review_lines_ci(manual_genre), sugg
+
+    if c == 'released_on':
+        return bool(re.match(r'^\d{4}-\d{2}-\d{2}', mval)), sugg
+
+    if c == 'wikipedia_page':
+        if not mval:
+            return False, sugg
+        base = title[:-6].strip() if str(title).endswith(' - DAR') else str(title)
+        tslug = _review_slug(base)
+        ttoks = set(re.findall(r'[a-z0-9]+', base.lower()))
+        ctx = set(re.findall(r'[a-z0-9]+', (str(cat) + ' ' + str(sub_raw)).lower()))
+        for ln in mval.split('\n'):
+            slug = ln.rsplit('/', 1)[-1]
+            if 'disambiguation' in slug.lower():
+                continue
+            # slug matches the title, or is a name-variant of it
+            # (e.g. Kelsey_Asbille for 'Kelsey Asbille Chow')
+            stoks = set(re.findall(r'[a-z0-9]+', re.sub(r'\([^)]*\)', '', slug).lower()))
+            if not ((tslug and tslug in _review_slug(slug))
+                    or (stoks and stoks <= ttoks)):
+                continue
+            par = re.search(r'\(([^)]*)\)', slug)
+            if not par:
+                return True, sugg
+            ptoks = set(re.findall(r'[a-z0-9]+', par.group(1).lower()))
+            if not ctx or (ptoks & ctx):
+                return True, sugg
+        return False, sugg
+
+    if c == 'facebook_page':
+        good = [l for l in sorted(exp_lines)
+                if not _BAD_FB_SUGG_RE.search(l) and not _FANPAGE_RE.search(l)]
+        if not mval:
+            return (not good), ('\n'.join(good) if good else sugg)
+        if any(_BAD_FB_MANUAL_RE.search(l) for l in man_lines):
+            return False, '\n'.join(good)
+        return True, sugg
+
+    if c == 'instagram_user':
+        good = [l for l in sorted(exp_lines) if not _FANPAGE_RE.search(l)]
+        if not mval:
+            return (not good), ('\n'.join(good) if good else sugg)
+        if _FANPAGE_RE.search(mval):
+            return False, '\n'.join(good)
+        return True, sugg
+
+    return False, sugg
+# ==================================================================================
+
+
 # categories handled by the original four review branches
 _TFX_LEGACY_CATS = {'movies', 'tv shows', 'talent', 'video game'}
 
@@ -1866,15 +1994,18 @@ def build_review(src, auto_fetch=True, progress=None):
                     continue
                 src_col = lower_cols[col.lower()]
                 mval = _review_norm(r.get(src_col))
-                eval_ = _review_norm(expected.get(col))
                 cells_checked += 1
-                if not eval_ or mval == eval_:
+                ok, sugg = _review_compare(
+                    col, r.get(src_col), expected.get(col), title=t, cat=cat,
+                    manual_genre=r.get(lower_cols.get('genre', ''), ''),
+                    sub_raw=r.get(lower_cols.get('title_sub_category', ''), ''))
+                if ok:
                     continue
                 status = 'Gap' if not mval else 'Mismatch'
                 findings.append(dict(
                     row=i + 2, title=t, column=src_col, status=status,
                     current=str(r.get(src_col) if r.get(src_col) is not None else ''),
-                    suggested=str(expected.get(col) or '')))
+                    suggested=sugg))
                 fills[(i, src_col)] = status
             if progress:
                 progress(i + 1, total)
@@ -1898,15 +2029,18 @@ def build_review(src, auto_fetch=True, progress=None):
                     continue
                 src_col = lower_cols[col.lower()]
                 mval = _review_norm(r.get(src_col))
-                eval_ = _review_norm(expected.get(col))
                 cells_checked += 1
-                if not eval_ or mval == eval_:
+                ok, sugg = _review_compare(
+                    col, r.get(src_col), expected.get(col), title=t, cat=cat,
+                    manual_genre=r.get(lower_cols.get('genre', ''), ''),
+                    sub_raw=r.get(lower_cols.get('title_sub_category', ''), ''))
+                if ok:
                     continue
                 status = 'Gap' if not mval else 'Mismatch'
                 findings.append(dict(
                     row=i + 2, title=t, column=src_col, status=status,
                     current=str(r.get(src_col) if r.get(src_col) is not None else ''),
-                    suggested=str(expected.get(col) or '')))
+                    suggested=sugg))
                 fills[(i, src_col)] = status
             if progress:
                 progress(i + 1, total)
@@ -1948,15 +2082,18 @@ def build_review(src, auto_fetch=True, progress=None):
                 continue
             src_col = lower_cols[col.lower()]
             mval = _review_norm(r.get(src_col))
-            eval_ = _review_norm(expected.get(col))
             cells_checked += 1
-            if not eval_ or mval == eval_:
+            ok, sugg = _review_compare(
+                col, r.get(src_col), expected.get(col), title=t, cat=cat,
+                manual_genre=r.get(lower_cols.get('genre', ''), ''),
+                sub_raw=r.get(lower_cols.get('title_sub_category', ''), ''))
+            if ok:
                 continue
             status = 'Gap' if not mval else 'Mismatch'
             findings.append(dict(
                 row=i + 2, title=t, column=src_col, status=status,
                 current=str(r.get(src_col) if r.get(src_col) is not None else ''),
-                suggested=str(expected.get(col) or '')))
+                suggested=sugg))
             fills[(i, src_col)] = status
         if progress:
             progress(i + 1, total)
