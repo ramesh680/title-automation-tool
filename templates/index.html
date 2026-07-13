@@ -444,6 +444,12 @@
                    <p>${label || 'Enriching titles…'} ${total ? (done + ' / ' + total + ' (' + pct + '%)') : ''}</p>${bar}</div>`;
         }
 
+        function fmtEta(s) {
+            if (s === null || s === undefined) return '';
+            const m = Math.floor(s / 60), sec = s % 60;
+            return ' — about ' + (m ? m + 'm ' : '') + sec + 's left';
+        }
+
         function pollJob(id) {
             fetch('/api/job/' + id)
                 .then(r => r.json())
@@ -454,7 +460,7 @@
                         return;
                     }
                     if (j.status === 'running') {
-                        renderProgress(j.done, j.total, 'Enriching titles…');
+                        renderProgress(j.done, j.total, 'Enriching titles…' + fmtEta(j.eta_seconds));
                         setTimeout(() => pollJob(id), 1500);
                     } else if (j.status === 'done') {
                         const a = document.createElement('a');
