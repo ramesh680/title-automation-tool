@@ -39,6 +39,17 @@ def _finding(field, status, value="", expected="", msg=""):
             "expected": expected, "msg": msg}
 
 
+# reviewer feedback (Jul 2026): 'True' and 't' are both correct
+_BOOL_TRUE = {"t", "true", "yes", "y", "1"}
+_BOOL_FALSE = {"f", "false", "no", "n", "0"}
+
+
+def _bool_equal(a: str, b: str) -> bool:
+    a, b = str(a).strip().lower(), str(b).strip().lower()
+    return (a in _BOOL_TRUE and b in _BOOL_TRUE) or \
+           (a in _BOOL_FALSE and b in _BOOL_FALSE)
+
+
 def validate_row(row: Dict[str, Any], schema_key: str,
                  rules: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Validate one row; return only non-ok findings (gaps + mismatches)."""
@@ -58,11 +69,18 @@ def validate_row(row: Dict[str, Any], schema_key: str,
         elif t == "const":
             if not val:
                 out.append(_finding(field, "gap", "", rule["value"], rule["msg"]))
-            elif val != rule["value"]:
+            elif val != rule["value"] and not _bool_equal(val, rule["value"]):
+                # 'True' == 't', 'False' == 'f', etc. are equivalent
                 out.append(_finding(field, "mismatch", val, rule["value"], rule["msg"]))
 
         elif t == "enum":
             if val and val not in rule["values"]:
+                # brand_set can be updated by anyone -- extra values are fine
+                # as long as at least one canonical value is present
+                if field == "brand_set":
+                    lines = [ln.strip() for ln in val.splitlines() if ln.strip()]
+                    if any(ln in rule["values"] for ln in lines):
+                        continue
                 out.append(_finding(field, "mismatch", val, "one of dropdown", rule["msg"]))
 
         elif t == "enum_ref":
@@ -95,7 +113,10 @@ def validate_row(row: Dict[str, Any], schema_key: str,
             # strip the DAR suffix before deriving the expected hashtag
             base = title[:-6].strip() if title.endswith(" - DAR") else title
             expected = _hashtag(base)
-            if expected and val and val != expected:
+            # reviewer feedback: manually curated terms are valid alternatives;
+            # only flag when the value contains no #hashtag/@handle at all
+            if expected and val and val != expected \
+                    and not re.search(r"[#@]\w", val):
                 out.append(_finding(field, "mismatch", val, expected, rule["msg"]))
 
     return out
