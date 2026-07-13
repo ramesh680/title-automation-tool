@@ -42,6 +42,16 @@ from datetime import date, timedelta
 try:
     import requests
     _SESSION = requests.Session()
+    try:
+        from requests.adapters import HTTPAdapter
+        # parallel auto-discovery runs many lookups at once; grow the
+        # connection pool so worker threads don't queue on free sockets
+        _ADAPTER = HTTPAdapter(pool_connections=32, pool_maxsize=64,
+                               max_retries=1)
+        _SESSION.mount("https://", _ADAPTER)
+        _SESSION.mount("http://", _ADAPTER)
+    except Exception:
+        pass
 except Exception:
     requests = None
     _SESSION = None
