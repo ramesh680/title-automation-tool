@@ -469,7 +469,7 @@
                         a.click();
                         a.remove();
                         document.getElementById('previewContent').innerHTML =
-                            '<p class="placeholder" style="color:var(--ok);text-align:center;padding:44px 0">✓ Export complete (' + (j.rows || '') + ' rows) — file downloaded.</p>';
+                            '<p class="placeholder" style="color:var(--ok);text-align:center;padding:44px 0">✓ Export complete (' + (j.rows || '') + ' rows' + (j.enriched !== null && j.enriched !== undefined ? ', ' + j.enriched + ' with discovered socials' : '') + ') — file downloaded.</p>';
                         showMessage('previewMessage', '✓ Excel file downloaded successfully!', 'success');
                     } else {
                         showMessage('previewMessage', j.error || 'Generation failed', 'error');
