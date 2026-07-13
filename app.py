@@ -2301,8 +2301,15 @@ def _run_generation(jid, kind, payload):
         if not rows:
             _job_set(jid, status='error', error='No titles provided')
             return
+        # how many rows actually got social/discovery data -- surfaces
+        # rate-limit problems instead of silently exporting blank socials
+        _soc = ('twitter_handle', 'instagram_user', 'facebook_page',
+                'youtube_channel_username', 'wikipedia_page', 'tiktok_user')
+        enriched = sum(1 for r in rows
+                       if any(str(r.get(c) or '').strip() for c in _soc))
         out = _rows_to_workbook(rows)
         _job_set(jid, status='done', file=out.getvalue(), rows=len(rows),
+                 enriched=enriched,
                  filename=f"Titles_Export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
     except Exception as e:  # noqa: BLE001
         logging.error(f"generation job {jid} failed: {e}")
@@ -2345,7 +2352,8 @@ def job_status(jid):
             eta = max(0, int(elapsed / j['done'] * (j['total'] - j['done'])))
         return jsonify({'status': j['status'], 'done': j['done'], 'total': j['total'],
                         'error': j['error'], 'rows': j.get('rows'),
-                        'summary': j.get('summary'), 'eta_seconds': eta})
+                        'summary': j.get('summary'), 'eta_seconds': eta,
+                        'enriched': j.get('enriched')})
 
 
 @app.route('/api/job/<jid>/download')
