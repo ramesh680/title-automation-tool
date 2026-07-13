@@ -7,6 +7,7 @@ import time
 import uuid
 import threading
 import logging
+import os
 
 try:
     from metadata_fetcher import (fetch_metadata, fetch_metadata_by_tt,
@@ -1348,6 +1349,51 @@ def create_tfx_row(title, kind, seed=None):
     return row
 
 
+# ---------------- parallel auto-discovery (large-file support) ----------------
+# Lookups used to run one title at a time; a 5,000-title file at ~2-5s per
+# title could never finish. Discovery is I/O-bound, so a small thread pool
+# gives a near-linear speed-up. Tune with the FETCH_WORKERS env var.
+FETCH_WORKERS = max(1, int(os.getenv('FETCH_WORKERS', '8') or 8))
+
+
+def _parallel_rows(items, worker, progress=None, parallel=True):
+    """Run worker(index, item) -> [row, ...] for every item, preserving input
+    order in the output. One failing title never kills the batch -- it just
+    yields no rows (and is logged). progress(done, total) is thread-safe."""
+    total = len(items)
+    if not total:
+        return []
+    results = [None] * total
+    state = {'done': 0}
+    lock = threading.Lock()
+
+    def _safe(i, item):
+        try:
+            results[i] = worker(i, item) or []
+        except Exception as e:  # noqa: BLE001 -- fail soft per title
+            logging.warning(f"title #{i + 1} failed during generation: {e}")
+            results[i] = []
+        finally:
+            with lock:
+                state['done'] += 1
+                d = state['done']
+            if progress:
+                progress(d, total)
+
+    if not parallel or total == 1 or FETCH_WORKERS == 1:
+        for i, item in enumerate(items):
+            _safe(i, item)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, total)) as ex:
+            list(ex.map(lambda p: _safe(*p), enumerate(items)))
+
+    out = []
+    for r in results:
+        out.extend(r or [])
+    return out
+
+
 def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
                            progress=None, default_kind='movie'):
     """Turn an uploaded file into fully-populated rows.
@@ -1370,13 +1416,11 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
         records = df.to_dict('records')
         if max_titles:
             records = records[:max_titles]
-        total = len(records)
-        for i, r in enumerate(records):
+
+        def _one_record(i, r):
             t = str(r.get('title', '')).strip()
             if not t:
-                if progress:
-                    progress(i + 1, total)
-                continue
+                return []
             kind_r = _norm_kind(r.get('title_category'), default_kind)
             if kind_r in TFX_KINDS and TFX_OK:
                 seed = r
@@ -1387,10 +1431,7 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
                     for k, v in r.items():
                         if v not in (None, ''):
                             seed[k] = v
-                rows.append(create_tfx_row(t, kind_r, seed))
-                if progress:
-                    progress(i + 1, total)
-                continue
+                return [create_tfx_row(t, kind_r, seed)]
             if kind_r in ('talent', 'game'):
                 if auto_fetch:
                     disc = dict((fetch_person(t) if kind_r == 'talent'
@@ -1399,21 +1440,19 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
                         if v not in (None, ''):
                             disc[k] = v
                     r = disc
-                rows.append(make_row(t, False, '', r,
-                                     talent=(kind_r == 'talent'),
-                                     game=(kind_r == 'game')))
-                if progress:
-                    progress(i + 1, total)
-                continue
+                return [make_row(t, False, '', r,
+                                 talent=(kind_r == 'talent'),
+                                 game=(kind_r == 'game'))]
             is_movie_r = kind_r == 'movie'
             if auto_fetch:
                 r = _merge_meta(r, t, True, is_movie=is_movie_r)
             # route through make_row so derived fields (network label, youtube
             # lines, brand sets, search terms) are computed consistently; explicit
             # values from the upload always win inside the row builders
-            rows.append(make_row(t, is_movie_r, str(r.get('network') or ''), r))
-            if progress:
-                progress(i + 1, total)
+            return [make_row(t, is_movie_r, str(r.get('network') or ''), r)]
+
+        rows = _parallel_rows(records, _one_record, progress=progress,
+                              parallel=auto_fetch)
     else:
         title_col = lower_cols.get('title') or df.columns[0]
         type_col = lower_cols.get('type') or lower_cols.get('title_category')
@@ -1428,29 +1467,32 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
             kind = _norm_kind(r[type_col] if type_col else '', default_kind)
             network = str(r[network_col]).strip() if network_col else ''
             specs.append((title, kind, network))
-        total = len(specs)
-        for i, (title, kind, network) in enumerate(specs):
+        def _one_spec(i, spec):
+            title, kind, network = spec
+            out = []
             if kind in TFX_KINDS and TFX_OK:
                 seed = dict(fetch_brand(title) or {}) if auto_fetch else None
-                rows.append(create_tfx_row(title, kind, seed))
+                out.append(create_tfx_row(title, kind, seed))
                 if include_dar and ' - DAR' not in title:
-                    rows.append(create_tfx_row(f"{title} - DAR", kind, seed))
+                    out.append(create_tfx_row(f"{title} - DAR", kind, seed))
             elif kind == 'talent':
                 meta = dict(fetch_person(title) or {}) if auto_fetch else {}
-                rows.append(make_row(title, False, '', meta, talent=True))
+                out.append(make_row(title, False, '', meta, talent=True))
             elif kind == 'game':
                 meta = dict(fetch_game(title) or {}) if auto_fetch else {}
-                rows.append(make_row(title, False, '', meta, game=True))
+                out.append(make_row(title, False, '', meta, game=True))
                 if include_dar and ' - DAR' not in title:
-                    rows.append(make_row(f"{title} - DAR", False, '', meta, game=True))
+                    out.append(make_row(f"{title} - DAR", False, '', meta, game=True))
             else:
                 is_movie = kind == 'movie'
                 meta = _merge_meta({}, title, auto_fetch, is_movie=is_movie)
-                rows.append(make_row(title, is_movie, network, meta))
+                out.append(make_row(title, is_movie, network, meta))
                 if include_dar and ' - DAR' not in title:
-                    rows.append(make_row(f"{title} - DAR", is_movie, network, meta))
-            if progress:
-                progress(i + 1, total)
+                    out.append(make_row(f"{title} - DAR", is_movie, network, meta))
+            return out
+
+        rows = _parallel_rows(specs, _one_spec, progress=progress,
+                              parallel=auto_fetch)
     return rows
 
 
@@ -1461,12 +1503,11 @@ def build_rows_from_titles(data, max_titles=None, progress=None):
         titles = titles[:max_titles]
     include_dar = data.get('includeDar', True)
     auto_fetch = bool(data.get('autoFetch', False))
-    total = len(titles)
-    rows = []
-    for i, title in enumerate(titles):
+    def _one_title(i, title):
         kind = _norm_kind(data.get('titles_type', {}).get(title, 'movie'))
         network = data.get('networks', {}).get(title, '')
         base_meta = data.get('metadata', {}).get(title, {})
+        out = []
         if kind in TFX_KINDS and TFX_OK:
             seed = base_meta
             if auto_fetch:
@@ -1476,33 +1517,34 @@ def build_rows_from_titles(data, max_titles=None, progress=None):
                 for k, v in (base_meta or {}).items():
                     if v not in (None, ''):
                         seed[k] = v
-            rows.append(create_tfx_row(title, kind, seed))
+            out.append(create_tfx_row(title, kind, seed))
             if include_dar and ' - DAR' not in title:
-                rows.append(create_tfx_row(f"{title} - DAR", kind, seed))
+                out.append(create_tfx_row(f"{title} - DAR", kind, seed))
         elif kind == 'talent':
             metadata = dict(fetch_person(title) or {}) if auto_fetch else {}
             for k, v in (base_meta or {}).items():
                 if v not in (None, ''):
                     metadata[k] = v
             # talent = a single DAR row per person, no twin
-            rows.append(make_row(title, False, '', metadata, talent=True))
+            out.append(make_row(title, False, '', metadata, talent=True))
         elif kind == 'game':
             metadata = dict(fetch_game(title) or {}) if auto_fetch else {}
             for k, v in (base_meta or {}).items():
                 if v not in (None, ''):
                     metadata[k] = v
-            rows.append(make_row(title, False, '', metadata, game=True))
+            out.append(make_row(title, False, '', metadata, game=True))
             if include_dar and ' - DAR' not in title:
-                rows.append(make_row(f"{title} - DAR", False, '', metadata, game=True))
+                out.append(make_row(f"{title} - DAR", False, '', metadata, game=True))
         else:
             is_movie = kind == 'movie'
             metadata = _merge_meta(base_meta, title, auto_fetch, is_movie=is_movie)
-            rows.append(make_row(title, is_movie, network, metadata))
+            out.append(make_row(title, is_movie, network, metadata))
             if include_dar and ' - DAR' not in title:
-                rows.append(make_row(f"{title} - DAR", is_movie, network, metadata))
-        if progress:
-            progress(i + 1, total)
-    return rows
+                out.append(make_row(f"{title} - DAR", is_movie, network, metadata))
+        return out
+
+    return _parallel_rows(titles, _one_title, progress=progress,
+                          parallel=auto_fetch)
 
 
 def _is_tv_row(r):
@@ -2297,9 +2339,13 @@ def job_status(jid):
         j = _JOBS.get(jid)
         if not j:
             return jsonify({'error': 'Unknown or expired job'}), 404
+        eta = None
+        if j['status'] == 'running' and j.get('done') and j.get('total'):
+            elapsed = time.time() - j.get('created', time.time())
+            eta = max(0, int(elapsed / j['done'] * (j['total'] - j['done'])))
         return jsonify({'status': j['status'], 'done': j['done'], 'total': j['total'],
                         'error': j['error'], 'rows': j.get('rows'),
-                        'summary': j.get('summary')})
+                        'summary': j.get('summary'), 'eta_seconds': eta})
 
 
 @app.route('/api/job/<jid>/download')
