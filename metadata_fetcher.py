@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.parse
 from datetime import date, timedelta
@@ -115,12 +116,68 @@ _MONTHS_FULL = {"january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "
                 "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12}
 
 
+# ---------------- polite parallel fetching ----------------
+# With parallel generation many lookups hit the same APIs at once; without
+# throttling, Wikidata/Wikipedia answer 429 and discovery silently comes
+# back empty (rows generate but socials are blank). Cap concurrent requests
+# per host and retry rate-limited calls with backoff.
+try:
+    MAX_PER_HOST = max(1, int(os.getenv("MAX_CONCURRENT_PER_HOST", "4")))
+except ValueError:
+    MAX_PER_HOST = 4
+_RETRY_STATUS = (429, 502, 503, 504)
+_MAX_RETRIES = 4
+_HOST_SEMS = {}
+_HOST_SEMS_LOCK = threading.Lock()
+
+
+def _host_sem(url):
+    host = urllib.parse.urlsplit(url).netloc.lower()
+    with _HOST_SEMS_LOCK:
+        s = _HOST_SEMS.get(host)
+        if s is None:
+            s = _HOST_SEMS[host] = threading.BoundedSemaphore(MAX_PER_HOST)
+        return s
+
+
+def _polite_get(url, **kw):
+    """Session.get with a per-host concurrency cap and retry/backoff on
+    rate-limit / transient statuses (honours Retry-After). Raises like
+    Session.get on final failure."""
+    sem = _host_sem(url)
+    delay = 0.5
+    for attempt in range(_MAX_RETRIES + 1):
+        with sem:
+            try:
+                r = _SESSION.get(url, **kw)
+            except requests.exceptions.RequestException:
+                if attempt >= _MAX_RETRIES:
+                    raise
+                time.sleep(delay)
+                delay *= 2
+                continue
+        if r.status_code in _RETRY_STATUS and attempt < _MAX_RETRIES:
+            ra = r.headers.get("Retry-After")
+            try:
+                wait = min(30.0, float(ra)) if ra else delay
+            except ValueError:
+                wait = delay
+            r.close()
+            log.info("HTTP %s from %s -- retrying in %.1fs",
+                     r.status_code, url.split('?')[0], wait)
+            time.sleep(wait)
+            delay *= 2
+            continue
+        return r
+    return r
+
+
 # ---------------- low level ----------------
 def _get_json(url, params=None, headers=None):
     if _SESSION is None:
         return None
     try:
-        r = _SESSION.get(url, params=params, headers=headers or HEADERS, timeout=TIMEOUT)
+        r = _polite_get(url, params=params, headers=headers or HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         return r.json()
     except Exception as e:  # noqa: BLE001
@@ -132,7 +189,7 @@ def _get_html(url):
     if _SESSION is None:
         return None
     try:
-        r = _SESSION.get(url, headers=HTML_HEADERS, timeout=TIMEOUT)
+        r = _polite_get(url, headers=HTML_HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         return r.text
     except Exception as e:  # noqa: BLE001
@@ -159,8 +216,8 @@ def _url_status(url):
         return _URL_STATUS_CACHE[url]
     status = None
     try:
-        r = _SESSION.get(url, headers=HTML_HEADERS, timeout=VALIDATE_TIMEOUT,
-                         allow_redirects=True, stream=True)
+        r = _polite_get(url, headers=HTML_HEADERS, timeout=VALIDATE_TIMEOUT,
+                        allow_redirects=True, stream=True)
         status = r.status_code
         r.close()
     except Exception as e:  # noqa: BLE001
