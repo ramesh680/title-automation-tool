@@ -1674,37 +1674,45 @@ def api_lookup():
     return jsonify({'discovered': meta, 'row': row})
 
 
+def _preview_payload(rows, preview_limited):
+    """Shape enriched rows into the JSON the preview panel renders."""
+    # preview shows the schema of the first title's category
+    def _kind(r):
+        return (r.get('_tfx_schema') or
+                ('talent' if _is_talent_row(r) else
+                 'game' if _is_game_row(r) else
+                 'tv' if _is_tv_row(r) else 'movie'))
+    first = _kind(rows[0])
+    cols = {'talent': TALENT_COLUMNS, 'game': GAME_COLUMNS,
+            'tv': TV_COLUMNS, 'movie': COLUMNS,
+            **({k: v for k, v in _TFX_COLUMNS.items()} if TFX_OK else {})}[first]
+    same = [r for r in rows if _kind(r) == first]
+    df = pd.DataFrame(same)
+    df = df.reindex(columns=cols).where(lambda x: pd.notnull(x), '')
+    return {
+        'total_rows': len(df),
+        'preview': df.head(4).to_dict('records'),
+        'columns': list(df.columns),
+        'preview_limited': preview_limited,
+    }
+
+
 @app.route('/api/preview', methods=['POST'])
 def preview_data():
+    """Synchronous preview. Kept for backwards compatibility, but with
+    Auto-discover ON the enrichment can outlive the HTTP request timeout
+    (worker killed -> 502), so the UI uses /api/preview_async instead."""
     try:
         rows = collect_rows(preview=True)
         if not rows:
             return jsonify({'error': 'No titles provided'}), 400
-        # preview shows the schema of the first title's category
-        def _kind(r):
-            return (r.get('_tfx_schema') or
-                    ('talent' if _is_talent_row(r) else
-                     'game' if _is_game_row(r) else
-                     'tv' if _is_tv_row(r) else 'movie'))
-        first = _kind(rows[0])
-        cols = {'talent': TALENT_COLUMNS, 'game': GAME_COLUMNS,
-                'tv': TV_COLUMNS, 'movie': COLUMNS,
-                **({k: v for k, v in _TFX_COLUMNS.items()} if TFX_OK else {})}[first]
-        same = [r for r in rows if _kind(r) == first]
-        df = pd.DataFrame(same)
-        df = df.reindex(columns=cols).where(lambda x: pd.notnull(x), '')
         # figure out whether the source had more titles than we sampled
         if request.files.get('file'):
             preview_limited = True
         else:
             src = len((request.get_json(silent=True) or {}).get('titles', []))
             preview_limited = src > PREVIEW_MAX_TITLES
-        return jsonify({
-            'total_rows': len(df),
-            'preview': df.head(4).to_dict('records'),
-            'columns': list(df.columns),
-            'preview_limited': preview_limited,
-        })
+        return jsonify(_preview_payload(rows, preview_limited))
     except Exception as e:
         logging.error(f"Error previewing data: {str(e)}")
         return jsonify({'error': f"Error: {str(e)}"}), 500
@@ -2290,16 +2298,24 @@ def _run_generation(jid, kind, payload):
                      summary=summary,
                      filename=f"Reviewed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
             return
+        max_titles = PREVIEW_MAX_TITLES if payload.get('preview') else None
         if kind == 'file':
             rows = build_rows_from_upload(
                 (payload['bytes'], payload['filename']),
                 payload['include_dar'], payload['auto_fetch'], progress=prog,
+                max_titles=max_titles,
                 default_kind=payload.get('title_type', 'movie'))
         else:
-            rows = build_rows_from_titles(payload['data'], progress=prog)
+            rows = build_rows_from_titles(payload['data'], max_titles=max_titles,
+                                          progress=prog)
 
         if not rows:
             _job_set(jid, status='error', error='No titles provided')
+            return
+        if payload.get('preview'):
+            _job_set(jid, status='done',
+                     preview=_preview_payload(rows, payload.get('preview_limited', False)),
+                     rows=len(rows))
             return
         # how many rows actually got social/discovery data -- surfaces
         # rate-limit problems instead of silently exporting blank socials
@@ -2340,6 +2356,38 @@ def generate_async():
     return jsonify({'job_id': jid})
 
 
+@app.route('/api/preview_async', methods=['POST'])
+def preview_async():
+    """Kick off a preview (first PREVIEW_MAX_TITLES titles, incl. auto-discover
+    enrichment) in the background; returns a job id. Poll /api/job/<jid> --
+    when done the job carries a 'preview' payload. This keeps long
+    auto-discovery lookups out of the HTTP request, which the platform
+    kills after ~30s (the old 502 'server timed out' error)."""
+    _prune_jobs()
+    jid = uuid.uuid4().hex[:12]
+    if request.files.get('file'):
+        f = request.files['file']
+        payload = {
+            'bytes': f.read(), 'filename': f.filename,
+            'include_dar': request.form.get('includeDar', 'true').lower() != 'false',
+            'auto_fetch': request.form.get('autoFetch', 'false').lower() == 'true',
+            'title_type': _norm_kind(request.form.get('titleType')),
+            'preview': True, 'preview_limited': True,
+        }
+        kind = 'file'
+    else:
+        data = request.get_json(silent=True) or {}
+        n_src = len([t for t in data.get('titles', []) if t and t.strip()])
+        payload = {'data': data, 'preview': True,
+                   'preview_limited': n_src > PREVIEW_MAX_TITLES}
+        kind = 'titles'
+    with _JOBS_LOCK:
+        _JOBS[jid] = {'status': 'running', 'done': 0, 'total': 0, 'error': None,
+                      'file': None, 'filename': None, 'rows': None, 'created': time.time()}
+    threading.Thread(target=_run_generation, args=(jid, kind, payload), daemon=True).start()
+    return jsonify({'job_id': jid})
+
+
 @app.route('/api/job/<jid>')
 def job_status(jid):
     with _JOBS_LOCK:
@@ -2353,6 +2401,7 @@ def job_status(jid):
         return jsonify({'status': j['status'], 'done': j['done'], 'total': j['total'],
                         'error': j['error'], 'rows': j.get('rows'),
                         'summary': j.get('summary'), 'eta_seconds': eta,
+                        'preview': j.get('preview'),
                         'enriched': j.get('enriched')})
 
 

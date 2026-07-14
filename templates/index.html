@@ -335,38 +335,64 @@
             };
         }
 
+        // Preview runs as a background job too -- auto-discover lookups can take
+        // ~30s+ per title, longer than the platform's request timeout (the old
+        // 502 "server timed out" error, which hit even a single title).
         function previewData() {
             const init = buildRequestInit();
             if (!init) return;
 
-            showLoading('previewContent', true);
+            renderProgress(0, 0, 'Starting preview…');
 
-            fetch('/api/preview', init)
+            fetch('/api/preview_async', init)
             .then(async r => {
                 if (!r.ok) {
                     const t = await r.text().catch(() => '');
-                    if (r.status === 502 || r.status === 504 || !t) {
-                        throw new Error('The server timed out. With Auto-discover on, try fewer titles or turn it off for large files.');
-                    }
                     throw new Error('Server error ' + r.status + (t ? ': ' + t.slice(0, 160) : ''));
                 }
                 return r.json();
             })
-            .then(data => {
-                if (data.error) {
-                    showMessage('previewMessage', data.error, 'error');
+            .then(d => {
+                if (d.error) {
+                    showMessage('previewMessage', d.error, 'error');
+                    showLoading('previewContent', false);
                     return;
                 }
+                pollPreviewJob(d.job_id);
+            })
+            .catch(e => {
+                showMessage('previewMessage', `Error: ${e.message}`, 'error');
+                showLoading('previewContent', false);
+            });
+        }
 
+        function pollPreviewJob(id) {
+            fetch('/api/job/' + id)
+                .then(r => r.json())
+                .then(j => {
+                    if (j.error && j.status !== 'running') {
+                        showMessage('previewMessage', j.error, 'error');
+                        showLoading('previewContent', false);
+                        return;
+                    }
+                    if (j.status === 'running') {
+                        renderProgress(j.done, j.total, 'Enriching preview…' + fmtEta(j.eta_seconds));
+                        setTimeout(() => pollPreviewJob(id), 1200);
+                    } else if (j.status === 'done' && j.preview) {
+                        displayPreviewResult(j.preview);
+                    } else {
+                        showMessage('previewMessage', j.error || 'Preview failed', 'error');
+                        showLoading('previewContent', false);
+                    }
+                })
+                .catch(() => setTimeout(() => pollPreviewJob(id), 2500));  // transient poll error -> retry
+        }
+
+        function displayPreviewResult(data) {
                 displayPreview(data);
                 document.getElementById('generateBtn').style.display = 'block';
                 const note = data.preview_limited ? ' (sample — full set is built on Download)' : '';
                 showMessage('previewMessage', `✓ Preview ready for ${data.total_rows} rows` + note, 'success');
-            })
-            .catch(e => {
-                showMessage('previewMessage', `Error: ${e.message}`, 'error');
-            })
-            .finally(() => showLoading('previewContent', false));
         }
 
         function escapeHtml(s) {
