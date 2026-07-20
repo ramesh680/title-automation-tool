@@ -129,7 +129,6 @@
                 <a class="nav-pill" href="/" style="text-decoration:none;color:#fff;background:linear-gradient(135deg,var(--brand1),var(--brand3));border:none">Generator</a>
                 <a class="nav-pill" href="/validator" style="text-decoration:none">Validator</a>
                 <a class="nav-pill" href="/review" style="text-decoration:none">Review</a>
-                <span class="nav-pill">Ramesh Goswami</span>
             </div>
         </nav>
 
@@ -151,6 +150,7 @@
                     <label class="lbl">Input method</label>
                     <select id="inputMethod" onchange="toggleInputMethod()">
                         <option value="manual">Manual Entry (Paste List)</option>
+                        <option value="handles">Social Handles → Template</option>
                         <option value="file">Upload CSV / Excel File</option>
                     </select>
                 </div>
@@ -159,6 +159,21 @@
                     <div class="form-group">
                         <label class="lbl">Titles (one per line)</label>
                         <textarea id="titlesList" placeholder="Cookie Queens&#10;Cruel Hands&#10;Elijah Peel&#10;..."></textarea>
+                    </div>
+                </div>
+
+                <div id="handlesInput" style="display:none">
+                    <div class="form-group">
+                        <label class="lbl">Social accounts (one per line)</label>
+                        <textarea id="handlesList" placeholder="@zendaya&#10;instagram.com/natgeo | National Geographic&#10;yt:@mrbeast&#10;x.com/nike | Nike&#10;tiktok.com/@khaby.lame"></textarea>
+                        <span class="hint">Pick the <b>Title type</b> below — it becomes the category for every account.
+                        Platform is auto-detected from the URL or a prefix
+                        (<b>ig:</b> <b>fb:</b> <b>tw:</b>/<b>x:</b> <b>yt:</b> <b>tt:</b> <b>tm:</b> <b>li:</b>);
+                        a bare <b>@name</b> or word defaults to Instagram. Add
+                        <b>| Title Name</b> to set the title exactly; otherwise a
+                        provisional title is derived from the handle for you to
+                        review. For <b>Talent</b>, gender/profession can't come from a
+                        handle — that sub-category is scaffolded and left for review.</span>
                     </div>
                 </div>
 
@@ -240,8 +255,9 @@
     <script>
         function toggleInputMethod() {
             const method = document.getElementById('inputMethod').value;
-            document.getElementById('manualInput').style.display = method === 'manual' ? 'block' : 'none';
-            document.getElementById('fileInput').style.display = method === 'file' ? 'block' : 'none';
+            document.getElementById('manualInput').style.display  = method === 'manual'  ? 'block' : 'none';
+            document.getElementById('handlesInput').style.display = method === 'handles' ? 'block' : 'none';
+            document.getElementById('fileInput').style.display    = method === 'file'    ? 'block' : 'none';
         }
 
         // Reflect the chosen filename in the upload label
@@ -296,6 +312,104 @@
         // Build the fetch options for /api/preview and /api/generate.
         // For file uploads we send multipart/form-data so the server can read
         // the workbook and preserve ALL columns (incl. social channels).
+        // ---- Social-handle-first mode ------------------------------------
+        // Each line is one account. Optional "handle | Title Name" sets the
+        // title; otherwise it's derived from the handle (review before ingest).
+        // Platform auto-detected from a URL or a prefix; bare @name -> Instagram.
+        // The chosen Title type is used as the category for every account.
+        // Metadata is sent under BOTH key styles so every builder consumes it:
+        // canonical BrandDef cols (talent/movie/tv/game) + ingest-header aliases
+        // (beauty/beverages/sports/general).
+        const HANDLE_FIELDS = {
+            instagram: ['instagram_user', 'Instagram'],
+            twitter:   ['twitter_handle', 'Twitter'],
+            facebook:  ['facebook_page', 'Facebook'],
+            youtube:   ['youtube_channel_username', 'YouTube'],
+            tiktok:    ['tiktok_user', 'TikTok'],
+            tumblr:    ['tumblr_page', 'Tumblr'],
+            linkedin:  ['linkedin_page', 'LinkedIn']
+        };
+
+        function _detectPlatform(token) {
+            const s = token.toLowerCase();
+            if (s.includes('instagram.com')) return 'instagram';
+            if (s.includes('tiktok.com'))    return 'tiktok';
+            if (s.includes('youtube.com') || s.includes('youtu.be')) return 'youtube';
+            if (s.includes('facebook.com') || s.includes('fb.com'))  return 'facebook';
+            if (s.includes('twitter.com')  || s.includes('x.com'))   return 'twitter';
+            if (s.includes('tumblr.com'))   return 'tumblr';
+            if (s.includes('linkedin.com')) return 'linkedin';
+            const pfx = s.match(/^(ig|insta|instagram|fb|facebook|tw|x|twitter|yt|youtube|tt|tiktok|tm|tumblr|li|linkedin)\s*:/);
+            if (pfx) {
+                const p = pfx[1];
+                if (p === 'fb' || p === 'facebook') return 'facebook';
+                if (p === 'tw' || p === 'x' || p === 'twitter') return 'twitter';
+                if (p === 'yt' || p === 'youtube') return 'youtube';
+                if (p === 'tt' || p === 'tiktok')  return 'tiktok';
+                if (p === 'tm' || p === 'tumblr')  return 'tumblr';
+                if (p === 'li' || p === 'linkedin') return 'linkedin';
+                return 'instagram';
+            }
+            return 'instagram';
+        }
+
+        function _cleanHandle(token, platform) {
+            let s = token.trim().replace(/^(ig|insta|instagram|fb|facebook|tw|x|twitter|yt|youtube|tt|tiktok|tm|tumblr|li|linkedin)\s*:\s*/i, '');
+            // tumblr: username.tumblr.com -> username
+            const tmb = s.match(/^(?:https?:\/\/)?([^./\s]+)\.tumblr\.com/i);
+            if (platform === 'tumblr' && tmb) return tmb[1].toLowerCase();
+            if (/^https?:\/\//i.test(s) || /^[\w.-]+\.[a-z]{2,}\//i.test(s)) {
+                s = s.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/[?#].*$/, '');
+                const parts = s.split('/').filter(Boolean);            // [domain, seg, ...]
+                s = parts.slice(1).find(p => !/^(channel|user|c|pages|profile\.php|in|company)$/i.test(p)) || '';
+            }
+            s = s.replace(/^@/, '').replace(/\/+$/, '');
+            if (platform === 'instagram' || platform === 'tiktok') s = s.toLowerCase();
+            return s;
+        }
+
+        function _deriveTitle(handle) {
+            let t = handle.replace(/^@/, '')
+                          .replace(/[._]+/g, ' ')
+                          .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+                          .replace(/\s+/g, ' ').trim();
+            return t.split(' ').map(w => w ? w[0].toUpperCase() + w.slice(1) : w).join(' ');
+        }
+
+        // Returns { titles:[...], types:{title:kind}, metadata:{title:{...}} }
+        function getHandlesPayload() {
+            const titleType = document.getElementById('titleType').value;
+            const titles = [], types = {}, metadata = {};
+            const tagRe = /\s*\[\s*(movie|movies|tv|tvshow|tv show|tv shows|talent|game|games|video ?games?|beauty|beverages?|sports?|general)\s*\]\s*$/i;
+            const text = document.getElementById('handlesList').value;
+            text.split('\n').map(l => l.trim()).filter(Boolean).forEach(line => {
+                const bar = line.split('|');
+                let handlePart = bar[0].trim();
+                const titlePart = bar.length > 1 ? bar.slice(1).join('|').trim() : '';
+                let kind = titleType;
+                const m = handlePart.match(tagRe);
+                if (m) { handlePart = handlePart.replace(tagRe, '').trim(); kind = m[1].toLowerCase(); }
+                if (!handlePart) return;
+                if (/talent/.test(kind)) kind = 'talent';
+                else if (/game/.test(kind)) kind = 'game';
+                else if (/beauty/.test(kind)) kind = 'beauty';
+                else if (/beverage/.test(kind)) kind = 'beverages';
+                else if (/sport/.test(kind)) kind = 'sports';
+                else if (/general/.test(kind)) kind = 'general';
+                else if (/tv/.test(kind)) kind = 'tvshow';
+                else if (!['movie','tvshow','talent','game','beauty','beverages','sports','general'].includes(kind)) kind = 'movie';
+
+                const platform = _detectPlatform(handlePart);
+                const handle = _cleanHandle(handlePart, platform);
+                if (!handle) return;
+                const title = titlePart || _deriveTitle(handle);
+                if (!title) return;
+                if (!(title in metadata)) { metadata[title] = {}; titles.push(title); types[title] = kind; }
+                HANDLE_FIELDS[platform].forEach(k => { metadata[title][k] = handle; });
+            });
+            return { titles, types, metadata };
+        }
+
         function buildRequestInit() {
             const method = document.getElementById('inputMethod').value;
             const includeDar = document.getElementById('includeDar').checked;
@@ -316,6 +430,22 @@
                 fd.append('titleType', titleType);
                 // Do NOT set Content-Type; the browser sets the multipart boundary.
                 return { method: 'POST', body: fd };
+            }
+
+            if (method === 'handles') {
+                const parsed = getHandlesPayload();
+                if (parsed.titles.length === 0) {
+                    showMessage('inputMessage', 'Please paste at least one social account', 'error');
+                    return null;
+                }
+                const payload = { titles: parsed.titles, includeDar: includeDar,
+                                  autoFetch: autoFetch, titles_type: parsed.types,
+                                  metadata: parsed.metadata };
+                return {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                };
             }
 
             const parsed = getTitlesAndTypes();
@@ -520,6 +650,7 @@
 
         function resetForm() {
             document.getElementById('titlesList').value = '';
+            const h = document.getElementById('handlesList'); if (h) h.value = '';
             document.getElementById('includeDar').checked = true;
             document.getElementById('previewContent').innerHTML = '<p style="color: #999; text-align: center; padding: 40px 0;">Click "Preview" to see how your data will be formatted</p>';
             document.getElementById('previewStats').style.display = 'none';
