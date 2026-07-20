@@ -12,7 +12,8 @@ import os
 try:
     from metadata_fetcher import (fetch_metadata, fetch_metadata_by_tt,
                                   fetch_person, fetch_game, fetch_brand,
-                                  warm_upcoming)
+                                  warm_upcoming, resolve_qid_by_handle,
+                                  entity_label, wikidata_meta)
 except Exception:  # keep the app running even if the module is missing
     def fetch_metadata(title, is_movie=True):
         return {}
@@ -20,17 +21,26 @@ except Exception:  # keep the app running even if the module is missing
     def fetch_metadata_by_tt(tt, is_movie=True, title=""):
         return {}
 
-    def fetch_person(name):
+    def fetch_person(name, qid=None):
         return {}
 
-    def fetch_game(name):
+    def fetch_game(name, qid=None):
         return {}
 
-    def fetch_brand(name):
+    def fetch_brand(name, qid=None):
         return {}
 
     def warm_upcoming():
         pass
+
+    def resolve_qid_by_handle(platform, handle):
+        return None
+
+    def entity_label(qid):
+        return ""
+
+    def wikidata_meta(title, qid=None, is_movie=True):
+        return {}
 
 import json
 import base64
@@ -1496,8 +1506,147 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
     return rows
 
 
+def _fb_url(v):
+    """Normalise a Facebook handle/URL to a canonical facebook.com URL."""
+    s = str(v or '').strip()
+    if not s:
+        return s
+    low = s.lower()
+    if 'facebook.com' in low:
+        path = s[low.find('facebook.com') + len('facebook.com'):].lstrip('/')
+        if not path.lower().startswith('profile.php'):
+            path = path.split('?')[0].split('#')[0]
+        return 'https://www.facebook.com/' + path
+    return 'https://www.facebook.com/' + s.lstrip('@/').split('?')[0].split('/')[0]
+
+
+def _yt_url(v):
+    """Normalise a YouTube handle/URL/channel-id to a canonical youtube.com URL."""
+    s = str(v or '').strip()
+    if not s:
+        return s
+    low = s.lower()
+    for dom in ('youtube.com', 'youtu.be'):
+        j = low.find(dom)
+        if j != -1:
+            return 'https://www.youtube.com/' + s[j + len(dom):].lstrip('/')
+    b = s.lstrip('@/').split('?')[0].split('/')[0]
+    if re.match(r'UC[0-9A-Za-z_-]{20,}$', b):
+        return 'https://www.youtube.com/channel/' + b
+    return 'https://www.youtube.com/@' + b
+
+
+# canonical BrandDef social column -> platform (for locating a seed handle)
+_CANON_PLATFORM = {
+    'instagram_user': 'instagram', 'twitter_handle': 'twitter',
+    'facebook_page': 'facebook', 'youtube_channel_username': 'youtube',
+    'tiktok_user': 'tiktok', 'tumblr_page': 'tumblr', 'linkedin_page': 'linkedin',
+}
+_PLATFORM_ORDER = ['instagram', 'twitter', 'youtube', 'tiktok', 'facebook',
+                   'tumblr', 'linkedin']
+
+
+def _resolve_handles_prepass(data, max_titles=None, progress=None):
+    """Handle-first Generator mode. Resolve each account to its real entity
+    (Wikidata reverse lookup on the social handle), then pull the full profile
+    -- real name, every other social (Facebook/YouTube as proper URLs),
+    Wikipedia and IMDb -- reusing the same fetchers the name path uses.
+
+    Returns a NEW payload dict with titles/titles_type/metadata rewritten. The
+    user-supplied handle always wins over a discovered one for its platform.
+    Unresolved accounts fall back to name-based enrichment (when a real title
+    was supplied) and otherwise keep their provisional title. Only runs when
+    data['resolve_by_handle'] is set, so every other caller is unaffected."""
+    src = [t for t in data.get('titles', []) if t and str(t).strip()]
+    if max_titles:
+        src = src[:max_titles]
+    types = data.get('titles_type', {}) or {}
+    metas = data.get('metadata', {}) or {}
+
+    def _resolve(i, title):
+        kind = _norm_kind(types.get(title, 'movie'))
+        seed = dict(metas.get(title, {}) or {})
+        by_plat = {}
+        for k, v in seed.items():
+            p = _CANON_PLATFORM.get(str(k).strip().lower())
+            if p and v and p not in by_plat:
+                by_plat[p] = str(v).strip()
+        qid = None
+        for p in _PLATFORM_ORDER:
+            if by_plat.get(p):
+                try:
+                    qid = resolve_qid_by_handle(p, by_plat[p])
+                except Exception:
+                    qid = None
+                if qid:
+                    break
+        real_name, disc = '', {}
+        try:
+            if qid:
+                real_name = entity_label(qid) or ''
+                if kind == 'talent':
+                    disc = fetch_person('', qid=qid) or {}
+                elif kind == 'game':
+                    disc = fetch_game('', qid=qid) or {}
+                elif kind in ('movie', 'tv'):
+                    disc = wikidata_meta('', qid=qid, is_movie=(kind == 'movie')) or {}
+                else:                                    # beauty/beverages/sports/general
+                    disc = fetch_brand('', qid=qid) or {}
+            else:
+                # no reverse hit: enrich by name (helps when '| Title' was given)
+                if kind == 'talent':
+                    disc = fetch_person(title) or {}
+                elif kind == 'game':
+                    disc = fetch_game(title) or {}
+                elif kind in ('movie', 'tv'):
+                    disc = wikidata_meta(title, is_movie=(kind == 'movie')) or {}
+                else:
+                    disc = fetch_brand(title) or {}
+        except Exception as e:  # noqa: BLE001 -- fail soft per account
+            logging.warning("handle resolve failed for %r: %s", title, e)
+            disc = {}
+        out_title = (real_name or title).strip() or title
+        merged = dict(disc or {})
+        for k, v in seed.items():               # user's own handle wins
+            if v not in (None, ''):
+                merged[k] = v
+        # Facebook / YouTube must be proper URLs (whether user- or Wikidata-sourced)
+        if merged.get('facebook_page'):
+            merged['facebook_page'] = _fb_url(merged['facebook_page'])
+        if merged.get('youtube_channel_username'):
+            merged['youtube_channel_username'] = _yt_url(merged['youtube_channel_username'])
+        # keep the ingest-header aliases in sync so every builder path agrees
+        for canon, alias in (('instagram_user', 'Instagram'), ('twitter_handle', 'Twitter'),
+                             ('facebook_page', 'Facebook'), ('youtube_channel_username', 'YouTube'),
+                             ('tiktok_user', 'TikTok'), ('tumblr_page', 'Tumblr')):
+            if merged.get(canon):
+                merged[alias] = merged[canon]
+        return [(out_title, kind, merged)]
+
+    resolved = _parallel_rows(src, _resolve, progress=progress, parallel=True)
+    new_titles, new_types, new_meta = [], {}, {}
+    for out_title, kind, merged in resolved:
+        if out_title not in new_meta:
+            new_titles.append(out_title)
+            new_types[out_title] = kind
+            new_meta[out_title] = {}
+        for k, v in merged.items():             # first non-blank wins on merge
+            if v not in (None, '') and k not in new_meta[out_title]:
+                new_meta[out_title][k] = v
+
+    nd = dict(data)
+    nd['titles'] = new_titles
+    nd['titles_type'] = new_types
+    nd['metadata'] = new_meta
+    nd['resolve_by_handle'] = False   # prevent re-entry
+    nd['autoFetch'] = False           # enrichment already done here
+    return nd
+
+
 def build_rows_from_titles(data, max_titles=None, progress=None):
     """Build rows from a manual titles payload (JSON)."""
+    if data.get('resolve_by_handle'):
+        data = _resolve_handles_prepass(data, max_titles=max_titles, progress=progress)
     titles = [t.strip() for t in data.get('titles', []) if t and t.strip()]
     if max_titles:
         titles = titles[:max_titles]
