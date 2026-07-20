@@ -169,11 +169,13 @@
                         <span class="hint">Pick the <b>Title type</b> below — it becomes the category for every account.
                         Platform is auto-detected from the URL or a prefix
                         (<b>ig:</b> <b>fb:</b> <b>tw:</b>/<b>x:</b> <b>yt:</b> <b>tt:</b> <b>tm:</b> <b>li:</b>);
-                        a bare <b>@name</b> or word defaults to Instagram. Add
-                        <b>| Title Name</b> to set the title exactly; otherwise a
-                        provisional title is derived from the handle for you to
-                        review. For <b>Talent</b>, gender/profession can't come from a
-                        handle — that sub-category is scaffolded and left for review.</span>
+                        a bare <b>@name</b> or word defaults to Instagram. From the one
+                        account given, the tool looks up the real entity and fills in the
+                        <b>title, the other social handles, Wikipedia and IMDb</b> (Facebook
+                        &amp; YouTube as full URLs); for Talent it also derives gender and
+                        profession. Add <b>| Title Name</b> to pin the title if a handle is
+                        ambiguous. Anything it can't resolve keeps a provisional title for
+                        review.</span>
                     </div>
                     <div class="form-group" style="margin-top:-4px">
                         <label class="lbl">…or import a CSV / Excel file of accounts</label>
@@ -598,8 +600,8 @@
                     return null;
                 }
                 const payload = { titles: parsed.titles, includeDar: includeDar,
-                                  autoFetch: autoFetch, titles_type: parsed.types,
-                                  metadata: parsed.metadata };
+                                  autoFetch: true, resolve_by_handle: true,
+                                  titles_type: parsed.types, metadata: parsed.metadata };
                 return {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
