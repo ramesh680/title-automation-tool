@@ -782,6 +782,76 @@ def _labels(qids):
     return out
 
 
+# ---- reverse lookup: social handle -> Wikidata entity ---------------------
+# Handle-first Generator mode. Given ONE account we find its Wikidata item,
+# so the full profile (real name + every other social as proper URLs +
+# Wikipedia + IMDb) can be pulled with the SAME extraction the name-based
+# fetchers use. Keyless: CirrusSearch 'haswbstatement' matches an exact
+# property value.
+_HANDLE_PROPS = {
+    "instagram": ["P2003"],
+    "twitter":   ["P2002"],
+    "facebook":  ["P2013"],
+    "youtube":   ["P11245", "P2397"],   # @handle, then channel id
+    "tiktok":    ["P7085"],
+    "tumblr":    ["P3943"],
+    "linkedin":  ["P4264", "P6634"],    # company id, then personal profile id
+}
+
+
+def _bare_handle(platform, handle):
+    """Reduce a URL / @name to the raw value Wikidata stores for the property."""
+    s = str(handle or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"^https?://", "", s, flags=re.I)
+    s = re.sub(r"^www\.", "", s, flags=re.I)
+    for dom in ("instagram.com/", "twitter.com/", "x.com/", "facebook.com/",
+                "youtube.com/", "youtu.be/", "tiktok.com/", "tumblr.com/",
+                "linkedin.com/"):
+        i = s.lower().find(dom)
+        if i != -1:
+            s = s[i + len(dom):]
+            break
+    s = s.split("?")[0].split("#")[0]
+    if platform == "linkedin":
+        s = re.sub(r"^(company|in)/", "", s, flags=re.I)
+    if platform == "youtube":
+        s = re.sub(r"^(channel|c|user)/", "", s, flags=re.I)
+    s = s.strip("/").split("/")[0]
+    return s.lstrip("@")
+
+
+def resolve_qid_by_handle(platform, handle):
+    """First Wikidata QID whose social property exactly matches this handle,
+    or None. Instagram/TikTok store lowercase, so both cases are tried."""
+    bare = _bare_handle(platform, handle)
+    if not bare:
+        return None
+    variants = []
+    for v in (bare, bare.lower()):
+        if v and v not in variants:
+            variants.append(v)
+    for prop in _HANDLE_PROPS.get(platform, []):
+        for v in variants:
+            srch = 'haswbstatement:%s=%s' % (prop, v)
+            data = _get_json(WIKIDATA_API, {"action": "query", "list": "search",
+                                            "srsearch": srch, "srlimit": 3,
+                                            "srnamespace": 0, "format": "json"})
+            for hit in (((data or {}).get("query", {}) or {}).get("search", []) or []):
+                qid = str(hit.get("title", ""))
+                if qid.startswith("Q"):
+                    return qid
+    return None
+
+
+def entity_label(qid):
+    """English label (canonical real name) for a Wikidata QID, or ''."""
+    if not qid:
+        return ""
+    return _labels([qid]).get(qid, "")
+
+
 # social-account properties where an 'end time' qualifier means the account
 # is closed / renamed / suspended -- such claims must never be used
 _SOCIAL_PROPS = {"P2002", "P2003", "P2013", "P2397", "P11245",
@@ -927,21 +997,23 @@ def wikidata_meta(title, qid=None, is_movie=True):
 _GENDER_QIDS = {"Q6581097": "Gender - Man", "Q6581072": "Gender - Woman"}
 
 
-def fetch_person(name):
+def fetch_person(name, qid=None):
     """Auto-discover a PERSON (talent) via Wikidata + IMDb suggestion API.
     Returns: socials, wikipedia_page, imdb_id (nm), gender line, occupation
-    labels, sport labels, us_citizen flag. Fails soft ({})."""
-    if not name:
+    labels, sport labels, us_citizen flag. Fails soft ({}).
+    When qid is given the candidate search is skipped and that entity is used
+    directly (handle-first resolution)."""
+    if not name and not qid:
         return {}
-    clean = re.sub(r"\s*-\s*DAR\s*$", "", name, flags=re.IGNORECASE).strip()
+    clean = re.sub(r"\s*-\s*DAR\s*$", "", name or "", flags=re.IGNORECASE).strip()
     clean, _ = _split_disambiguator(clean)
-    key = ("person:" + clean.lower(),)
+    key = ("person:qid:" + qid,) if qid else ("person:" + clean.lower(),)
     if key in _CACHE:
         return dict(_CACHE[key])
     meta = {}
     try:
-        entity = None
-        for cand in _search_candidates(clean, limit=6)[:4]:
+        entity = _entity(qid) if qid else None
+        for cand in ([] if qid else _search_candidates(clean, limit=6)[:4]):
             ent = _entity(cand)
             if not ent:
                 continue
@@ -994,7 +1066,7 @@ def fetch_person(name):
             meta["sports"] = [labels[q] for q in sport_qids if labels.get(q)]
             meta["us_citizen"] = "Q30" in set(_claim_values(claims, "P27"))
         # IMDb nm id fallback via the suggestion API (people come back as nm...)
-        if not meta.get("imdb_id"):
+        if not meta.get("imdb_id") and clean:
             q = urllib.parse.quote(clean.strip().lower())
             data = _get_json(IMDB_SUGGEST.format(q=q), headers=HTML_HEADERS)
             for it in (data or {}).get("d", []):
@@ -1012,22 +1084,22 @@ def fetch_person(name):
 _GAME_TYPES = {"Q7889", "Q116776512", "Q865493"}  # video game (+ expansions)
 
 
-def fetch_game(name):
+def fetch_game(name, qid=None):
     """Auto-discover a VIDEO GAME via Wikidata: developer (P178), publisher
     (P123), platforms (P400), genres (P136), release (P577), socials,
-    wikipedia, metacritic, imdb. Fails soft ({})."""
-    if not name:
+    wikipedia, metacritic, imdb. Fails soft ({}). qid skips the search."""
+    if not name and not qid:
         return {}
-    clean = re.sub(r"\s*-\s*DAR\s*$", "", name, flags=re.IGNORECASE).strip()
+    clean = re.sub(r"\s*-\s*DAR\s*$", "", name or "", flags=re.IGNORECASE).strip()
     clean, _ = _split_disambiguator(clean)
-    key = ("game:" + clean.lower(),)
+    key = ("game:qid:" + qid,) if qid else ("game:" + clean.lower(),)
     if key in _CACHE:
         return dict(_CACHE[key])
     meta = {}
     try:
-        entity = None
+        entity = _entity(qid) if qid else None
         fallback = None
-        for cand in _search_candidates(clean, limit=8)[:6]:
+        for cand in ([] if qid else _search_candidates(clean, limit=8)[:6]):
             ent = _entity(cand)
             if not ent:
                 continue
@@ -1116,26 +1188,28 @@ _BRAND_TYPES = {
 _NOT_BRAND_TYPES = {"Q5", "Q4167410"}  # human, disambiguation page
 
 
-def fetch_brand(name):
+def fetch_brand(name, qid=None):
     """Auto-discover a BRAND (Beauty / Beverages / Sports / General) via
     Wikidata: social accounts, Wikipedia page, ticker symbol.
 
     Unlike the film/TV path, candidates are NOT filtered to FILM_TV_TYPES --
     that filter is exactly why brand lookups used to come back empty. Returns
     keys named after the BrandDef columns so create_tfx_row can map them
-    straight onto the row. Fails soft ({})."""
-    if not name:
+    straight onto the row. Fails soft ({}). qid skips the search."""
+    if not name and not qid:
         return {}
-    clean = re.sub(r"\s*-\s*DAR\s*$", "", name, flags=re.IGNORECASE).strip()
+    clean = re.sub(r"\s*-\s*DAR\s*$", "", name or "", flags=re.IGNORECASE).strip()
     clean, _ = _split_disambiguator(clean)
-    key = ("brand:" + clean.lower(),)
+    key = ("brand:qid:" + qid,) if qid else ("brand:" + clean.lower(),)
     if key in _CACHE:
         return dict(_CACHE[key])
     meta = {}
     try:
         skip = FILM_TV_TYPES | _GAME_TYPES | _NOT_BRAND_TYPES
         entity = brand_fb = name_fb = None
-        for cand in _search_candidates(clean, limit=8)[:6]:
+        if qid:
+            entity = _entity(qid)
+        for cand in ([] if qid else _search_candidates(clean, limit=8)[:6]):
             ent = _entity(cand)
             if not ent:
                 continue
