@@ -175,6 +175,19 @@
                         review. For <b>Talent</b>, gender/profession can't come from a
                         handle — that sub-category is scaffolded and left for review.</span>
                     </div>
+                    <div class="form-group" style="margin-top:-4px">
+                        <label class="lbl">…or import a CSV / Excel file of accounts</label>
+                        <div class="file-upload">
+                            <input type="file" id="handlesFile" accept=".csv,.xlsx,.xls">
+                            <label for="handlesFile" class="file-upload-label" id="handlesFileLabel">📁 Click to select or drag file here</label>
+                        </div>
+                        <span class="hint">Reads a column of handles or URLs. An optional
+                        <b>title</b>/<b>name</b> column sets the title, an optional
+                        <b>platform</b> column picks the network, and separate
+                        <b>Instagram</b>/<b>Twitter</b>/<b>Facebook</b>/<b>YouTube</b>/<b>TikTok</b>
+                        columns are each imported per row. The file fills the box above —
+                        review, then Preview.</span>
+                    </div>
                 </div>
 
                 <div id="fileInput" style="display:none">
@@ -269,6 +282,19 @@
                     if (this.files && this.files[0]) {
                         label.textContent = '📄 ' + this.files[0].name;
                     } else {
+                        label.textContent = '📁 Click to select or drag file here';
+                    }
+                });
+            }
+
+            const handlesFile = document.getElementById('handlesFile');
+            if (handlesFile) {
+                handlesFile.addEventListener('change', function () {
+                    const label = document.getElementById('handlesFileLabel');
+                    if (this.files && this.files[0]) {
+                        if (label) label.textContent = '📄 ' + this.files[0].name;
+                        importHandlesFile(this.files[0]);
+                    } else if (label) {
                         label.textContent = '📁 Click to select or drag file here';
                     }
                 });
@@ -377,6 +403,139 @@
         }
 
         // Returns { titles:[...], types:{title:kind}, metadata:{title:{...}} }
+        // ---- Import handles from a CSV / Excel file ----------------------
+        // The file only *fills* the box above (same format as pasting), so it
+        // flows through getHandlesPayload unchanged. CSV is parsed natively;
+        // .xlsx/.xls uses SheetJS, loaded on demand only when needed.
+        const _PLAT_HEADER = {
+            instagram:'instagram', ig:'instagram', insta:'instagram', 'ig handle':'instagram',
+            twitter:'twitter', x:'twitter', 'twitter/x':'twitter', 'twitter handle':'twitter',
+            facebook:'facebook', fb:'facebook', 'facebook page':'facebook',
+            youtube:'youtube', yt:'youtube', 'youtube channel':'youtube',
+            tiktok:'tiktok', tt:'tiktok', tumblr:'tumblr',
+            linkedin:'linkedin', li:'linkedin'
+        };
+        const _PLAT_PREFIX = {instagram:'ig', twitter:'tw', facebook:'fb', youtube:'yt', tiktok:'tt', tumblr:'tm', linkedin:'li'};
+        const _TITLE_HDR  = ['title','name','brand','entity','show','movie','person','display name','account name'];
+        const _HANDLE_HDR = ['handle','account','username','user','url','link','profile','social','social handle'];
+        const _PLATCOL_HDR = ['platform','network','site'];
+        const _hnorm = s => String(s == null ? '' : s).trim().toLowerCase();
+
+        function _parseCSV(text) {
+            const rows = []; let row = [], cur = '', q = false;
+            for (let i = 0; i < text.length; i++) {
+                const ch = text[i];
+                if (q) {
+                    if (ch === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; }
+                    else cur += ch;
+                } else if (ch === '"') q = true;
+                else if (ch === ',') { row.push(cur); cur = ''; }
+                else if (ch === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; }
+                else if (ch !== '\r') cur += ch;
+            }
+            if (cur !== '' || row.length) { row.push(cur); rows.push(row); }
+            return rows;
+        }
+
+        // 2-D array (with optional header row) -> handle textarea lines.
+        function _rowsToHandleLines(rows) {
+            rows = (rows || []).filter(r => r && r.some(c => String(c == null ? '' : c).trim() !== ''));
+            if (!rows.length) return [];
+            const head = rows[0].map(_hnorm);
+            const looksHeader = head.some(h =>
+                _TITLE_HDR.includes(h) || _HANDLE_HDR.includes(h) || _PLATCOL_HDR.includes(h) || (h in _PLAT_HEADER));
+            const cols = { title: -1, handle: -1, platCol: -1, socials: [] };
+            let dataRows = rows;
+            if (looksHeader) {
+                dataRows = rows.slice(1);
+                head.forEach((h, i) => {
+                    if (h in _PLAT_HEADER) cols.socials.push({ idx: i, platform: _PLAT_HEADER[h] });
+                    else if (cols.title < 0 && _TITLE_HDR.includes(h)) cols.title = i;
+                    else if (cols.handle < 0 && _HANDLE_HDR.includes(h)) cols.handle = i;
+                    else if (cols.platCol < 0 && _PLATCOL_HDR.includes(h)) cols.platCol = i;
+                });
+            }
+            const lines = [];
+            dataRows.forEach(r => {
+                const cell = i => (i >= 0 && i < r.length) ? String(r[i] == null ? '' : r[i]).trim() : '';
+                let title = cell(cols.title);
+                const entries = [];
+                cols.socials.forEach(s => { const v = cell(s.idx); if (v) entries.push({ platform: s.platform, value: v }); });
+                if (cols.handle >= 0) {
+                    const v = cell(cols.handle);
+                    if (v) {
+                        let platform = null;
+                        if (cols.platCol >= 0) { const p = _hnorm(cell(cols.platCol)); if (p in _PLAT_HEADER) platform = _PLAT_HEADER[p]; }
+                        entries.push({ platform, value: v });
+                    }
+                }
+                if (!entries.length && !looksHeader) {          // headerless: col0 = handle, col1 = title
+                    const v = cell(0); if (v) entries.push({ platform: null, value: v });
+                    if (!title) title = cell(1);
+                }
+                if (!entries.length) return;
+                // no title but several handles in the row -> derive a shared title so they merge
+                if (!title && entries.length > 1) {
+                    const e0 = entries[0], p0 = e0.platform || _detectPlatform(e0.value);
+                    title = _deriveTitle(_cleanHandle(e0.value, p0));
+                }
+                entries.forEach(e => {
+                    let tok = e.value;
+                    if (e.platform && !/^https?:\/\//i.test(tok) && !/[\w.-]+\.[a-z]{2,}\//i.test(tok)) {
+                        tok = _PLAT_PREFIX[e.platform] + ':' + tok;
+                    }
+                    lines.push(title ? (tok + ' | ' + title) : tok);
+                });
+            });
+            return lines;
+        }
+
+        let _xlsxPromise = null;
+        function _loadSheetJS() {
+            if (window.XLSX) return Promise.resolve(window.XLSX);
+            if (_xlsxPromise) return _xlsxPromise;
+            _xlsxPromise = new Promise((res, rej) => {
+                const s = document.createElement('script');
+                s.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+                s.onload = () => res(window.XLSX);
+                s.onerror = () => rej(new Error('Could not load the Excel reader (network blocked?). Save the file as CSV and try again.'));
+                document.head.appendChild(s);
+            });
+            return _xlsxPromise;
+        }
+
+        function _fillHandlesFromRows(rows, fname) {
+            const lines = _rowsToHandleLines(rows);
+            if (!lines.length) { showMessage('inputMessage', 'No handles found in that file.', 'error'); return; }
+            const box = document.getElementById('handlesList');
+            box.value = (box.value.trim() ? box.value.trim() + '\n' : '') + lines.join('\n');
+            showMessage('inputMessage', 'Loaded ' + lines.length + ' account' + (lines.length > 1 ? 's' : '') + ' from ' + fname + '. Review, then Preview.', 'success');
+        }
+
+        function importHandlesFile(file) {
+            if (!file) return;
+            const name = (file.name || '').toLowerCase();
+            if (name.endsWith('.csv') || file.type === 'text/csv') {
+                const fr = new FileReader();
+                fr.onload = () => _fillHandlesFromRows(_parseCSV(String(fr.result || '')), file.name);
+                fr.onerror = () => showMessage('inputMessage', 'Could not read that file.', 'error');
+                fr.readAsText(file);
+            } else {
+                _loadSheetJS().then(XLSX => {
+                    const fr = new FileReader();
+                    fr.onload = () => {
+                        try {
+                            const wb = XLSX.read(new Uint8Array(fr.result), { type: 'array' });
+                            const ws = wb.Sheets[wb.SheetNames[0]];
+                            _fillHandlesFromRows(XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: false }), file.name);
+                        } catch (e) { showMessage('inputMessage', 'Could not parse that Excel file: ' + e.message, 'error'); }
+                    };
+                    fr.onerror = () => showMessage('inputMessage', 'Could not read that file.', 'error');
+                    fr.readAsArrayBuffer(file);
+                }).catch(e => showMessage('inputMessage', e.message, 'error'));
+            }
+        }
+
         function getHandlesPayload() {
             const titleType = document.getElementById('titleType').value;
             const titles = [], types = {}, metadata = {};
@@ -651,6 +810,8 @@
         function resetForm() {
             document.getElementById('titlesList').value = '';
             const h = document.getElementById('handlesList'); if (h) h.value = '';
+            const hf = document.getElementById('handlesFile'); if (hf) hf.value = '';
+            const hfl = document.getElementById('handlesFileLabel'); if (hfl) hfl.textContent = '📁 Click to select or drag file here';
             document.getElementById('includeDar').checked = true;
             document.getElementById('previewContent').innerHTML = '<p style="color: #999; text-align: center; padding: 40px 0;">Click "Preview" to see how your data will be formatted</p>';
             document.getElementById('previewStats').style.display = 'none';
