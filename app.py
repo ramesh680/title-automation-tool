@@ -12,8 +12,7 @@ import os
 try:
     from metadata_fetcher import (fetch_metadata, fetch_metadata_by_tt,
                                   fetch_person, fetch_game, fetch_brand,
-                                  warm_upcoming, resolve_qid_by_handle,
-                                  entity_label, wikidata_meta)
+                                  warm_upcoming)
 except Exception:  # keep the app running even if the module is missing
     def fetch_metadata(title, is_movie=True):
         return {}
@@ -21,26 +20,17 @@ except Exception:  # keep the app running even if the module is missing
     def fetch_metadata_by_tt(tt, is_movie=True, title=""):
         return {}
 
-    def fetch_person(name, qid=None):
+    def fetch_person(name):
         return {}
 
-    def fetch_game(name, qid=None):
+    def fetch_game(name):
         return {}
 
-    def fetch_brand(name, qid=None):
+    def fetch_brand(name):
         return {}
 
     def warm_upcoming():
         pass
-
-    def resolve_qid_by_handle(platform, handle):
-        return None
-
-    def entity_label(qid):
-        return ""
-
-    def wikidata_meta(title, qid=None, is_movie=True):
-        return {}
 
 import json
 import base64
@@ -913,6 +903,103 @@ def create_talent_row(title, metadata=None):
     return row
 
 
+# ===================== Publishers (BrandDefinitionReport schema) =====================
+# Publisher brands export in the 40-column BrandDefinitionReport / BrandIngest
+# format (learned from the Brand Definition Report template): ONE ' - DAR' row
+# per publication -- no regular twin, like Talent. title_category 'Publishers',
+# companies 'Pristine Brand', brand_set 'LF // Publishing\nPristine DAR Brands',
+# an optional 'Publication Type - X' sub-category, and '#name|DAR|DAR' twitter
+# search terms. genre / box-office / ratings (RT, IMDb, Metacritic) stay blank --
+# publishing brands are not rated titles. network carries the parent publisher.
+PUBLISHER_COLUMNS = [
+    'brand_id', 'title', 'title_created_date', 'title_category',
+    'title_sub_category', 'genre', 'primary_genre', 'iso_mic', 'stock_exchange',
+    'ticker_symbol', 'companies', 'brand_set', 'composite_brand_set', 'active',
+    'released_on', 'domestic_opening_weekend_box_office',
+    'domestic_opening_weekend_screens', 'domestic_opening_weekend_rank',
+    'street_date', 'network', 'facebook_page', 'facebook_verified',
+    'twitter_handle', 'twitter_verified', 'instagram_user',
+    'youtube_channel_username', 'youtube_channel_company', 'tiktok_user',
+    'linkedin_page', 'threads_page', 'pinterest_user_username',
+    'pinterest_board', 'wikipedia_page', 'rottentomatoes', 'imdb_id',
+    'metacritic', 'twitter_search_terms', 'instagram_business_hashtags',
+    'twitter_search_term_keywords', 'last_reviewed',
+]
+
+PUBLISHER_DEFAULT_BRAND_SET = "LF // Publishing\nPristine DAR Brands"
+
+
+def create_publisher_row(title, metadata=None):
+    """Create a Publisher row in the 40-column BrandDefinitionReport schema.
+
+    Publisher brands are DAR rows: one ' - DAR' row per publication, no twin.
+    Any value present in `metadata` (an uploaded/payload row or auto-discovered
+    brand data) always wins over the computed default, matching the app's other
+    row builders.
+    """
+    metadata = metadata or {}
+    clean_name = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
+    out_title = f"{clean_name} - DAR"   # publisher brands are DAR rows
+
+    # sub-category: 'Publication Type - X' when known; blank is valid (some
+    # template rows carry no publication type, e.g. iMore).
+    _sub = str(metadata.get('title_sub_category') or '').strip()
+
+    # twitter_search_terms: DAR row -> '@handle|DAR|DAR' + '#name|DAR|DAR'
+    gen_terms, _ = generate_search_terms(
+        clean_name, '', None, True,
+        twitter_handle=str(metadata.get('twitter_handle') or ''))
+
+    def mv(key, default=''):
+        v = metadata.get(key, '')
+        return v if v not in (None, '') else default
+
+    row = {
+        'brand_id': metadata.get('brand_id', ''),
+        'title': out_title,
+        'title_created_date': mv('title_created_date',
+                                 datetime.now().strftime('%Y-%m-%d')),
+        'title_category': mv('title_category', 'Publishers'),
+        'title_sub_category': _sub,
+        'genre': metadata.get('genre', ''),
+        'primary_genre': metadata.get('primary_genre', ''),
+        'iso_mic': metadata.get('iso_mic', ''),
+        'stock_exchange': metadata.get('stock_exchange', ''),
+        'ticker_symbol': metadata.get('ticker_symbol', ''),
+        'companies': mv('companies', 'Pristine Brand'),
+        'brand_set': mv('brand_set', PUBLISHER_DEFAULT_BRAND_SET),
+        'composite_brand_set': metadata.get('composite_brand_set', ''),
+        'active': _norm_bool(metadata.get('active', True)),
+        'released_on': metadata.get('released_on', ''),
+        'domestic_opening_weekend_box_office': metadata.get('domestic_opening_weekend_box_office', ''),
+        'domestic_opening_weekend_screens': metadata.get('domestic_opening_weekend_screens', ''),
+        'domestic_opening_weekend_rank': metadata.get('domestic_opening_weekend_rank', ''),
+        'street_date': metadata.get('street_date', ''),
+        'network': metadata.get('network', ''),
+        'facebook_page': metadata.get('facebook_page', ''),
+        'facebook_verified': metadata.get('facebook_verified', ''),
+        'twitter_handle': metadata.get('twitter_handle', ''),
+        'twitter_verified': metadata.get('twitter_verified', ''),
+        'instagram_user': str(metadata.get('instagram_user') or '').lower(),
+        'youtube_channel_username': metadata.get('youtube_channel_username', ''),
+        'youtube_channel_company': metadata.get('youtube_channel_company', ''),
+        'tiktok_user': metadata.get('tiktok_user', ''),
+        'linkedin_page': metadata.get('linkedin_page', ''),
+        'threads_page': metadata.get('threads_page', ''),
+        'pinterest_user_username': metadata.get('pinterest_user_username', ''),
+        'pinterest_board': metadata.get('pinterest_board', ''),
+        'wikipedia_page': metadata.get('wikipedia_page', ''),
+        'rottentomatoes': metadata.get('rottentomatoes', ''),
+        'imdb_id': metadata.get('imdb_id', ''),
+        'metacritic': metadata.get('metacritic', ''),
+        'twitter_search_terms': mv('twitter_search_terms', gen_terms),
+        'instagram_business_hashtags': metadata.get('instagram_business_hashtags', ''),
+        'twitter_search_term_keywords': metadata.get('twitter_search_term_keywords', ''),
+        'last_reviewed': metadata.get('last_reviewed', ''),
+    }
+    return row
+
+
 # ===================== Video Games (BDR schema) =====================
 # Games export in the 39-column Video-Game BDR format. Like movies/TV they
 # get a base row (Operations - Core Title, brand_set 'Competitive View') and
@@ -1078,13 +1165,16 @@ def create_game_row(title, metadata=None):
     return row
 
 
-def make_row(title, is_movie, network="", metadata=None, talent=False, game=False):
+def make_row(title, is_movie, network="", metadata=None, talent=False, game=False,
+             publisher=False):
     """Dispatch: movies (42-col), TV (39-col BrandIngest), Talent (38-col
-    BrandDef), Video Games (39-col BDR)."""
+    BrandDef), Video Games (39-col BDR), Publishers (40-col BrandDefinitionReport)."""
     if talent:
         return create_talent_row(title, metadata)
     if game:
         return create_game_row(title, metadata)
+    if publisher:
+        return create_publisher_row(title, metadata)
     if is_movie:
         return create_row(title, is_movie, network, metadata)
     return create_tv_row(title, network, metadata)
@@ -1301,6 +1391,8 @@ def _norm_kind(v, default='movie'):
         return 'talent'
     if 'game' in s:
         return 'game'
+    if 'publisher' in s:            # 'publisher', 'Publishers'
+        return 'publisher'
     if 'beauty' in s:               # 'beauty', 'Health & Beauty'
         return 'beauty'
     if 'beverage' in s:             # 'beverages', 'Beverages'
@@ -1442,6 +1534,16 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
                         if v not in (None, ''):
                             seed[k] = v
                 return [create_tfx_row(t, kind_r, seed)]
+            if kind_r == 'publisher':
+                # publisher brands enrich from brand discovery (like the tfx
+                # schemas); explicit upload values always win
+                if auto_fetch:
+                    disc = dict(fetch_brand(t) or {})
+                    for k, v in r.items():
+                        if v not in (None, ''):
+                            disc[k] = v
+                    r = disc
+                return [make_row(t, False, '', r, publisher=True)]
             if kind_r in ('talent', 'game'):
                 if auto_fetch:
                     disc = dict((fetch_person(t) if kind_r == 'talent'
@@ -1488,6 +1590,10 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
             elif kind == 'talent':
                 meta = dict(fetch_person(title) or {}) if auto_fetch else {}
                 out.append(make_row(title, False, '', meta, talent=True))
+            elif kind == 'publisher':
+                # publisher = a single DAR row per publication, no twin
+                meta = dict(fetch_brand(title) or {}) if auto_fetch else {}
+                out.append(make_row(title, False, '', meta, publisher=True))
             elif kind == 'game':
                 meta = dict(fetch_game(title) or {}) if auto_fetch else {}
                 out.append(make_row(title, False, '', meta, game=True))
@@ -1506,147 +1612,8 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
     return rows
 
 
-def _fb_url(v):
-    """Normalise a Facebook handle/URL to a canonical facebook.com URL."""
-    s = str(v or '').strip()
-    if not s:
-        return s
-    low = s.lower()
-    if 'facebook.com' in low:
-        path = s[low.find('facebook.com') + len('facebook.com'):].lstrip('/')
-        if not path.lower().startswith('profile.php'):
-            path = path.split('?')[0].split('#')[0]
-        return 'https://www.facebook.com/' + path
-    return 'https://www.facebook.com/' + s.lstrip('@/').split('?')[0].split('/')[0]
-
-
-def _yt_url(v):
-    """Normalise a YouTube handle/URL/channel-id to a canonical youtube.com URL."""
-    s = str(v or '').strip()
-    if not s:
-        return s
-    low = s.lower()
-    for dom in ('youtube.com', 'youtu.be'):
-        j = low.find(dom)
-        if j != -1:
-            return 'https://www.youtube.com/' + s[j + len(dom):].lstrip('/')
-    b = s.lstrip('@/').split('?')[0].split('/')[0]
-    if re.match(r'UC[0-9A-Za-z_-]{20,}$', b):
-        return 'https://www.youtube.com/channel/' + b
-    return 'https://www.youtube.com/@' + b
-
-
-# canonical BrandDef social column -> platform (for locating a seed handle)
-_CANON_PLATFORM = {
-    'instagram_user': 'instagram', 'twitter_handle': 'twitter',
-    'facebook_page': 'facebook', 'youtube_channel_username': 'youtube',
-    'tiktok_user': 'tiktok', 'tumblr_page': 'tumblr', 'linkedin_page': 'linkedin',
-}
-_PLATFORM_ORDER = ['instagram', 'twitter', 'youtube', 'tiktok', 'facebook',
-                   'tumblr', 'linkedin']
-
-
-def _resolve_handles_prepass(data, max_titles=None, progress=None):
-    """Handle-first Generator mode. Resolve each account to its real entity
-    (Wikidata reverse lookup on the social handle), then pull the full profile
-    -- real name, every other social (Facebook/YouTube as proper URLs),
-    Wikipedia and IMDb -- reusing the same fetchers the name path uses.
-
-    Returns a NEW payload dict with titles/titles_type/metadata rewritten. The
-    user-supplied handle always wins over a discovered one for its platform.
-    Unresolved accounts fall back to name-based enrichment (when a real title
-    was supplied) and otherwise keep their provisional title. Only runs when
-    data['resolve_by_handle'] is set, so every other caller is unaffected."""
-    src = [t for t in data.get('titles', []) if t and str(t).strip()]
-    if max_titles:
-        src = src[:max_titles]
-    types = data.get('titles_type', {}) or {}
-    metas = data.get('metadata', {}) or {}
-
-    def _resolve(i, title):
-        kind = _norm_kind(types.get(title, 'movie'))
-        seed = dict(metas.get(title, {}) or {})
-        by_plat = {}
-        for k, v in seed.items():
-            p = _CANON_PLATFORM.get(str(k).strip().lower())
-            if p and v and p not in by_plat:
-                by_plat[p] = str(v).strip()
-        qid = None
-        for p in _PLATFORM_ORDER:
-            if by_plat.get(p):
-                try:
-                    qid = resolve_qid_by_handle(p, by_plat[p])
-                except Exception:
-                    qid = None
-                if qid:
-                    break
-        real_name, disc = '', {}
-        try:
-            if qid:
-                real_name = entity_label(qid) or ''
-                if kind == 'talent':
-                    disc = fetch_person('', qid=qid) or {}
-                elif kind == 'game':
-                    disc = fetch_game('', qid=qid) or {}
-                elif kind in ('movie', 'tv'):
-                    disc = wikidata_meta('', qid=qid, is_movie=(kind == 'movie')) or {}
-                else:                                    # beauty/beverages/sports/general
-                    disc = fetch_brand('', qid=qid) or {}
-            else:
-                # no reverse hit: enrich by name (helps when '| Title' was given)
-                if kind == 'talent':
-                    disc = fetch_person(title) or {}
-                elif kind == 'game':
-                    disc = fetch_game(title) or {}
-                elif kind in ('movie', 'tv'):
-                    disc = wikidata_meta(title, is_movie=(kind == 'movie')) or {}
-                else:
-                    disc = fetch_brand(title) or {}
-        except Exception as e:  # noqa: BLE001 -- fail soft per account
-            logging.warning("handle resolve failed for %r: %s", title, e)
-            disc = {}
-        out_title = (real_name or title).strip() or title
-        merged = dict(disc or {})
-        for k, v in seed.items():               # user's own handle wins
-            if v not in (None, ''):
-                merged[k] = v
-        # Facebook / YouTube must be proper URLs (whether user- or Wikidata-sourced)
-        if merged.get('facebook_page'):
-            merged['facebook_page'] = _fb_url(merged['facebook_page'])
-        if merged.get('youtube_channel_username'):
-            merged['youtube_channel_username'] = _yt_url(merged['youtube_channel_username'])
-        # keep the ingest-header aliases in sync so every builder path agrees
-        for canon, alias in (('instagram_user', 'Instagram'), ('twitter_handle', 'Twitter'),
-                             ('facebook_page', 'Facebook'), ('youtube_channel_username', 'YouTube'),
-                             ('tiktok_user', 'TikTok'), ('tumblr_page', 'Tumblr')):
-            if merged.get(canon):
-                merged[alias] = merged[canon]
-        return [(out_title, kind, merged)]
-
-    resolved = _parallel_rows(src, _resolve, progress=progress, parallel=True)
-    new_titles, new_types, new_meta = [], {}, {}
-    for out_title, kind, merged in resolved:
-        if out_title not in new_meta:
-            new_titles.append(out_title)
-            new_types[out_title] = kind
-            new_meta[out_title] = {}
-        for k, v in merged.items():             # first non-blank wins on merge
-            if v not in (None, '') and k not in new_meta[out_title]:
-                new_meta[out_title][k] = v
-
-    nd = dict(data)
-    nd['titles'] = new_titles
-    nd['titles_type'] = new_types
-    nd['metadata'] = new_meta
-    nd['resolve_by_handle'] = False   # prevent re-entry
-    nd['autoFetch'] = False           # enrichment already done here
-    return nd
-
-
 def build_rows_from_titles(data, max_titles=None, progress=None):
     """Build rows from a manual titles payload (JSON)."""
-    if data.get('resolve_by_handle'):
-        data = _resolve_handles_prepass(data, max_titles=max_titles, progress=progress)
     titles = [t.strip() for t in data.get('titles', []) if t and t.strip()]
     if max_titles:
         titles = titles[:max_titles]
@@ -1676,6 +1643,13 @@ def build_rows_from_titles(data, max_titles=None, progress=None):
                     metadata[k] = v
             # talent = a single DAR row per person, no twin
             out.append(make_row(title, False, '', metadata, talent=True))
+        elif kind == 'publisher':
+            metadata = dict(fetch_brand(title) or {}) if auto_fetch else {}
+            for k, v in (base_meta or {}).items():
+                if v not in (None, ''):
+                    metadata[k] = v
+            # publisher = a single DAR row per publication, no twin
+            out.append(make_row(title, False, '', metadata, publisher=True))
         elif kind == 'game':
             metadata = dict(fetch_game(title) or {}) if auto_fetch else {}
             for k, v in (base_meta or {}).items():
@@ -1708,6 +1682,10 @@ def _is_game_row(r):
     return 'game' in str(r.get('title_category', '')).lower()
 
 
+def _is_publisher_row(r):
+    return str(r.get('title_category', '')).lower() == 'publishers'
+
+
 def _rows_to_workbook(rows):
     """Write rows to an xlsx BytesIO. Movies use the 42-col schema, TV the
     39-col BrandIngest, Talent the 38-col BrandDef, Video Games the 39-col
@@ -1720,10 +1698,12 @@ def _rows_to_workbook(rows):
             tfx.setdefault(k, []).append(r)
     talent = [r for r in rows if not r.get('_tfx_schema') and _is_talent_row(r)]
     games = [r for r in rows if not r.get('_tfx_schema') and _is_game_row(r)]
+    publishers = [r for r in rows if not r.get('_tfx_schema') and _is_publisher_row(r)]
     tv = [r for r in rows if not r.get('_tfx_schema') and _is_tv_row(r)]
     movies = [r for r in rows if not r.get('_tfx_schema')
-              and not _is_tv_row(r) and not _is_talent_row(r) and not _is_game_row(r)]
-    groups = [g for g in (movies, tv, talent, games, *tfx.values()) if g]
+              and not _is_tv_row(r) and not _is_talent_row(r)
+              and not _is_game_row(r) and not _is_publisher_row(r)]
+    groups = [g for g in (movies, tv, talent, games, publishers, *tfx.values()) if g]
     if len(groups) > 1:
         sheets = []
         if movies:
@@ -1734,6 +1714,8 @@ def _rows_to_workbook(rows):
             sheets.append(('Talent', talent, TALENT_COLUMNS))
         if games:
             sheets.append(('Video Games', games, GAME_COLUMNS))
+        if publishers:
+            sheets.append(('Publishers', publishers, PUBLISHER_COLUMNS))
         for k, rws in tfx.items():
             sheets.append((_TFX_SHEET_LABELS.get(k, k.title()), rws,
                            _TFX_COLUMNS[k]))
@@ -1744,6 +1726,8 @@ def _rows_to_workbook(rows):
         sheets = [('BrandDef', talent, TALENT_COLUMNS)]
     elif games:
         sheets = [('BDR', games, GAME_COLUMNS)]
+    elif publishers:
+        sheets = [('BrandIngest', publishers, PUBLISHER_COLUMNS)]
     elif tv:
         sheets = [('BrandIngest', tv, TV_COLUMNS)]
     else:
@@ -1806,6 +1790,10 @@ def api_lookup():
         row = create_tfx_row(title, kind_n, dict(meta))
         row.pop('_tfx_schema', None)
         return jsonify({'discovered': meta, 'row': row})
+    if 'publisher' in kind:
+        meta = fetch_brand(title)
+        row = make_row(title, False, '', dict(meta), publisher=True)
+        return jsonify({'discovered': meta, 'row': row})
     if 'talent' in kind:
         meta = fetch_person(title)
         row = make_row(title, False, '', dict(meta), talent=True)
@@ -1830,9 +1818,11 @@ def _preview_payload(rows, preview_limited):
         return (r.get('_tfx_schema') or
                 ('talent' if _is_talent_row(r) else
                  'game' if _is_game_row(r) else
+                 'publisher' if _is_publisher_row(r) else
                  'tv' if _is_tv_row(r) else 'movie'))
     first = _kind(rows[0])
     cols = {'talent': TALENT_COLUMNS, 'game': GAME_COLUMNS,
+            'publisher': PUBLISHER_COLUMNS,
             'tv': TV_COLUMNS, 'movie': COLUMNS,
             **({k: v for k, v in _TFX_COLUMNS.items()} if TFX_OK else {})}[first]
     same = [r for r in rows if _kind(r) == first]
