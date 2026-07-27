@@ -129,6 +129,7 @@
                 <a class="nav-pill" href="/" style="text-decoration:none;color:#fff;background:linear-gradient(135deg,var(--brand1),var(--brand3));border:none">Generator</a>
                 <a class="nav-pill" href="/validator" style="text-decoration:none">Validator</a>
                 <a class="nav-pill" href="/review" style="text-decoration:none">Review</a>
+                <span class="nav-pill">Ramesh Goswami</span>
             </div>
         </nav>
 
@@ -150,7 +151,6 @@
                     <label class="lbl">Input method</label>
                     <select id="inputMethod" onchange="toggleInputMethod()">
                         <option value="manual">Manual Entry (Paste List)</option>
-                        <option value="handles">Social Handles → Template</option>
                         <option value="file">Upload CSV / Excel File</option>
                     </select>
                 </div>
@@ -159,36 +159,6 @@
                     <div class="form-group">
                         <label class="lbl">Titles (one per line)</label>
                         <textarea id="titlesList" placeholder="Cookie Queens&#10;Cruel Hands&#10;Elijah Peel&#10;..."></textarea>
-                    </div>
-                </div>
-
-                <div id="handlesInput" style="display:none">
-                    <div class="form-group">
-                        <label class="lbl">Social accounts (one per line)</label>
-                        <textarea id="handlesList" placeholder="@zendaya&#10;instagram.com/natgeo | National Geographic&#10;yt:@mrbeast&#10;x.com/nike | Nike&#10;tiktok.com/@khaby.lame"></textarea>
-                        <span class="hint">Pick the <b>Title type</b> below — it becomes the category for every account.
-                        Platform is auto-detected from the URL or a prefix
-                        (<b>ig:</b> <b>fb:</b> <b>tw:</b>/<b>x:</b> <b>yt:</b> <b>tt:</b> <b>tm:</b> <b>li:</b>);
-                        a bare <b>@name</b> or word defaults to Instagram. From the one
-                        account given, the tool looks up the real entity and fills in the
-                        <b>title, the other social handles, Wikipedia and IMDb</b> (Facebook
-                        &amp; YouTube as full URLs); for Talent it also derives gender and
-                        profession. Add <b>| Title Name</b> to pin the title if a handle is
-                        ambiguous. Anything it can't resolve keeps a provisional title for
-                        review.</span>
-                    </div>
-                    <div class="form-group" style="margin-top:-4px">
-                        <label class="lbl">…or import a CSV / Excel file of accounts</label>
-                        <div class="file-upload">
-                            <input type="file" id="handlesFile" accept=".csv,.xlsx,.xls">
-                            <label for="handlesFile" class="file-upload-label" id="handlesFileLabel">📁 Click to select or drag file here</label>
-                        </div>
-                        <span class="hint">Reads a column of handles or URLs. An optional
-                        <b>title</b>/<b>name</b> column sets the title, an optional
-                        <b>platform</b> column picks the network, and separate
-                        <b>Instagram</b>/<b>Twitter</b>/<b>Facebook</b>/<b>YouTube</b>/<b>TikTok</b>
-                        columns are each imported per row. The file fills the box above —
-                        review, then Preview.</span>
                     </div>
                 </div>
 
@@ -214,10 +184,11 @@
                         <option value="beverages">Beverages</option>
                         <option value="sports">Sports Teams (Sports Franchise)</option>
                         <option value="general">General (any brand category)</option>
+                        <option value="publisher">Publishers</option>
                         <option value="mixed">Mixed (tag each title / use type column)</option>
                     </select>
                     <span class="hint">For <b>Mixed</b> manual entry, tag each line:
-                    <b>Title [movie]</b>, <b>[tv]</b>, <b>[talent]</b> or <b>[game]</b> — untagged
+                    <b>Title [movie]</b>, <b>[tv]</b>, <b>[talent]</b>, <b>[game]</b> or <b>[publisher]</b> — untagged
                     lines count as movies. For file uploads the selector applies to rows without a
                     <b>type</b> / <b>title_category</b> column value — rows with one keep it.</span>
                 </div>
@@ -270,9 +241,8 @@
     <script>
         function toggleInputMethod() {
             const method = document.getElementById('inputMethod').value;
-            document.getElementById('manualInput').style.display  = method === 'manual'  ? 'block' : 'none';
-            document.getElementById('handlesInput').style.display = method === 'handles' ? 'block' : 'none';
-            document.getElementById('fileInput').style.display    = method === 'file'    ? 'block' : 'none';
+            document.getElementById('manualInput').style.display = method === 'manual' ? 'block' : 'none';
+            document.getElementById('fileInput').style.display = method === 'file' ? 'block' : 'none';
         }
 
         // Reflect the chosen filename in the upload label
@@ -284,19 +254,6 @@
                     if (this.files && this.files[0]) {
                         label.textContent = '📄 ' + this.files[0].name;
                     } else {
-                        label.textContent = '📁 Click to select or drag file here';
-                    }
-                });
-            }
-
-            const handlesFile = document.getElementById('handlesFile');
-            if (handlesFile) {
-                handlesFile.addEventListener('change', function () {
-                    const label = document.getElementById('handlesFileLabel');
-                    if (this.files && this.files[0]) {
-                        if (label) label.textContent = '📄 ' + this.files[0].name;
-                        importHandlesFile(this.files[0]);
-                    } else if (label) {
                         label.textContent = '📁 Click to select or drag file here';
                     }
                 });
@@ -313,7 +270,7 @@
             const titles = [], types = {};
             if (method !== 'manual') return { titles, types };
 
-            const tagRe = /\s*\[\s*(movie|movies|tv|tvshow|tv show|tv shows|talent|game|games|video ?games?|beauty|beverages?|sports?|general)\s*\]\s*$/i;
+            const tagRe = /\s*\[\s*(movie|movies|tv|tvshow|tv show|tv shows|talent|game|games|video ?games?|beauty|beverages?|sports?|general|publishers?)\s*\]\s*$/i;
             const text = document.getElementById('titlesList').value;
             text.split('\n').map(t => t.trim()).filter(t => t.length > 0).forEach(line => {
                 let kind = titleType;
@@ -325,6 +282,7 @@
                 if (!line) return;
                 if (/talent/.test(kind)) kind = 'talent';
                 else if (/game/.test(kind)) kind = 'game';
+                else if (/publish/.test(kind)) kind = 'publisher';
                 else if (/beauty/.test(kind)) kind = 'beauty';
                 else if (/beverage/.test(kind)) kind = 'beverages';
                 else if (/sport/.test(kind)) kind = 'sports';
@@ -340,237 +298,6 @@
         // Build the fetch options for /api/preview and /api/generate.
         // For file uploads we send multipart/form-data so the server can read
         // the workbook and preserve ALL columns (incl. social channels).
-        // ---- Social-handle-first mode ------------------------------------
-        // Each line is one account. Optional "handle | Title Name" sets the
-        // title; otherwise it's derived from the handle (review before ingest).
-        // Platform auto-detected from a URL or a prefix; bare @name -> Instagram.
-        // The chosen Title type is used as the category for every account.
-        // Metadata is sent under BOTH key styles so every builder consumes it:
-        // canonical BrandDef cols (talent/movie/tv/game) + ingest-header aliases
-        // (beauty/beverages/sports/general).
-        const HANDLE_FIELDS = {
-            instagram: ['instagram_user', 'Instagram'],
-            twitter:   ['twitter_handle', 'Twitter'],
-            facebook:  ['facebook_page', 'Facebook'],
-            youtube:   ['youtube_channel_username', 'YouTube'],
-            tiktok:    ['tiktok_user', 'TikTok'],
-            tumblr:    ['tumblr_page', 'Tumblr'],
-            linkedin:  ['linkedin_page', 'LinkedIn']
-        };
-
-        function _detectPlatform(token) {
-            const s = token.toLowerCase();
-            if (s.includes('instagram.com')) return 'instagram';
-            if (s.includes('tiktok.com'))    return 'tiktok';
-            if (s.includes('youtube.com') || s.includes('youtu.be')) return 'youtube';
-            if (s.includes('facebook.com') || s.includes('fb.com'))  return 'facebook';
-            if (s.includes('twitter.com')  || s.includes('x.com'))   return 'twitter';
-            if (s.includes('tumblr.com'))   return 'tumblr';
-            if (s.includes('linkedin.com')) return 'linkedin';
-            const pfx = s.match(/^(ig|insta|instagram|fb|facebook|tw|x|twitter|yt|youtube|tt|tiktok|tm|tumblr|li|linkedin)\s*:/);
-            if (pfx) {
-                const p = pfx[1];
-                if (p === 'fb' || p === 'facebook') return 'facebook';
-                if (p === 'tw' || p === 'x' || p === 'twitter') return 'twitter';
-                if (p === 'yt' || p === 'youtube') return 'youtube';
-                if (p === 'tt' || p === 'tiktok')  return 'tiktok';
-                if (p === 'tm' || p === 'tumblr')  return 'tumblr';
-                if (p === 'li' || p === 'linkedin') return 'linkedin';
-                return 'instagram';
-            }
-            return 'instagram';
-        }
-
-        function _cleanHandle(token, platform) {
-            let s = token.trim().replace(/^(ig|insta|instagram|fb|facebook|tw|x|twitter|yt|youtube|tt|tiktok|tm|tumblr|li|linkedin)\s*:\s*/i, '');
-            // tumblr: username.tumblr.com -> username
-            const tmb = s.match(/^(?:https?:\/\/)?([^./\s]+)\.tumblr\.com/i);
-            if (platform === 'tumblr' && tmb) return tmb[1].toLowerCase();
-            if (/^https?:\/\//i.test(s) || /^[\w.-]+\.[a-z]{2,}\//i.test(s)) {
-                s = s.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/[?#].*$/, '');
-                const parts = s.split('/').filter(Boolean);            // [domain, seg, ...]
-                s = parts.slice(1).find(p => !/^(channel|user|c|pages|profile\.php|in|company)$/i.test(p)) || '';
-            }
-            s = s.replace(/^@/, '').replace(/\/+$/, '');
-            if (platform === 'instagram' || platform === 'tiktok') s = s.toLowerCase();
-            return s;
-        }
-
-        function _deriveTitle(handle) {
-            let t = handle.replace(/^@/, '')
-                          .replace(/[._]+/g, ' ')
-                          .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-                          .replace(/\s+/g, ' ').trim();
-            return t.split(' ').map(w => w ? w[0].toUpperCase() + w.slice(1) : w).join(' ');
-        }
-
-        // Returns { titles:[...], types:{title:kind}, metadata:{title:{...}} }
-        // ---- Import handles from a CSV / Excel file ----------------------
-        // The file only *fills* the box above (same format as pasting), so it
-        // flows through getHandlesPayload unchanged. CSV is parsed natively;
-        // .xlsx/.xls uses SheetJS, loaded on demand only when needed.
-        const _PLAT_HEADER = {
-            instagram:'instagram', ig:'instagram', insta:'instagram', 'ig handle':'instagram',
-            twitter:'twitter', x:'twitter', 'twitter/x':'twitter', 'twitter handle':'twitter',
-            facebook:'facebook', fb:'facebook', 'facebook page':'facebook',
-            youtube:'youtube', yt:'youtube', 'youtube channel':'youtube',
-            tiktok:'tiktok', tt:'tiktok', tumblr:'tumblr',
-            linkedin:'linkedin', li:'linkedin'
-        };
-        const _PLAT_PREFIX = {instagram:'ig', twitter:'tw', facebook:'fb', youtube:'yt', tiktok:'tt', tumblr:'tm', linkedin:'li'};
-        const _TITLE_HDR  = ['title','name','brand','entity','show','movie','person','display name','account name'];
-        const _HANDLE_HDR = ['handle','account','username','user','url','link','profile','social','social handle'];
-        const _PLATCOL_HDR = ['platform','network','site'];
-        const _hnorm = s => String(s == null ? '' : s).trim().toLowerCase();
-
-        function _parseCSV(text) {
-            const rows = []; let row = [], cur = '', q = false;
-            for (let i = 0; i < text.length; i++) {
-                const ch = text[i];
-                if (q) {
-                    if (ch === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; }
-                    else cur += ch;
-                } else if (ch === '"') q = true;
-                else if (ch === ',') { row.push(cur); cur = ''; }
-                else if (ch === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; }
-                else if (ch !== '\r') cur += ch;
-            }
-            if (cur !== '' || row.length) { row.push(cur); rows.push(row); }
-            return rows;
-        }
-
-        // 2-D array (with optional header row) -> handle textarea lines.
-        function _rowsToHandleLines(rows) {
-            rows = (rows || []).filter(r => r && r.some(c => String(c == null ? '' : c).trim() !== ''));
-            if (!rows.length) return [];
-            const head = rows[0].map(_hnorm);
-            const looksHeader = head.some(h =>
-                _TITLE_HDR.includes(h) || _HANDLE_HDR.includes(h) || _PLATCOL_HDR.includes(h) || (h in _PLAT_HEADER));
-            const cols = { title: -1, handle: -1, platCol: -1, socials: [] };
-            let dataRows = rows;
-            if (looksHeader) {
-                dataRows = rows.slice(1);
-                head.forEach((h, i) => {
-                    if (h in _PLAT_HEADER) cols.socials.push({ idx: i, platform: _PLAT_HEADER[h] });
-                    else if (cols.title < 0 && _TITLE_HDR.includes(h)) cols.title = i;
-                    else if (cols.handle < 0 && _HANDLE_HDR.includes(h)) cols.handle = i;
-                    else if (cols.platCol < 0 && _PLATCOL_HDR.includes(h)) cols.platCol = i;
-                });
-            }
-            const lines = [];
-            dataRows.forEach(r => {
-                const cell = i => (i >= 0 && i < r.length) ? String(r[i] == null ? '' : r[i]).trim() : '';
-                let title = cell(cols.title);
-                const entries = [];
-                cols.socials.forEach(s => { const v = cell(s.idx); if (v) entries.push({ platform: s.platform, value: v }); });
-                if (cols.handle >= 0) {
-                    const v = cell(cols.handle);
-                    if (v) {
-                        let platform = null;
-                        if (cols.platCol >= 0) { const p = _hnorm(cell(cols.platCol)); if (p in _PLAT_HEADER) platform = _PLAT_HEADER[p]; }
-                        entries.push({ platform, value: v });
-                    }
-                }
-                if (!entries.length && !looksHeader) {          // headerless: col0 = handle, col1 = title
-                    const v = cell(0); if (v) entries.push({ platform: null, value: v });
-                    if (!title) title = cell(1);
-                }
-                if (!entries.length) return;
-                // no title but several handles in the row -> derive a shared title so they merge
-                if (!title && entries.length > 1) {
-                    const e0 = entries[0], p0 = e0.platform || _detectPlatform(e0.value);
-                    title = _deriveTitle(_cleanHandle(e0.value, p0));
-                }
-                entries.forEach(e => {
-                    let tok = e.value;
-                    if (e.platform && !/^https?:\/\//i.test(tok) && !/[\w.-]+\.[a-z]{2,}\//i.test(tok)) {
-                        tok = _PLAT_PREFIX[e.platform] + ':' + tok;
-                    }
-                    lines.push(title ? (tok + ' | ' + title) : tok);
-                });
-            });
-            return lines;
-        }
-
-        let _xlsxPromise = null;
-        function _loadSheetJS() {
-            if (window.XLSX) return Promise.resolve(window.XLSX);
-            if (_xlsxPromise) return _xlsxPromise;
-            _xlsxPromise = new Promise((res, rej) => {
-                const s = document.createElement('script');
-                s.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
-                s.onload = () => res(window.XLSX);
-                s.onerror = () => rej(new Error('Could not load the Excel reader (network blocked?). Save the file as CSV and try again.'));
-                document.head.appendChild(s);
-            });
-            return _xlsxPromise;
-        }
-
-        function _fillHandlesFromRows(rows, fname) {
-            const lines = _rowsToHandleLines(rows);
-            if (!lines.length) { showMessage('inputMessage', 'No handles found in that file.', 'error'); return; }
-            const box = document.getElementById('handlesList');
-            box.value = (box.value.trim() ? box.value.trim() + '\n' : '') + lines.join('\n');
-            showMessage('inputMessage', 'Loaded ' + lines.length + ' account' + (lines.length > 1 ? 's' : '') + ' from ' + fname + '. Review, then Preview.', 'success');
-        }
-
-        function importHandlesFile(file) {
-            if (!file) return;
-            const name = (file.name || '').toLowerCase();
-            if (name.endsWith('.csv') || file.type === 'text/csv') {
-                const fr = new FileReader();
-                fr.onload = () => _fillHandlesFromRows(_parseCSV(String(fr.result || '')), file.name);
-                fr.onerror = () => showMessage('inputMessage', 'Could not read that file.', 'error');
-                fr.readAsText(file);
-            } else {
-                _loadSheetJS().then(XLSX => {
-                    const fr = new FileReader();
-                    fr.onload = () => {
-                        try {
-                            const wb = XLSX.read(new Uint8Array(fr.result), { type: 'array' });
-                            const ws = wb.Sheets[wb.SheetNames[0]];
-                            _fillHandlesFromRows(XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: false }), file.name);
-                        } catch (e) { showMessage('inputMessage', 'Could not parse that Excel file: ' + e.message, 'error'); }
-                    };
-                    fr.onerror = () => showMessage('inputMessage', 'Could not read that file.', 'error');
-                    fr.readAsArrayBuffer(file);
-                }).catch(e => showMessage('inputMessage', e.message, 'error'));
-            }
-        }
-
-        function getHandlesPayload() {
-            const titleType = document.getElementById('titleType').value;
-            const titles = [], types = {}, metadata = {};
-            const tagRe = /\s*\[\s*(movie|movies|tv|tvshow|tv show|tv shows|talent|game|games|video ?games?|beauty|beverages?|sports?|general)\s*\]\s*$/i;
-            const text = document.getElementById('handlesList').value;
-            text.split('\n').map(l => l.trim()).filter(Boolean).forEach(line => {
-                const bar = line.split('|');
-                let handlePart = bar[0].trim();
-                const titlePart = bar.length > 1 ? bar.slice(1).join('|').trim() : '';
-                let kind = titleType;
-                const m = handlePart.match(tagRe);
-                if (m) { handlePart = handlePart.replace(tagRe, '').trim(); kind = m[1].toLowerCase(); }
-                if (!handlePart) return;
-                if (/talent/.test(kind)) kind = 'talent';
-                else if (/game/.test(kind)) kind = 'game';
-                else if (/beauty/.test(kind)) kind = 'beauty';
-                else if (/beverage/.test(kind)) kind = 'beverages';
-                else if (/sport/.test(kind)) kind = 'sports';
-                else if (/general/.test(kind)) kind = 'general';
-                else if (/tv/.test(kind)) kind = 'tvshow';
-                else if (!['movie','tvshow','talent','game','beauty','beverages','sports','general'].includes(kind)) kind = 'movie';
-
-                const platform = _detectPlatform(handlePart);
-                const handle = _cleanHandle(handlePart, platform);
-                if (!handle) return;
-                const title = titlePart || _deriveTitle(handle);
-                if (!title) return;
-                if (!(title in metadata)) { metadata[title] = {}; titles.push(title); types[title] = kind; }
-                HANDLE_FIELDS[platform].forEach(k => { metadata[title][k] = handle; });
-            });
-            return { titles, types, metadata };
-        }
-
         function buildRequestInit() {
             const method = document.getElementById('inputMethod').value;
             const includeDar = document.getElementById('includeDar').checked;
@@ -591,22 +318,6 @@
                 fd.append('titleType', titleType);
                 // Do NOT set Content-Type; the browser sets the multipart boundary.
                 return { method: 'POST', body: fd };
-            }
-
-            if (method === 'handles') {
-                const parsed = getHandlesPayload();
-                if (parsed.titles.length === 0) {
-                    showMessage('inputMessage', 'Please paste at least one social account', 'error');
-                    return null;
-                }
-                const payload = { titles: parsed.titles, includeDar: includeDar,
-                                  autoFetch: true, resolve_by_handle: true,
-                                  titles_type: parsed.types, metadata: parsed.metadata };
-                return {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                };
             }
 
             const parsed = getTitlesAndTypes();
@@ -811,9 +522,6 @@
 
         function resetForm() {
             document.getElementById('titlesList').value = '';
-            const h = document.getElementById('handlesList'); if (h) h.value = '';
-            const hf = document.getElementById('handlesFile'); if (hf) hf.value = '';
-            const hfl = document.getElementById('handlesFileLabel'); if (hfl) hfl.textContent = '📁 Click to select or drag file here';
             document.getElementById('includeDar').checked = true;
             document.getElementById('previewContent').innerHTML = '<p style="color: #999; text-align: center; padding: 40px 0;">Click "Preview" to see how your data will be formatted</p>';
             document.getElementById('previewStats').style.display = 'none';
