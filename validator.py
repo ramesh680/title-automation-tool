@@ -59,9 +59,11 @@ DEFAULT_RULES = {
          "check": "imdb_ttcode_format", "applies_to": ["Movies", "TV Shows"],
          "message": "IMDb value should be an IMDb title URL / ttNNNNNNN code."},
         {"sheet": "*", "column": "metacritic", "check": "metacritic_url_format",
+         "message": "metacritic value should be a metacritic.com movie/tv URL."},
+        {"sheet": "*", "column": "rottentomatoes", "check": "rottentomatoes_url_format",
          "applies_to": ["Movies", "TV Shows"],
-         "message": "Metacritic value should be a movie URL (contains /movie/ or /m/). "
-                    "A /tv/ URL is not a valid Metacritic URL for this title."},
+         "message": "Rotten Tomatoes value should be a movie URL (contains /m/). "
+                    "A /tv/ URL is not accepted as a valid Rotten Tomatoes URL."},
         {"sheet": "*", "column": "wikipedia_page",
          "check": "english_wikipedia_url_matches_title", "accepted_host": "en.wikipedia.org",
          "message": "Wikipedia URLs must be en.wikipedia.org/wiki/... and match the title."},
@@ -205,27 +207,40 @@ def _chk_imdb_ttcode_format(val, row, rule):
     return None, ""
 
 
-# Business rule (Movies & TV Shows): a valid Metacritic URL is a MOVIE URL --
-# it contains /movie/ or /m/. A /tv/ path is explicitly NOT considered valid,
-# even for TV-Show titles. Checked in that order so a /tv/ link always fails.
-_MC_TV_RE = re.compile(r"/tv/", re.I)
-_MC_VALID_RE = re.compile(r"/(?:movie|m)/", re.I)
+# Metacritic: format only -- metacritic.com movie OR tv paths are both fine.
+_MC_RE = re.compile(r"metacritic\.com/(movie|tv)/", re.I)
 
 
 def _chk_metacritic_url_format(val, row, rule):
+    v = _s(val)
+    if v == "":
+        return SEV_WARN, "Metacritic URL missing (lookup from title pending)."
+    if not _MC_RE.search(v):
+        return SEV_FAIL, rule.get("message", "Metacritic URL malformed.")
+    return None, ""
+
+
+# Business rule (Movies & TV Shows): a valid Rotten Tomatoes URL is a MOVIE URL
+# -- it contains /m/. A /tv/ path is explicitly NOT accepted, even for TV-Show
+# titles. Checked in that order so a /tv/ link always fails.
+_RT_TV_RE = re.compile(r"/tv/", re.I)
+_RT_VALID_RE = re.compile(r"/m/", re.I)
+
+
+def _chk_rottentomatoes_url_format(val, row, rule):
     # Only enforced for the categories in applies_to (Movies / TV Shows).
     applies = [a.lower() for a in rule.get("applies_to", [])]
     if applies and _norm(_row_get(row, "title_category")) not in applies:
         return None, ""
     v = _s(val)
     if v == "":
-        return SEV_WARN, "Metacritic URL missing (lookup from title pending)."
-    if _MC_TV_RE.search(v):
+        return SEV_WARN, "Rotten Tomatoes URL missing (lookup from title pending)."
+    if _RT_TV_RE.search(v):
         return SEV_FAIL, rule.get(
             "message",
-            "A /tv/ URL is not a valid Metacritic URL (use the /movie/ or /m/ URL).")
-    if not _MC_VALID_RE.search(v):
-        return SEV_FAIL, rule.get("message", "Metacritic URL malformed.")
+            "A /tv/ URL is not accepted as a valid Rotten Tomatoes URL (use the /m/ URL).")
+    if not _RT_VALID_RE.search(v):
+        return SEV_FAIL, rule.get("message", "Rotten Tomatoes URL malformed.")
     return None, ""
 
 
@@ -282,6 +297,8 @@ CHECKS = {
     "lookup_imdb_ttcode_from_title": _chk_imdb_ttcode_format,      # alias
     "metacritic_url_format": _chk_metacritic_url_format,
     "lookup_metacritic_url_from_title": _chk_metacritic_url_format,  # alias
+    "rottentomatoes_url_format": _chk_rottentomatoes_url_format,
+    "lookup_rottentomatoes_url_from_title": _chk_rottentomatoes_url_format,  # alias
     "english_wikipedia_url_matches_title": _chk_english_wikipedia_url_matches_title,
     "wikidata_english_wikipedia_url_matches_title": _chk_english_wikipedia_url_matches_title,
     "contains_companies_and_platform_accounts": _chk_contains_companies_and_platform_accounts,
