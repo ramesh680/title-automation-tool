@@ -1,6 +1,7 @@
 """
 Unit tests for the four optimization changes (July 2026):
-  * Idea 3 - Metacritic URL rule: /movie/ or /m/ valid, /tv/ invalid (Movies/TV)
+  * Idea 3 - Rotten Tomatoes URL rule: /m/ valid, /tv/ invalid (Movies/TV);
+            Metacritic keeps its original movie/tv format check
   * Idea 4 - brand_set required-value-by-category check
   * Idea 2 - talent profession hint (fetch_person + app helpers)
 
@@ -10,58 +11,85 @@ import os
 import validator as V
 
 
-# --------------------------- Idea 3: Metacritic ---------------------------
-MC_RULE = {"applies_to": ["Movies", "TV Shows"],
-           "message": "bad metacritic"}
+# ----------------------- Idea 3: Rotten Tomatoes --------------------------
+RT_RULE = {"applies_to": ["Movies", "TV Shows"], "message": "bad rt"}
 
 
-def _mc(val, category):
-    return V._chk_metacritic_url_format(val, {"title_category": category}, MC_RULE)
+def _rt(val, category):
+    return V._chk_rottentomatoes_url_format(val, {"title_category": category}, RT_RULE)
 
 
-def test_metacritic_movie_path_valid_for_movies():
-    sev, _ = _mc("https://www.metacritic.com/movie/dune-part-two/", "Movies")
+def test_rt_m_path_valid_for_movies():
+    sev, _ = _rt("https://www.rottentomatoes.com/m/dune_part_two", "Movies")
     assert sev is None
 
 
-def test_metacritic_m_path_valid():
-    sev, _ = _mc("https://www.rottentomatoes.com/m/dune_part_two", "Movies")
+def test_rt_m_path_valid_for_tv_shows():
+    # a TV title still needs the /m/ style URL under this rule
+    sev, _ = _rt("https://www.rottentomatoes.com/m/the_bear", "TV Shows")
     assert sev is None
 
 
-def test_metacritic_tv_path_invalid_for_tv_shows():
-    sev, msg = _mc("https://www.metacritic.com/tv/the-bear/", "TV Shows")
+def test_rt_movie_path_valid_for_movies():
+    # /movie/ is valid too (not just /m/)
+    sev, _ = _rt("https://www.rottentomatoes.com/movie/dune_part_three", "Movies")
+    assert sev is None
+
+
+def test_rt_movie_path_valid_for_tv_shows():
+    sev, _ = _rt("https://www.rottentomatoes.com/movie/the_bear", "TV Shows")
+    assert sev is None
+
+
+def test_rt_tv_path_invalid_for_tv_shows():
+    sev, _ = _rt("https://www.rottentomatoes.com/tv/the_bear", "TV Shows")
     assert sev == V.SEV_FAIL
 
 
-def test_metacritic_tv_default_message_mentions_movie():
-    # with no custom message the default explains the /movie/ (or /m/) rule
-    sev, msg = V._chk_metacritic_url_format(
-        "https://www.metacritic.com/tv/the-bear/",
+def test_rt_tv_path_invalid_for_movies():
+    sev, _ = _rt("https://www.rottentomatoes.com/tv/whatever", "Movies")
+    assert sev == V.SEV_FAIL
+
+
+def test_rt_default_message_mentions_tv():
+    sev, msg = V._chk_rottentomatoes_url_format(
+        "https://www.rottentomatoes.com/tv/the_bear",
         {"title_category": "TV Shows"},
         {"applies_to": ["Movies", "TV Shows"]})
     assert sev == V.SEV_FAIL
     assert "/tv/" in msg
 
 
-def test_metacritic_tv_path_invalid_for_movies():
-    sev, _ = _mc("https://www.metacritic.com/tv/some-show/", "Movies")
-    assert sev == V.SEV_FAIL
-
-
-def test_metacritic_blank_is_warning():
-    sev, _ = _mc("", "Movies")
+def test_rt_blank_is_warning():
+    sev, _ = _rt("", "Movies")
     assert sev == V.SEV_WARN
 
 
-def test_metacritic_rule_skips_other_categories():
-    # a /tv/ URL on a non-Movies/TV row must NOT be failed by this rule
-    sev, _ = _mc("https://www.metacritic.com/tv/whatever/", "Talent")
+def test_rt_rule_skips_other_categories():
+    sev, _ = _rt("https://www.rottentomatoes.com/tv/whatever", "Talent")
     assert sev is None
 
 
+def test_rt_garbage_fails():
+    sev, _ = _rt("https://example.com/foo/bar", "Movies")
+    assert sev == V.SEV_FAIL
+
+
+# --- Metacritic keeps its ORIGINAL behaviour (movie AND tv both valid) ---
+def test_metacritic_movie_and_tv_both_valid():
+    for url in ("https://www.metacritic.com/movie/dune-part-two/",
+                "https://www.metacritic.com/tv/the-bear/"):
+        sev, _ = V._chk_metacritic_url_format(url, {"title_category": "Movies"}, {})
+        assert sev is None, url
+
+
+def test_metacritic_blank_is_warning():
+    sev, _ = V._chk_metacritic_url_format("", {}, {})
+    assert sev == V.SEV_WARN
+
+
 def test_metacritic_garbage_fails():
-    sev, _ = _mc("https://example.com/foo/bar", "Movies")
+    sev, _ = V._chk_metacritic_url_format("https://example.com/x/", {}, {})
     assert sev == V.SEV_FAIL
 
 
@@ -172,14 +200,23 @@ def test_fetch_person_hint_biases_candidate(monkeypatch):
     assert meta.get("profession") == "chef"
 
 
-def test_metacritic_resolver_rejects_tv_candidate(monkeypatch):
+def test_rt_helpers_enforce_movie_only():
     os.environ["VALIDATE_URLS"] = "0"
     import importlib
     import metadata_fetcher as MF
     importlib.reload(MF)
-    # VALIDATE_URLS off: a /movie/ candidate is returned as-is, a /tv/ one is dropped
-    assert MF.resolve_metacritic("X", candidate="http://www.metacritic.com/movie/x/") \
-        == "http://www.metacritic.com/movie/x/"
-    assert MF.resolve_metacritic("X", candidate="http://www.metacritic.com/tv/x/") == ""
-    assert MF._is_tv_metacritic("http://www.metacritic.com/tv/x/") is True
-    assert MF._is_tv_metacritic("http://www.metacritic.com/movie/x/") is False
+    assert MF.is_tv_rottentomatoes("http://www.rottentomatoes.com/tv/x") is True
+    assert MF.is_tv_rottentomatoes("http://www.rottentomatoes.com/m/x") is False
+    assert MF.clean_rottentomatoes("http://www.rottentomatoes.com/m/x") \
+        == "http://www.rottentomatoes.com/m/x"
+    assert MF.clean_rottentomatoes("http://www.rottentomatoes.com/tv/x") == ""
+
+
+def test_metacritic_resolver_keeps_tv_candidate(monkeypatch):
+    """Metacritic is back to its original behaviour: /tv/ is fine."""
+    os.environ["VALIDATE_URLS"] = "0"
+    import importlib
+    import metadata_fetcher as MF
+    importlib.reload(MF)
+    for url in ("http://www.metacritic.com/movie/x/", "http://www.metacritic.com/tv/x/"):
+        assert MF.resolve_metacritic("X", candidate=url) == url

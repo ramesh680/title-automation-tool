@@ -62,8 +62,9 @@ DEFAULT_RULES = {
          "message": "metacritic value should be a metacritic.com movie/tv URL."},
         {"sheet": "*", "column": "rottentomatoes", "check": "rottentomatoes_url_format",
          "applies_to": ["Movies", "TV Shows"],
-         "message": "Rotten Tomatoes value should be a movie URL (contains /m/). "
-                    "A /tv/ URL is not accepted as a valid Rotten Tomatoes URL."},
+         "message": "Rotten Tomatoes value should be a movie URL (contains /m/ or "
+                    "/movie/). A /tv/ URL is not accepted as a valid Rotten "
+                    "Tomatoes URL for Movies or TV Shows."},
         {"sheet": "*", "column": "wikipedia_page",
          "check": "english_wikipedia_url_matches_title", "accepted_host": "en.wikipedia.org",
          "message": "Wikipedia URLs must be en.wikipedia.org/wiki/... and match the title."},
@@ -221,10 +222,10 @@ def _chk_metacritic_url_format(val, row, rule):
 
 
 # Business rule (Movies & TV Shows): a valid Rotten Tomatoes URL is a MOVIE URL
-# -- it contains /m/. A /tv/ path is explicitly NOT accepted, even for TV-Show
-# titles. Checked in that order so a /tv/ link always fails.
+# -- it contains /m/ or /movie/. A /tv/ path is explicitly NOT accepted, even
+# for TV-Show titles. Checked in that order so a /tv/ link always fails.
 _RT_TV_RE = re.compile(r"/tv/", re.I)
-_RT_VALID_RE = re.compile(r"/m/", re.I)
+_RT_VALID_RE = re.compile(r"/(?:m|movie)/", re.I)
 
 
 def _chk_rottentomatoes_url_format(val, row, rule):
@@ -238,7 +239,8 @@ def _chk_rottentomatoes_url_format(val, row, rule):
     if _RT_TV_RE.search(v):
         return SEV_FAIL, rule.get(
             "message",
-            "A /tv/ URL is not accepted as a valid Rotten Tomatoes URL (use the /m/ URL).")
+            "A /tv/ URL is not accepted as a valid Rotten Tomatoes URL "
+            "(use the /m/ or /movie/ URL).")
     if not _RT_VALID_RE.search(v):
         return SEV_FAIL, rule.get("message", "Rotten Tomatoes URL malformed.")
     return None, ""
