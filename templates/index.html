@@ -193,6 +193,17 @@
                     <b>type</b> / <b>title_category</b> column value — rows with one keep it.</span>
                 </div>
 
+                <div class="form-group" id="talentProfessionGroup">
+                    <label class="lbl" for="talentProfession">Talent professional details (optional)</label>
+                    <input type="text" id="talentProfession"
+                           placeholder="e.g. Actor, NBA player, Musician, Chef">
+                    <span class="hint">Helps fetch the <b>right</b> social accounts for people who
+                    share a name. Applies to <b>Talent</b> titles. For manual entry it applies to
+                    every talent line — override one line with a brace tag,
+                    e.g. <b>Michael Jordan {basketball}</b>. For file uploads, add a
+                    <b>profession</b> column instead.</span>
+                </div>
+
                 <div class="form-group">
                     <label class="toggle">
                         <input type="checkbox" id="includeDar" checked><span class="slider"></span>
@@ -267,13 +278,23 @@
         function getTitlesAndTypes() {
             const method = document.getElementById('inputMethod').value;
             const titleType = document.getElementById('titleType').value;
-            const titles = [], types = {};
-            if (method !== 'manual') return { titles, types };
+            const defaultProfession = (document.getElementById('talentProfession')
+                                       || {}).value ? document.getElementById('talentProfession').value.trim() : '';
+            const titles = [], types = {}, professions = {};
+            if (method !== 'manual') return { titles, types, professions };
 
             const tagRe = /\s*\[\s*(movie|movies|tv|tvshow|tv show|tv shows|talent|game|games|video ?games?|beauty|beverages?|sports?|general|publishers?)\s*\]\s*$/i;
+            // optional per-line profession tag in braces: "Michael Jordan {basketball}"
+            const profRe = /\s*\{\s*([^{}]+?)\s*\}\s*/;
             const text = document.getElementById('titlesList').value;
             text.split('\n').map(t => t.trim()).filter(t => t.length > 0).forEach(line => {
                 let kind = titleType;
+                let profession = '';
+                const pm = line.match(profRe);
+                if (pm) {
+                    profession = pm[1].trim();
+                    line = line.replace(profRe, ' ').trim();
+                }
                 const m = line.match(tagRe);
                 if (m) {
                     line = line.replace(tagRe, '').trim();
@@ -291,8 +312,11 @@
                 else kind = 'movie';           // 'mixed' + untagged -> movie
                 titles.push(line);
                 types[line] = kind;
+                // talent lines pick up the per-line brace tag, else the box default
+                const prof = profession || (kind === 'talent' ? defaultProfession : '');
+                if (prof) professions[line] = prof;
             });
-            return { titles, types };
+            return { titles, types, professions };
         }
 
         // Build the fetch options for /api/preview and /api/generate.
@@ -316,6 +340,8 @@
                 fd.append('includeDar', includeDar);
                 fd.append('autoFetch', autoFetch);
                 fd.append('titleType', titleType);
+                const defProf = (document.getElementById('talentProfession') || {}).value || '';
+                if (defProf.trim()) fd.append('talentProfession', defProf.trim());
                 // Do NOT set Content-Type; the browser sets the multipart boundary.
                 return { method: 'POST', body: fd };
             }
@@ -329,7 +355,7 @@
 
             // every title always gets an explicit type (fixes mixed runs
             // silently defaulting to movies)
-            const payload = { titles: titles, includeDar: includeDar, autoFetch: autoFetch, titles_type: parsed.types };
+            const payload = { titles: titles, includeDar: includeDar, autoFetch: autoFetch, titles_type: parsed.types, professions: parsed.professions };
             return {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },

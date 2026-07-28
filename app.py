@@ -20,7 +20,7 @@ except Exception:  # keep the app running even if the module is missing
     def fetch_metadata_by_tt(tt, is_movie=True, title=""):
         return {}
 
-    def fetch_person(name):
+    def fetch_person(name, qid=None, profession=""):
         return {}
 
     def fetch_game(name):
@@ -1408,6 +1408,42 @@ def _norm_kind(v, default='movie'):
     return 'movie'
 
 
+# Idea 2: optional professional-details hint for Talent. Accepted upload column
+# names (case-insensitive). Used only for talent -- it disambiguates the person
+# lookup and seeds the occupation used for classification/social fetching.
+PROFESSION_COLUMNS = (
+    'profession', 'professional_details', 'professional details',
+    'talent_profession', 'talent profession', 'profession_detail',
+    'profession/category', 'profession / category', 'profession or category',
+    'category_detail', 'category detail',
+)
+
+
+def _row_profession(r):
+    """Return the professional-details hint from an uploaded record, or ''."""
+    if not isinstance(r, dict):
+        return ''
+    low = {str(k).strip().lower(): k for k in r.keys()}
+    for name in PROFESSION_COLUMNS:
+        if name in low:
+            v = r.get(low[name])
+            if v not in (None, '') and str(v).strip().lower() not in ('nan', 'none'):
+                return str(v).strip()
+    return ''
+
+
+def _apply_profession(meta, profession):
+    """Overlay a profession hint onto a talent metadata dict so classification
+    and social fetching can use it (never overrides discovered occupations)."""
+    if not profession:
+        return meta
+    meta = dict(meta or {})
+    meta.setdefault('profession', profession)
+    if not meta.get('occupations'):
+        meta['occupations'] = [profession]
+    return meta
+
+
 # kinds handled by the titleforge extension (Beauty/Beverages/Sports/General)
 TFX_KINDS = {'beauty', 'beverages', 'sports', 'general'}
 _TFX_SHEET_LABELS = {'beauty': 'Beauty', 'beverages': 'Beverages',
@@ -1497,7 +1533,8 @@ def _parallel_rows(items, worker, progress=None, parallel=True):
 
 
 def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
-                           progress=None, default_kind='movie'):
+                           progress=None, default_kind='movie',
+                           default_profession=''):
     """Turn an uploaded file into fully-populated rows.
 
     max_titles caps titles processed BEFORE lookups (keeps Preview fast).
@@ -1545,13 +1582,16 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
                     r = disc
                 return [make_row(t, False, '', r, publisher=True)]
             if kind_r in ('talent', 'game'):
+                prof = (_row_profession(r) or default_profession) if kind_r == 'talent' else ''
                 if auto_fetch:
-                    disc = dict((fetch_person(t) if kind_r == 'talent'
+                    disc = dict((fetch_person(t, profession=prof) if kind_r == 'talent'
                                  else fetch_game(t)) or {})
                     for k, v in r.items():
                         if v not in (None, ''):
                             disc[k] = v
                     r = disc
+                if prof:
+                    r = _apply_profession(r, prof)
                 return [make_row(t, False, '', r,
                                  talent=(kind_r == 'talent'),
                                  game=(kind_r == 'game'))]
@@ -1569,6 +1609,8 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
         title_col = lower_cols.get('title') or df.columns[0]
         type_col = lower_cols.get('type') or lower_cols.get('title_category')
         network_col = lower_cols.get('network')
+        prof_col = next((lower_cols[c] for c in PROFESSION_COLUMNS
+                         if c in lower_cols), None)
         specs = []
         for _, r in df.iterrows():
             title = str(r[title_col]).strip()
@@ -1578,9 +1620,14 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
                 break
             kind = _norm_kind(r[type_col] if type_col else '', default_kind)
             network = str(r[network_col]).strip() if network_col else ''
-            specs.append((title, kind, network))
+            profession = str(r[prof_col]).strip() if prof_col else ''
+            if profession.lower() in ('nan', 'none'):
+                profession = ''
+            if not profession:
+                profession = default_profession
+            specs.append((title, kind, network, profession))
         def _one_spec(i, spec):
-            title, kind, network = spec
+            title, kind, network, profession = spec
             out = []
             if kind in TFX_KINDS and TFX_OK:
                 seed = dict(fetch_brand(title) or {}) if auto_fetch else None
@@ -1588,7 +1635,8 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
                 if include_dar and ' - DAR' not in title:
                     out.append(create_tfx_row(f"{title} - DAR", kind, seed))
             elif kind == 'talent':
-                meta = dict(fetch_person(title) or {}) if auto_fetch else {}
+                meta = dict(fetch_person(title, profession=profession) or {}) if auto_fetch else {}
+                meta = _apply_profession(meta, profession)
                 out.append(make_row(title, False, '', meta, talent=True))
             elif kind == 'publisher':
                 # publisher = a single DAR row per publication, no twin
@@ -1637,10 +1685,15 @@ def build_rows_from_titles(data, max_titles=None, progress=None):
             if include_dar and ' - DAR' not in title:
                 out.append(create_tfx_row(f"{title} - DAR", kind, seed))
         elif kind == 'talent':
-            metadata = dict(fetch_person(title) or {}) if auto_fetch else {}
+            # profession hint: explicit per-title 'professions' map, else from
+            # the title's metadata payload (any accepted profession column name)
+            profession = str(data.get('professions', {}).get(title, '')
+                             or _row_profession(base_meta or {})).strip()
+            metadata = dict(fetch_person(title, profession=profession) or {}) if auto_fetch else {}
             for k, v in (base_meta or {}).items():
                 if v not in (None, ''):
                     metadata[k] = v
+            metadata = _apply_profession(metadata, profession)
             # talent = a single DAR row per person, no twin
             out.append(make_row(title, False, '', metadata, talent=True))
         elif kind == 'publisher':
@@ -1759,7 +1812,8 @@ def collect_rows(preview=False):
         default_kind = _norm_kind(request.form.get('titleType'))
         rows = build_rows_from_upload(request.files['file'], include_dar, auto_fetch,
                                       max_titles=max_titles,
-                                      default_kind=default_kind)
+                                      default_kind=default_kind,
+                                      default_profession=request.form.get('talentProfession', ''))
     else:
         data = request.get_json(silent=True) or {}
         rows = build_rows_from_titles(data, max_titles=max_titles)
@@ -2443,7 +2497,8 @@ def _run_generation(jid, kind, payload):
                 (payload['bytes'], payload['filename']),
                 payload['include_dar'], payload['auto_fetch'], progress=prog,
                 max_titles=max_titles,
-                default_kind=payload.get('title_type', 'movie'))
+                default_kind=payload.get('title_type', 'movie'),
+                default_profession=payload.get('talent_profession', ''))
         else:
             rows = build_rows_from_titles(payload['data'], max_titles=max_titles,
                                           progress=prog)
@@ -2483,6 +2538,7 @@ def generate_async():
             'include_dar': request.form.get('includeDar', 'true').lower() != 'false',
             'auto_fetch': request.form.get('autoFetch', 'false').lower() == 'true',
             'title_type': _norm_kind(request.form.get('titleType')),
+            'talent_profession': request.form.get('talentProfession', ''),
         }
         kind = 'file'
     else:
@@ -2511,6 +2567,7 @@ def preview_async():
             'include_dar': request.form.get('includeDar', 'true').lower() != 'false',
             'auto_fetch': request.form.get('autoFetch', 'false').lower() == 'true',
             'title_type': _norm_kind(request.form.get('titleType')),
+            'talent_profession': request.form.get('talentProfession', ''),
             'preview': True, 'preview_limited': True,
         }
         kind = 'file'

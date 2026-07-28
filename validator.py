@@ -50,15 +50,18 @@ DEFAULT_RULES = {
          "message": "title_category must be present and one of the approved categories "
                     "(Movies, TV Shows, Talent, Video Game, Health & Beauty, Beverages, "
                     "Sports Franchise, or the General master list)."},
-        {"sheet": "*", "column": "brand_set", "check": "dar_or_competitive_brand_set",
-         "message": "DAR titles need 'Pristine DAR Brands'; other titles need 'Competitive View'."},
+        {"sheet": "*", "column": "brand_set", "check": "brand_set_present_for_category",
+         "message": "The brand set required for this title category (per the ingest "
+                    "templates) is missing from brand_set."},
         {"sheet": "*", "column": "companies", "check": "dar_company_rule",
          "message": "DAR titles must have companies = 'Pristine Brand'."},
         {"sheet": "*", "column": "imdb_id", "alternate_column": "imdb_url",
          "check": "imdb_ttcode_format", "applies_to": ["Movies", "TV Shows"],
          "message": "IMDb value should be an IMDb title URL / ttNNNNNNN code."},
         {"sheet": "*", "column": "metacritic", "check": "metacritic_url_format",
-         "message": "metacritic value should be a metacritic.com movie/tv URL."},
+         "applies_to": ["Movies", "TV Shows"],
+         "message": "Metacritic value should be a movie URL (contains /movie/ or /m/). "
+                    "A /tv/ URL is not a valid Metacritic URL for this title."},
         {"sheet": "*", "column": "wikipedia_page",
          "check": "english_wikipedia_url_matches_title", "accepted_host": "en.wikipedia.org",
          "message": "Wikipedia URLs must be en.wikipedia.org/wiki/... and match the title."},
@@ -121,6 +124,66 @@ def _chk_dar_or_competitive_brand_set(val, row, rule):
     return None, ""
 
 
+# --- brand_set required-value-by-category (Idea 4) -------------------------
+# The ingest templates each carry a signature brand set. This maps a title
+# category to the brand set token that MUST appear in the brand_set cell --
+# split by whether the row is a DAR (pristine) row or a competitive/standard
+# row. These signatures mirror what the tool's own row builders emit, so a
+# workbook produced by the generator always passes.
+_BRAND_SET_BY_KIND = {
+    "movie":     {"dar": "Pristine DAR Brands",           "std": "Competitive View"},
+    "tv":        {"dar": "LF // TV",                       "std": "Competitive View"},
+    "talent":    {"dar": "LF // Talent",                   "std": "LF // Talent"},
+    "publisher": {"dar": "LF // Publishing",               "std": "LF // Publishing"},
+    "game":      {"dar": "LF // Video Games",              "std": "Competitive View"},
+    "beauty":    {"dar": "LF // Beauty",                   "std": "Competitive View"},
+    "beverages": {"dar": "LF // Beverages",                "std": "Competitive View"},
+    "sports":    {"dar": "LF // Professional Sports Teams", "std": "Competitive View"},
+    # "general" is intentionally absent: its brand set is carried through from
+    # the source sheet, so there is no single required value to enforce.
+}
+
+
+def _kind_from_category(cat):
+    """Map a free-text title_category to a brand-set kind key. Mirrors the
+    generator's own _norm_kind so the two never disagree."""
+    s = (cat or "").strip().lower()
+    if "talent" in s:
+        return "talent"
+    if "publisher" in s:
+        return "publisher"
+    if "game" in s:
+        return "game"
+    if "beauty" in s:
+        return "beauty"
+    if "beverage" in s:
+        return "beverages"
+    if "sport" in s:
+        return "sports"
+    if s == "general":
+        return "general"
+    if "tv" in s:
+        return "tv"
+    if "movie" in s or "film" in s:
+        return "movie"
+    return ""
+
+
+def _chk_brand_set_present_for_category(val, row, rule):
+    """Flag ONLY when the brand set required for the row's title category is not
+    present in brand_set. If it is present (or the category has no fixed
+    requirement), the cell passes."""
+    cat = _s(_row_get(row, "title_category"))
+    spec = _BRAND_SET_BY_KIND.get(_kind_from_category(cat))
+    if not spec:
+        return None, ""  # unknown / General category -> nothing required
+    required = spec["dar"] if _is_dar(row) else spec["std"]
+    if required.lower() not in _norm(val):
+        msg = rule.get("message", "Required brand set is missing.")
+        return SEV_FAIL, f"{msg} Expected to contain '{required}' for category '{cat}'."
+    return None, ""
+
+
 def _chk_dar_company_rule(val, row, rule):
     if _is_dar(row) and _norm(val) != "pristine brand":
         return SEV_FAIL, rule.get("message", "DAR company must be 'Pristine Brand'.")
@@ -142,14 +205,26 @@ def _chk_imdb_ttcode_format(val, row, rule):
     return None, ""
 
 
-_MC_RE = re.compile(r"metacritic\.com/(movie|tv)/", re.I)
+# Business rule (Movies & TV Shows): a valid Metacritic URL is a MOVIE URL --
+# it contains /movie/ or /m/. A /tv/ path is explicitly NOT considered valid,
+# even for TV-Show titles. Checked in that order so a /tv/ link always fails.
+_MC_TV_RE = re.compile(r"/tv/", re.I)
+_MC_VALID_RE = re.compile(r"/(?:movie|m)/", re.I)
 
 
 def _chk_metacritic_url_format(val, row, rule):
+    # Only enforced for the categories in applies_to (Movies / TV Shows).
+    applies = [a.lower() for a in rule.get("applies_to", [])]
+    if applies and _norm(_row_get(row, "title_category")) not in applies:
+        return None, ""
     v = _s(val)
     if v == "":
         return SEV_WARN, "Metacritic URL missing (lookup from title pending)."
-    if not _MC_RE.search(v):
+    if _MC_TV_RE.search(v):
+        return SEV_FAIL, rule.get(
+            "message",
+            "A /tv/ URL is not a valid Metacritic URL (use the /movie/ or /m/ URL).")
+    if not _MC_VALID_RE.search(v):
         return SEV_FAIL, rule.get("message", "Metacritic URL malformed.")
     return None, ""
 
@@ -201,6 +276,7 @@ CHECKS = {
     "not_blank_and_not_placeholder": _chk_not_blank_and_not_placeholder,
     "approved_category": _chk_approved_category,
     "dar_or_competitive_brand_set": _chk_dar_or_competitive_brand_set,
+    "brand_set_present_for_category": _chk_brand_set_present_for_category,
     "dar_company_rule": _chk_dar_company_rule,
     "imdb_ttcode_format": _chk_imdb_ttcode_format,
     "lookup_imdb_ttcode_from_title": _chk_imdb_ttcode_format,      # alias

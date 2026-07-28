@@ -281,27 +281,35 @@ def resolve_metacritic(title, is_movie=True, candidate=None, curated=False):
       definitive 404/410.
     * guessed candidate (slugged title, e.g. from the BOM calendar service):
       kept ONLY when the page verifiably returns 200.
-    * fallback: slug the title and try /movie/ then /tv/ (order depends on
-      the title type); again only a verified 200 is accepted.
+    * fallback: slug the title and try /movie/ only; again only a verified 200
+      is accepted.
+
+    Business rule: for both Movies and TV Shows only a MOVIE Metacritic URL
+    (/movie/, or a /m/ path) is valid. A /tv/ URL is never accepted -- a curated
+    /tv/ candidate is dropped and the /tv/ fallback is not attempted.
     """
     if not VALIDATE_URLS:
-        return candidate or ""
-    if candidate:
+        return "" if _is_tv_metacritic(candidate) else (candidate or "")
+    if candidate and not _is_tv_metacritic(candidate):
         alive = _mc_alive(candidate)
         if alive or (curated and alive is None):
             return candidate
     slug = _mc_slug(title)
     if not slug:
         return ""
-    sections = ("movie", "tv") if is_movie else ("tv", "movie")
-    for sec in sections:
-        url = "https://www.metacritic.com/%s/%s/" % (sec, slug)
-        if candidate and url.rstrip("/") == str(candidate).replace(
-                "http://", "https://").rstrip("/"):
-            continue  # already tried above
-        if _mc_alive(url):
-            return "http://www.metacritic.com/%s/%s/" % (sec, slug)
+    # Only the /movie/ path is valid (for Movies AND TV Shows); never /tv/.
+    url = "https://www.metacritic.com/movie/%s/" % slug
+    if candidate and url.rstrip("/") == str(candidate).replace(
+            "http://", "https://").rstrip("/"):
+        return candidate if _mc_alive(candidate) else ""
+    if _mc_alive(url):
+        return "http://www.metacritic.com/movie/%s/" % slug
     return ""
+
+
+def _is_tv_metacritic(url):
+    """A /tv/ Metacritic URL is not valid under the movie-only business rule."""
+    return "/tv/" in str(url or "").lower()
 
 
 # ---------------- social account liveness ----------------
@@ -997,22 +1005,38 @@ def wikidata_meta(title, qid=None, is_movie=True):
 _GENDER_QIDS = {"Q6581097": "Gender - Man", "Q6581072": "Gender - Woman"}
 
 
-def fetch_person(name, qid=None):
+def fetch_person(name, qid=None, profession=""):
     """Auto-discover a PERSON (talent) via Wikidata + IMDb suggestion API.
     Returns: socials, wikipedia_page, imdb_id (nm), gender line, occupation
     labels, sport labels, us_citizen flag. Fails soft ({}).
+
     When qid is given the candidate search is skipped and that entity is used
-    directly (handle-first resolution)."""
+    directly (handle-first resolution).
+
+    `profession` is an optional professional-details hint from Ops (e.g.
+    "Actor", "NBA player", "Musician"). It disambiguates people who share a
+    name -- the candidate whose Wikidata description matches the hint wins --
+    and seeds the occupation used for talent classification when Wikidata has
+    none, so the right social accounts are fetched. Ignored when qid is given
+    (an explicit entity needs no disambiguation).
+    """
     if not name and not qid:
         return {}
     clean = re.sub(r"\s*-\s*DAR\s*$", "", name or "", flags=re.IGNORECASE).strip()
     clean, _ = _split_disambiguator(clean)
-    key = ("person:qid:" + qid,) if qid else ("person:" + clean.lower(),)
+    hint = "" if qid else _norm(profession)
+    # cache key includes the hint so "John Smith" + "actor" and + "chef" differ
+    key = (("person:qid:" + qid,) if qid
+           else ("person:" + clean.lower() + ("|" + hint if hint else ""),))
     if key in _CACHE:
         return dict(_CACHE[key])
     meta = {}
     try:
+        # An explicit qid wins outright (handle-first resolution). Otherwise
+        # collect human candidates and choose: a name match wins first, and
+        # among those the one whose description matches the profession hint.
         entity = _entity(qid) if qid else None
+        candidates = []  # (name_match, hint_match, entity)
         for cand in ([] if qid else _search_candidates(clean, limit=6)[:4]):
             ent = _entity(cand)
             if not ent:
@@ -1021,12 +1045,18 @@ def fetch_person(name, qid=None):
             if "Q5" not in set(_claim_values(claims, "P31")):
                 continue  # not a human
             lbl = (ent.get("labels", {}).get("en", {}) or {}).get("value", "")
-            if _norm(lbl) == _norm(clean) or any(
-                    _norm(a.get("value")) == _norm(clean)
-                    for a in ent.get("aliases", {}).get("en", [])):
-                entity = ent
-                break
-            entity = entity or ent  # weak fallback: first human hit
+            name_match = _norm(lbl) == _norm(clean) or any(
+                _norm(a.get("value")) == _norm(clean)
+                for a in ent.get("aliases", {}).get("en", []))
+            desc = _norm((ent.get("descriptions", {}).get("en", {}) or {}).get("value", ""))
+            hint_match = bool(hint and hint in desc)
+            candidates.append((name_match, hint_match, ent))
+            if name_match and (hint_match or not hint):
+                break  # best possible for this hint -- stop early
+        if entity is None and candidates:
+            # prefer name match, then profession-hint match
+            candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+            entity = candidates[0][2]
         if entity is not None:
             claims = entity.get("claims", {})
             raw = {}
@@ -1075,6 +1105,12 @@ def fetch_person(name, qid=None):
                     break
     except Exception as e:  # noqa: BLE001
         log.warning("fetch_person failed for %r: %s", name, e)
+    # Seed the Ops-provided profession so talent classification has something to
+    # work with when Wikidata returned no occupation (keeps the hint authoritative).
+    if profession and profession.strip():
+        meta["profession"] = profession.strip()
+        if not meta.get("occupations"):
+            meta["occupations"] = [profession.strip()]
     verify_socials(meta)
     _CACHE[key] = dict(meta)
     return meta
