@@ -281,35 +281,42 @@ def resolve_metacritic(title, is_movie=True, candidate=None, curated=False):
       definitive 404/410.
     * guessed candidate (slugged title, e.g. from the BOM calendar service):
       kept ONLY when the page verifiably returns 200.
-    * fallback: slug the title and try /movie/ only; again only a verified 200
-      is accepted.
-
-    Business rule: for both Movies and TV Shows only a MOVIE Metacritic URL
-    (/movie/, or a /m/ path) is valid. A /tv/ URL is never accepted -- a curated
-    /tv/ candidate is dropped and the /tv/ fallback is not attempted.
+    * fallback: slug the title and try /movie/ then /tv/ (order depends on
+      the title type); again only a verified 200 is accepted.
     """
     if not VALIDATE_URLS:
-        return "" if _is_tv_metacritic(candidate) else (candidate or "")
-    if candidate and not _is_tv_metacritic(candidate):
+        return candidate or ""
+    if candidate:
         alive = _mc_alive(candidate)
         if alive or (curated and alive is None):
             return candidate
     slug = _mc_slug(title)
     if not slug:
         return ""
-    # Only the /movie/ path is valid (for Movies AND TV Shows); never /tv/.
-    url = "https://www.metacritic.com/movie/%s/" % slug
-    if candidate and url.rstrip("/") == str(candidate).replace(
-            "http://", "https://").rstrip("/"):
-        return candidate if _mc_alive(candidate) else ""
-    if _mc_alive(url):
-        return "http://www.metacritic.com/movie/%s/" % slug
+    sections = ("movie", "tv") if is_movie else ("tv", "movie")
+    for sec in sections:
+        url = "https://www.metacritic.com/%s/%s/" % (sec, slug)
+        if candidate and url.rstrip("/") == str(candidate).replace(
+                "http://", "https://").rstrip("/"):
+            continue  # already tried above
+        if _mc_alive(url):
+            return "http://www.metacritic.com/%s/%s/" % (sec, slug)
     return ""
 
 
-def _is_tv_metacritic(url):
-    """A /tv/ Metacritic URL is not valid under the movie-only business rule."""
+def is_tv_rottentomatoes(url):
+    """Business rule (Movies & TV Shows): only a MOVIE Rotten Tomatoes URL --
+    one containing /m/ -- is accepted. A /tv/ path is never valid, so such a
+    value is dropped rather than shipped to Ops."""
     return "/tv/" in str(url or "").lower()
+
+
+def clean_rottentomatoes(url):
+    """Return the RT URL if it satisfies the movie-only (/m/) rule, else ''."""
+    u = str(url or "").strip()
+    if not u or is_tv_rottentomatoes(u):
+        return ""
+    return u
 
 
 # ---------------- social account liveness ----------------
@@ -936,7 +943,12 @@ def wikidata_meta(title, qid=None, is_movie=True):
             raw[key] = v[0]
     meta = {}
     if "rottentomatoes" in raw:
-        meta["rottentomatoes"] = "http://www.rottentomatoes.com/" + raw["rottentomatoes"]
+        # movie-only rule: a /tv/ RT path is not accepted, so drop it rather
+        # than emit an invalid URL (leaves a blank cell Ops can fill).
+        _rt = clean_rottentomatoes(
+            "http://www.rottentomatoes.com/" + raw["rottentomatoes"])
+        if _rt:
+            meta["rottentomatoes"] = _rt
     if "metacritic" in raw:
         meta["metacritic"] = "http://www.metacritic.com/" + raw["metacritic"].strip("/") + "/"
     if "imdb" in raw:
