@@ -1017,6 +1017,147 @@ def wikidata_meta(title, qid=None, is_movie=True):
 _GENDER_QIDS = {"Q6581097": "Gender - Man", "Q6581072": "Gender - Woman"}
 
 
+# ---- profession hint ("Talent professional details" from Ops) -------------
+# Ops type these freehand: "Football Player", "NBA basketball", "soccer
+# player", "musician". The first implementation matched them with
+#     hint = _norm(profession); hint_match = hint in _norm(description)
+# but _norm() strips spaces as well as punctuation, so "NBA basketball"
+# became "nbabasketball" and was tested against "americanbasketballplayer" --
+# never a substring. Every multi-word hint silently failed and only bare
+# single words that appear verbatim in a Wikidata description ("musician")
+# ever worked. We tokenise the hint instead and expand league/colloquial
+# shorthand into the vocabulary Wikidata actually uses in its labels.
+_HINT_STOPWORDS = {
+    "a", "an", "and", "at", "for", "in", "of", "on", "or", "the",
+    "player", "players", "playing", "plays", "professional", "pro",
+    "former", "ex", "retired", "current", "star", "famous", "celebrity",
+    "personality", "person", "people", "talent", "career", "detail",
+    "details", "league", "team", "club", "sport", "sports",
+}
+
+# shorthand -> terms that appear in Wikidata P106/P641 labels & descriptions
+_HINT_ALIASES = {
+    "nba": ["basketball"],
+    "wnba": ["basketball"],
+    "nfl": ["american football"],
+    "mlb": ["baseball"],
+    "nhl": ["ice hockey", "hockey"],
+    "mls": ["association football", "soccer"],
+    "fifa": ["association football", "soccer"],
+    "epl": ["association football", "soccer"],
+    "premier": ["association football", "soccer"],
+    "soccer": ["association football", "soccer"],
+    "footballer": ["football", "association football"],
+    "gridiron": ["american football"],
+    "f1": ["formula one", "racing driver", "motorsport"],
+    "nascar": ["racing driver", "motorsport"],
+    "ufc": ["mixed martial arts"],
+    "mma": ["mixed martial arts"],
+    "wwe": ["professional wrestling"],
+    "wrestler": ["professional wrestling", "wrestling"],
+    "boxer": ["boxer", "boxing"],
+    "singer": ["singer", "musician"],
+    "rapper": ["rapper", "musician"],
+    "musician": ["musician", "singer", "songwriter", "composer"],
+    "dj": ["disc jockey", "record producer"],
+    "actress": ["actor"],
+    "filmmaker": ["film director", "director", "film producer"],
+    "youtuber": ["youtuber", "internet celebrity"],
+    "influencer": ["influencer", "internet celebrity"],
+    "streamer": ["streamer", "internet celebrity"],
+    "presenter": ["television presenter", "presenter"],
+    "host": ["television presenter", "radio host", "presenter"],
+    "anchor": ["journalist", "news presenter"],
+    "author": ["author", "writer"],
+    "businessman": ["businessperson", "entrepreneur"],
+    "businesswoman": ["businessperson", "entrepreneur"],
+    "ceo": ["businessperson", "entrepreneur"],
+    "athlete": ["athlete", "sportsperson"],
+}
+
+
+# What to do when a profession hint matches nobody:
+#   * several people share the name -> ALWAYS blank + flag. We cannot tell which
+#     one Ops meant, and a wrong IMDb id is expensive to unpick downstream.
+#   * exactly one person has the name -> keep them, flag for review. There is no
+#     rival to confuse them with, and freehand hints ("bassist", "Beatle") often
+#     just do not echo Wikidata's wording. Set this True to blank those too.
+STRICT_UNIQUE_HINT = os.getenv("STRICT_UNIQUE_HINT", "0") == "1"
+
+
+def _clean_person_name(name):
+    """Strip stray leading/trailing punctuation that comes in with pasted
+    lists -- "Bill Murray:" must look up (and export) as "Bill Murray".
+    Interior punctuation and a trailing period are preserved so "Martin
+    Luther King Jr." and "Anna-Maria O'Brien" survive intact."""
+    s = (name or "").strip()
+    s = re.sub(r"^[\s\-–—:;,.|/\\*#>\"']+", "", s)
+    s = re.sub(r"[\s\-–—:;,|/\\*#\"']+$", "", s)
+    return re.sub(r"\s{2,}", " ", s).strip()
+
+
+def _fold(s):
+    """Lowercase and ASCII-fold, keeping word boundaries. Deleting non-ASCII
+    outright turned "Fútbol" into "tbol" and guaranteed a false rejection."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(s or "")).encode(
+        "ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9\s]", " ", s.lower())
+
+
+def _hint_terms(hint):
+    """Expand a freehand profession hint into lowercase match terms.
+    Multi-word terms ("american football") are kept whole so they can be
+    matched as phrases. Returns [] for a blank or content-free hint."""
+    raw = _fold(hint)
+    words = [w for w in raw.split() if w]
+    terms = []   # ORDER MATTERS: callers walk these in priority order, so
+                 # _HINT_ALIASES' own ordering must survive (for "host",
+                 # "television presenter" has to come before "radio host").
+
+    def _add(t):
+        if t and t not in terms:
+            terms.append(t)
+    for w in words:
+        if w in _HINT_ALIASES:
+            for a in _HINT_ALIASES[w]:
+                _add(a)
+            _add(w)
+        elif w not in _HINT_STOPWORDS and len(w) > 2:
+            _add(w)
+    kept = [w for w in words if w not in _HINT_STOPWORDS and len(w) > 2]
+    if len(kept) > 1:
+        _add(" ".join(kept))
+    return terms
+
+
+def _hint_haystack(ent, extra_labels=()):
+    """Lowercase text a hint is scored against: the English description plus
+    the resolved occupation (P106) and sport (P641) labels. The description
+    alone is far too thin -- it is terse for some people and absent for
+    others, which is why hint matching had nothing to bite on."""
+    parts = []
+    if ent:
+        d = (ent.get("descriptions", {}).get("en", {}) or {}).get("value", "")
+        if d:
+            parts.append(str(d))
+    parts.extend(str(x) for x in extra_labels if x)
+    return _fold(" ".join(parts))
+
+
+def _hint_score(terms, haystack):
+    """How strongly a candidate supports the profession hint: whole-word hits,
+    multi-word phrases weighted double. 0 == the hint is unsupported, which is
+    treated as "not this person" rather than "close enough"."""
+    if not terms or not haystack:
+        return 0
+    score = 0
+    for t in terms:
+        if re.search(r"\b" + re.escape(t) + r"\b", haystack):
+            score += 2 if " " in t else 1
+    return score
+
+
 def fetch_person(name, qid=None, profession=""):
     """Auto-discover a PERSON (talent) via Wikidata + IMDb suggestion API.
     Returns: socials, wikipedia_page, imdb_id (nm), gender line, occupation
@@ -1026,49 +1167,172 @@ def fetch_person(name, qid=None, profession=""):
     directly (handle-first resolution).
 
     `profession` is an optional professional-details hint from Ops (e.g.
-    "Actor", "NBA player", "Musician"). It disambiguates people who share a
-    name -- the candidate whose Wikidata description matches the hint wins --
-    and seeds the occupation used for talent classification when Wikidata has
-    none, so the right social accounts are fetched. Ignored when qid is given
-    (an explicit entity needs no disambiguation).
+    "Actor", "NBA basketball", "soccer player"). It is the PRIMARY
+    discriminator between people who share a name: the hint is expanded into
+    match terms and scored against each candidate's description, occupations
+    (P106) and sports (P641). The hint is also fed into the Wikidata search so
+    the intended person actually enters the candidate pool. Ignored when qid is
+    given (an explicit entity needs no disambiguation).
+
+    When a hint is supplied and NO candidate supports it, the lookup returns
+    `needs_review` with no discovered ids instead of falling back to the most
+    prominent same-name person -- a wrong IMDb id costs far more to unpick
+    downstream than a blank cell costs to fill in.
     """
     if not name and not qid:
         return {}
     clean = re.sub(r"\s*-\s*DAR\s*$", "", name or "", flags=re.IGNORECASE).strip()
+    clean = _clean_person_name(clean)
     clean, _ = _split_disambiguator(clean)
-    hint = "" if qid else _norm(profession)
-    # cache key includes the hint so "John Smith" + "actor" and + "chef" differ
-    key = (("person:qid:" + qid,) if qid
-           else ("person:" + clean.lower() + ("|" + hint if hint else ""),))
+    clean = _clean_person_name(clean)
+    hint_raw = "" if qid else (profession or "").strip()
+    hint_terms = _hint_terms(hint_raw)
+    # Tuple key, not concatenation: a name containing '|' would otherwise
+    # collide with a name+hint key.
+    # Include the RAW hint: "soccer" and "soccer player" expand to the same
+    # terms, but each must keep its own review wording and its own search.
+    key = (("person:qid", qid) if qid
+           else ("person", clean.lower(), hint_raw.lower(), tuple(hint_terms)))
     if key in _CACHE:
         return dict(_CACHE[key])
     meta = {}
+    hint_matched = False
+    hint_unconfirmed = False  # entity kept, but the hint did not corroborate it
+    had_candidates = False    # any SAME-NAME human found at all
+    n_named = 0               # how many same-name humans were seen
+    label_map = {}
     try:
-        # An explicit qid wins outright (handle-first resolution). Otherwise
-        # collect human candidates and choose: a name match wins first, and
-        # among those the one whose description matches the profession hint.
+        # An explicit qid wins outright (handle-first resolution). If that fetch
+        # fails we must NOT fall back to a name search -- adopting whoever
+        # shares the name is worse than returning nothing.
         entity = _entity(qid) if qid else None
-        candidates = []  # (name_match, hint_match, entity)
-        for cand in ([] if qid else _search_candidates(clean, limit=6)[:4]):
-            ent = _entity(cand)
-            if not ent:
-                continue
-            claims = ent.get("claims", {})
-            if "Q5" not in set(_claim_values(claims, "P31")):
-                continue  # not a human
-            lbl = (ent.get("labels", {}).get("en", {}) or {}).get("value", "")
-            name_match = _norm(lbl) == _norm(clean) or any(
-                _norm(a.get("value")) == _norm(clean)
-                for a in ent.get("aliases", {}).get("en", []))
-            desc = _norm((ent.get("descriptions", {}).get("en", {}) or {}).get("value", ""))
-            hint_match = bool(hint and hint in desc)
-            candidates.append((name_match, hint_match, ent))
-            if name_match and (hint_match or not hint):
-                break  # best possible for this hint -- stop early
-        if entity is None and candidates:
-            # prefer name match, then profession-hint match
-            candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
-            entity = candidates[0][2]
+        if not qid:
+            # Hint-qualified queries go FIRST. The intended person is often
+            # outside the top hits for the bare name (for "David Lee" the other
+            # David Lees crowd it out), and the candidate caps below would trim
+            # the hint results away if the bare-name hits were queued ahead.
+            searches = []
+            if hint_terms:      # a hint of only stopwords must not steer the
+                                # search, or it biases without being scorable
+                searches.append(clean + " " + hint_raw)
+                searches.extend(clean + " " + t for t in hint_terms if " " in t)
+            seen_q, queries = set(), []
+            for s in searches[:2]:             # Wikidata search is case-
+                k = " ".join(s.lower().split())  # insensitive: dedupe on that
+                if k and k not in seen_q:
+                    seen_q.add(k)
+                    queries.append(s)
+            # The bare name is ALWAYS searched, never truncated away: it is the
+            # only query guaranteed to surface the same-name people, and
+            # had_candidates / the hard-fail decision depend on seeing them.
+            if " ".join(clean.lower().split()) not in seen_q:
+                queries.append(clean)
+            # Round-robin the per-query results so a hint query returning many
+            # hits cannot starve the bare-name query (or vice versa) once the
+            # candidate cap bites.
+            per_query = [_search_candidates(s, limit=8) for s in queries]
+            cand_qids = []
+            for i in range(max((len(p) for p in per_query), default=0)):
+                for p in per_query:
+                    if i < len(p) and p[i] not in cand_qids:
+                        cand_qids.append(p[i])
+            humans = []  # (entity, name_match, occ_qids, sport_qids)
+            for c in cand_qids[:12]:
+                ent = _entity(c)
+                if not ent:
+                    continue
+                claims = ent.get("claims", {})
+                if "Q5" not in set(_claim_values(claims, "P31")):
+                    continue  # not a human
+                lbl = (ent.get("labels", {}).get("en", {}) or {}).get("value", "")
+                name_match = _norm(lbl) == _norm(clean) or any(
+                    _norm(a.get("value")) == _norm(clean)
+                    for a in ent.get("aliases", {}).get("en", []))
+                humans.append((ent, name_match,
+                               _claim_values(claims, "P106")[:12],
+                               _claim_values(claims, "P641")[:4]))
+                if not hint_terms and name_match:
+                    break        # no hint: first name match wins, as before
+                if len(humans) >= 6:
+                    break
+            had_candidates = any(h[1] for h in humans)
+            # Resolve every candidate's occupation/sport labels in ONE batched
+            # call so hint scoring can see them without a request per person.
+            if hint_terms and humans:
+                want = []
+                for _ent, _nm, occ, spo in humans:
+                    for q in occ + spo:
+                        if q not in want:
+                            want.append(q)
+                label_map = _labels(want[:50])
+            scored = []  # (hint_score, name_match, entity)
+            for ent, name_match, occ, spo in humans:
+                hay = _hint_haystack(ent, [label_map.get(q) for q in occ + spo])
+                scored.append((_hint_score(hint_terms, hay), name_match, ent))
+            if scored:
+                if hint_terms:
+                    # The hint decides BETWEEN same-name people; it must never
+                    # promote a differently-named person, or searching
+                    # "Mark Wahlberg soccer player" can return a footballer
+                    # called Mark Walberg. Name match is a hard filter here.
+                    named = [c for c in scored if c[1]]
+                    named.sort(key=lambda c: c[0], reverse=True)
+                    n_named = len(named)
+                    if named and named[0][0] > 0:
+                        hint_matched = True
+                        entity = named[0][2]
+                    elif n_named == 1 and not STRICT_UNIQUE_HINT:
+                        # Only ONE person has this name, so there is no rival to
+                        # confuse them with and nothing for the hint to
+                        # disambiguate. Ops hints are freehand ("bassist",
+                        # "Beatle") and often do not echo Wikidata's wording --
+                        # discarding a unique, unambiguous person over that
+                        # would make the hint actively harmful. Keep them, but
+                        # flag it and do not classify from the unmatched hint.
+                        entity = named[0][2]
+                        hint_unconfirmed = True
+                    else:
+                        entity = None
+                else:
+                    scored.sort(key=lambda c: c[1], reverse=True)
+                    entity = scored[0][2]
+        if entity is None and hint_terms and had_candidates:
+            # Several people share this name and none support the professional
+            # details, so picking the most prominent is a coin flip on the wrong
+            # person. Return nothing and flag it rather than export a wrong id.
+            meta["needs_review"] = True
+            meta["review_reason"] = (
+                "Found %d people named '%s' but none match the professional "
+                "details '%s' - check the spelling or the profession."
+                % (n_named, clean, hint_raw))
+            meta["profession"] = hint_raw
+            meta["hint_matched"] = False
+            # The hint was actively contradicted by every candidate, so it must
+            # not be used to classify either -- otherwise a rejected "soccer
+            # player" still stamps the row "Athlete - Soccer".
+            meta["hint_rejected"] = True
+            _CACHE[key] = dict(meta)
+            return dict(meta)
+        if entity is None and hint_terms:
+            # Nobody of this name in Wikidata at all: there is no rival
+            # candidate for the hint to contradict, so fall through to the
+            # normal no-hint path (IMDb suggestion + hint-seeded occupation).
+            # Supplying professional details must never return LESS than
+            # omitting them. Still flagged, so Ops verify before ingestion.
+            meta["needs_review"] = True
+            meta["review_reason"] = (
+                "No Wikidata entry for '%s' - details below come from an "
+                "exact IMDb name match only and are unverified." % clean)
+        elif hint_unconfirmed:
+            # Unique same-name person kept despite an unmatched hint.
+            meta["needs_review"] = True
+            meta["review_reason"] = (
+                "Only one person is named '%s', so their details were used, but "
+                "nothing about them matches the professional details '%s' - "
+                "confirm this is the right person."
+                % (clean, hint_raw))
+            # Classification must come from Wikidata, not the unmatched hint.
+            meta["hint_rejected"] = True
         if entity is not None:
             claims = entity.get("claims", {})
             raw = {}
@@ -1103,7 +1367,12 @@ def fetch_person(name, qid=None, profession=""):
                     break
             occ_qids = _claim_values(claims, "P106")[:12]
             sport_qids = _claim_values(claims, "P641")[:4]
-            labels = _labels(occ_qids + sport_qids)
+            # Reuse the batched candidate-scoring labels; only ask for the ones
+            # we have not already resolved.
+            labels = dict(label_map)
+            missing = [q for q in occ_qids + sport_qids if q not in labels]
+            if missing:
+                labels.update(_labels(missing))
             meta["occupations"] = [labels[q] for q in occ_qids if labels.get(q)]
             meta["sports"] = [labels[q] for q in sport_qids if labels.get(q)]
             meta["us_citizen"] = "Q30" in set(_claim_values(claims, "P27"))
@@ -1117,12 +1386,14 @@ def fetch_person(name, qid=None, profession=""):
                     break
     except Exception as e:  # noqa: BLE001
         log.warning("fetch_person failed for %r: %s", name, e)
-    # Seed the Ops-provided profession so talent classification has something to
-    # work with when Wikidata returned no occupation (keeps the hint authoritative).
-    if profession and profession.strip():
-        meta["profession"] = profession.strip()
-        if not meta.get("occupations"):
-            meta["occupations"] = [profession.strip()]
+    # Keep the Ops hint on the payload for classification, but never overwrite
+    # occupations discovered from Wikidata -- classification decides which of
+    # the two wins (hint first, then P106 order), not this function.
+    if hint_raw:
+        meta["profession"] = hint_raw
+        meta["hint_matched"] = bool(hint_matched)
+        if not meta.get("occupations") and not meta.get("hint_rejected"):
+            meta["occupations"] = [hint_raw]
     verify_socials(meta)
     _CACHE[key] = dict(meta)
     return meta
