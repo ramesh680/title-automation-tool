@@ -804,23 +804,123 @@ _TALENT_SPORT_ALIAS = {
 }
 
 
+# A hint can name a sport without describing an athlete. "basketball coach",
+# "NFL commentator" and "golf writer" must not export as Talent Type - Athlete.
+_NON_ATHLETE_ROLES = (
+    'coach', 'manager', 'commentator', 'analyst', 'pundit', 'presenter',
+    'anchor', 'host', 'journalist', 'reporter', 'writer', 'author',
+    'broadcaster', 'promoter', 'agent', 'executive', 'owner', 'referee',
+    'umpire', 'official', 'trainer', 'scout', 'physio', 'doctor',
+    'announcer', 'blogger', 'podcaster', 'youtuber', 'influencer',
+)
+
+
+def _hint_terms_for(hint):
+    """Expanded hint terms, via the resolver's expansion when importable."""
+    try:
+        from metadata_fetcher import _hint_terms
+        return _hint_terms(hint)
+    except Exception:
+        return [w for w in str(hint or '').lower().replace('-', ' ').split()
+                if w]
+
+
+def _hint_sport(hint):
+    """Template sport term named by an Ops profession hint, or ''.
+    Runs the hint through the same expansion the resolver uses, so "NBA
+    basketball" and "soccer player" land on 'Basketball' / 'Soccer'."""
+    if not hint:
+        return ''
+    low = str(hint).lower()
+    if any(r in low for r in _NON_ATHLETE_ROLES):
+        return ''      # names a sport, but describes a non-playing role
+    terms = _hint_terms_for(hint)
+    tset = set(terms)
+    # longest alias keys first so 'american football' beats bare 'football'
+    for label in sorted(_TALENT_SPORT_ALIAS, key=len, reverse=True):
+        if label in tset:
+            return _TALENT_SPORT_ALIAS[label]
+    for label in sorted(_TALENT_SPORT_ALIAS, key=len, reverse=True):
+        if any(label in t for t in terms):
+            return _TALENT_SPORT_ALIAS[label]
+    # Bare "football" is deliberately NOT resolved here: it means soccer in most
+    # of the world and gridiron in the US. Leave it to the resolved person's own
+    # P641 sport claim rather than guessing a subtype we may have to unpick.
+    return ''
+
+
+def _occ_entry(occ):
+    """First _TALENT_OCC_MAP entry matching one occupation label, or None."""
+    o = str(occ).lower()
+    for kw, typ, skind, sterm in _TALENT_OCC_MAP:
+        if kw in o:
+            return (typ, skind, sterm)
+    return None
+
+
 def _talent_classify(metadata):
-    """(talent_type_line, subtype_line) from discovered occupations/sports."""
+    """(talent_type_line, subtype_line) from the Ops profession hint first,
+    then discovered occupations/sports.
+
+    Occupation priority used to be the position of a keyword in
+    _TALENT_OCC_MAP, which is hand-ordered with 'rapper'/'singer' above
+    'actor'. That silently misclassified anyone with a side career -- Mark
+    Wahlberg came back "Musician - Rapper" because Wikidata lists rapper
+    among his occupations at all. We now walk the occupations in the order
+    WIKIDATA returns them (P106 is roughly prominence-ordered) and take the
+    first that maps to a known type, so the person's primary trade wins.
+    """
     occs = [str(o).lower() for o in (metadata.get('occupations') or [])]
     sports = [str(s).lower() for s in (metadata.get('sports') or [])]
     gender = str(metadata.get('gender') or '')
+    hint = str(metadata.get('profession') or '').strip()
+    if metadata.get('hint_rejected'):
+        hint = ''   # every candidate contradicted it; do not classify from it
     ttype = subtype = ''
-    if sports:
+
+    # 1) the Ops-supplied professional details win when they name a type or a
+    #    sport -- that is the entire point of collecting them.
+    if hint:
+        hsport = _hint_sport(hint)
+        if hsport:
+            ttype = 'Athlete'
+            subtype = (_tref().talent_subtype_for('Athlete', hsport)
+                       if _tref() else '') or \
+                f"Talent Subtype - Athlete - {hsport}"
+        else:
+            # Match the EXPANDED terms, not the raw string: otherwise
+            # "actress"/"DJ"/"TV host" never hit _TALENT_OCC_MAP and the whole
+            # non-sport half of the alias table goes unused.
+            hit = None
+            for t in [hint] + _hint_terms_for(hint):
+                hit = _occ_entry(t)
+                if hit:
+                    break
+            if hit:
+                ttype, skind, sterm = hit
+                if skind and sterm:
+                    subtype = (_tref().talent_subtype_for(skind, sterm)
+                               if _tref() else '') or \
+                        f"Talent Subtype - {skind} - {sterm}"
+
+    # 2) otherwise fall back to what Wikidata discovered. A sport-adjacent hint
+    #    ("basketball coach") suppresses the P641 shortcut too -- most coaches
+    #    and commentators carry a sport claim, so without this the guard above
+    #    would be bypassed one line later.
+    hint_is_non_athlete = bool(hint) and any(
+        r in hint.lower() for r in _NON_ATHLETE_ROLES)
+    if not ttype and sports and not hint_is_non_athlete:
         ttype = 'Athlete'
         term = _TALENT_SPORT_ALIAS.get(sports[0], sports[0].title())
         if _tref():
             subtype = _tref().talent_subtype_for('Athlete', term)
         if not subtype:
             subtype = f"Talent Subtype - Athlete - {term}"
-    else:
-        for kw, typ, skind, sterm in _TALENT_OCC_MAP:
-            if any(kw in o for o in occs):
-                ttype = typ
+    elif not ttype:
+        for o in occs:                       # Wikidata's own order, not ours
+            hit = _occ_entry(o)
+            if hit:
+                ttype, skind, sterm = hit
                 if skind and sterm:
                     subtype = (_tref().talent_subtype_for(skind, sterm)
                                if _tref() else '') or \
@@ -840,14 +940,19 @@ def create_talent_row(title, metadata=None):
     Values present in `metadata` always win over computed defaults."""
     metadata = metadata or {}
     clean_name = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
+    clean_name = _clean_title_text(clean_name)
     out_title = f"{clean_name} - DAR"   # talent brands are DAR rows
+    _review = bool(metadata.get('needs_review'))
 
     # sub-category: Subtype \n Gender \n Talent Type (template CONCAT order)
     _sub = str(metadata.get('title_sub_category') or '').strip()
     if not _sub:
         ttype_line, subtype_line = _talent_classify(metadata)
-        if not ttype_line:
-            ttype_line = 'Talent Type - Media Personality'  # template default
+        if not ttype_line and not _review:
+            # Template default. Deliberately NOT applied to unresolved rows:
+            # stamping "Media Personality" on a person we could not identify
+            # turns a visible gap into an invisible wrong answer.
+            ttype_line = 'Talent Type - Media Personality'
         gender_line = str(metadata.get('gender') or '').strip()
         _sub = "\n".join(x for x in (subtype_line, gender_line, ttype_line) if x)
 
@@ -900,6 +1005,14 @@ def create_talent_row(title, metadata=None):
         'youtube_search_terms': metadata.get('youtube_search_terms', ''),
         'url_managers': metadata.get('url_managers', ''),
     }
+    if _review:
+        # Underscore keys are stripped by the reindex(columns=...) in
+        # _rows_to_workbook, so the 38-column BrandDef schema is untouched --
+        # they only feed the separate 'Needs Review' sheet and the preview.
+        row['_needs_review'] = True
+        row['_review_reason'] = str(metadata.get('review_reason') or
+                                    'Could not resolve this person.')
+        row['_review_profession'] = str(metadata.get('profession') or '')
     return row
 
 
@@ -1419,6 +1532,17 @@ PROFESSION_COLUMNS = (
 )
 
 
+def _clean_title_text(s):
+    """Strip stray leading/trailing punctuation from a pasted title line.
+    "Bill Murray:" was exported verbatim as the brand title "Bill Murray: - DAR"
+    and never matched anything upstream. A trailing period is kept ("... Jr.")
+    and interior punctuation is untouched."""
+    s = str(s or '').strip()
+    s = re.sub(r"^[\s\-–—:;,.|/\\*#>\"']+", '', s)
+    s = re.sub(r"[\s\-–—:;,|/\\*#\"']+$", '', s)
+    return re.sub(r"\s{2,}", ' ', s).strip()
+
+
 def _row_profession(r):
     """Return the professional-details hint from an uploaded record, or ''."""
     if not isinstance(r, dict):
@@ -1438,6 +1562,12 @@ def _apply_profession(meta, profession):
     if not profession:
         return meta
     meta = dict(meta or {})
+    if meta.get('hint_rejected'):
+        # The resolver found same-name people and none matched this hint. Do
+        # not re-seed it as an occupation here or it comes back in through the
+        # side door and classifies a row we deliberately left unresolved.
+        meta.setdefault('profession', profession)
+        return meta
     meta.setdefault('profession', profession)
     if not meta.get('occupations'):
         meta['occupations'] = [profession]
@@ -1786,11 +1916,22 @@ def _rows_to_workbook(rows):
     else:
         sheets = [('Sheet1', movies, COLUMNS)]
     out = BytesIO()
+    # Rows the resolver could not confirm get their own sheet so Ops can see
+    # them at a glance. The ingestion sheets keep their exact column sets.
+    review = [r for r in rows if isinstance(r, dict) and r.get('_needs_review')]
     with pd.ExcelWriter(out, engine='openpyxl') as xw:
         for name, rws, cols in sheets:
             df = pd.DataFrame(rws).reindex(columns=cols)
             df = df.where(pd.notnull(df), '')
             df.to_excel(xw, sheet_name=name, index=False)
+        if review:
+            rdf = pd.DataFrame([{
+                'title': r.get('title', ''),
+                'title_category': r.get('title_category', ''),
+                'professional_details': r.get('_review_profession', ''),
+                'why_flagged': r.get('_review_reason', ''),
+            } for r in review])
+            rdf.to_excel(xw, sheet_name='Needs Review', index=False)
     out.seek(0)
     return out
 
@@ -1887,6 +2028,13 @@ def _preview_payload(rows, preview_limited):
         'preview': df.head(4).to_dict('records'),
         'columns': list(df.columns),
         'preview_limited': preview_limited,
+        # rows whose professional-details hint matched nobody -- surfaced here
+        # so Ops see it in Preview rather than discovering it after ingestion
+        'needs_review': [{'title': r.get('title', ''),
+                          'profession': r.get('_review_profession', ''),
+                          'reason': r.get('_review_reason', '')}
+                         for r in rows
+                         if isinstance(r, dict) and r.get('_needs_review')],
     }
 
 
