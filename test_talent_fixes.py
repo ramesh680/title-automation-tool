@@ -125,6 +125,13 @@ class ImdbNmByName(unittest.TestCase):
         self.assertEqual(mf._pick_person_imdb("Kara Young", "nm0949743", self.KARA),
                          "nm16990294")
 
+    def test_p345_present_as_alias_but_wrong_name_is_replaced(self):
+        # nm0949743 DOES surface for "Kara Young" but IMDb names it "Mary Young"
+        cands = [{"id": "nm0949743", "l": "Mary Young"},
+                 {"id": "nm16990294", "l": "Kara Young"}]
+        self.assertEqual(mf._pick_person_imdb("Kara Young", "nm0949743", cands),
+                         "nm16990294")
+
     def test_corroborated_p345_is_kept(self):
         self.assertEqual(mf._pick_person_imdb("Kara Young", "nm16990294", self.KARA),
                          "nm16990294")

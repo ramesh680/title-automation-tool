@@ -1352,9 +1352,12 @@ def _pick_person_imdb(base, p345, cands):
     be confirmed the existing P345 is left as-is (fail-open)."""
     if not base:
         return p345
-    if p345 and any(it.get("id") == p345 for it in cands):
-        return p345
     exact = [it for it in cands if _norm(it.get("l")) == _norm(base)]
+    # keep the Wikidata P345 id ONLY if IMDb lists it under this exact name --
+    # not merely if it turns up as an alias hit (nm0949743 surfaces for "Kara
+    # Young" but IMDb names it "Mary Young", so it must not be kept).
+    if p345 and any(it.get("id") == p345 for it in exact):
+        return p345
     if exact:
         return exact[0]["id"]
     return p345
