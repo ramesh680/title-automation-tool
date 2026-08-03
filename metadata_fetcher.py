@@ -284,15 +284,20 @@ def _mc_alive(url):
     return None  # 403/429/5xx: fail open, we can't tell
 
 
-def resolve_metacritic(title, is_movie=True, candidate=None, curated=False):
+def resolve_metacritic(title, is_movie=True, candidate=None, curated=False, year=None):
     """Return a Metacritic URL that is known (or safely presumed) valid, or ''.
+
+    Release-date first (same rule as IMDb): when a release year is known, the
+    year-suffixed slug -- '.../movie/superman-2025/' -- is tried before the bare
+    slug (which is usually the oldest same-named title), so a colliding title
+    resolves to the right year's page.
 
     * curated candidate (Wikidata P1712): trusted -- dropped ONLY on a
       definitive 404/410.
     * guessed candidate (slugged title, e.g. from the BOM calendar service):
       kept ONLY when the page verifiably returns 200.
-    * fallback: slug the title and try /movie/ then /tv/ (order depends on
-      the title type); again only a verified 200 is accepted.
+    * fallback: slug the title (year-suffixed first) and try /movie/ then /tv/
+      per the title type; again only a verified 200 is accepted.
     """
     if not VALIDATE_URLS:
         return candidate or ""
@@ -303,14 +308,16 @@ def resolve_metacritic(title, is_movie=True, candidate=None, curated=False):
     slug = _mc_slug(title)
     if not slug:
         return ""
+    slugs = [f"{slug}-{year}", slug] if year else [slug]
     sections = ("movie", "tv") if is_movie else ("tv", "movie")
     for sec in sections:
-        url = "https://www.metacritic.com/%s/%s/" % (sec, slug)
-        if candidate and url.rstrip("/") == str(candidate).replace(
-                "http://", "https://").rstrip("/"):
-            continue  # already tried above
-        if _mc_alive(url):
-            return "http://www.metacritic.com/%s/%s/" % (sec, slug)
+        for sl in slugs:
+            url = "https://www.metacritic.com/%s/%s/" % (sec, sl)
+            if candidate and url.rstrip("/") == str(candidate).replace(
+                    "http://", "https://").rstrip("/"):
+                continue  # already tried above
+            if _mc_alive(url):
+                return "http://www.metacritic.com/%s/%s/" % (sec, sl)
     return ""
 
 
@@ -327,6 +334,60 @@ def clean_rottentomatoes(url):
     if not u or is_tv_rottentomatoes(u):
         return ""
     return u
+
+
+def _rt_slug(title):
+    """Slug the way Rotten Tomatoes builds /m/ movie paths (underscores)."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", title or "").encode("ascii", "ignore").decode("ascii")
+    s = s.replace("&", " and ").replace("'", "")
+    return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+
+
+def _rt_alive(url):
+    """True (200), False (definitive 404/410) or None (blocked/throttled)."""
+    status = _url_status(url.replace("http://", "https://"))
+    if status is None:
+        return None
+    if status == 200:
+        return True
+    if status in (404, 410):
+        return False
+    return None  # 403/429/5xx: fail open, we can't tell
+
+
+def resolve_rottentomatoes(title, is_movie=True, candidate=None, curated=False, year=None):
+    """Return a movie-only (/m/) Rotten Tomatoes URL, or ''.
+
+    Same rule as IMDb/Metacritic: with a known release year the year-suffixed
+    slug -- '/m/superman_2025' -- is tried before the bare slug, so a colliding
+    title resolves to the right year's page.
+
+    * curated candidate (Wikidata P1258): trusted -- dropped ONLY on a
+      definitive 404/410 (and only if it satisfies the /m/ movie-only rule).
+    * generated slug: kept ONLY when the page verifiably returns 200.
+    Business rule: a /tv/ path is never valid, so TV Shows yield ''."""
+    cand = clean_rottentomatoes(candidate)
+    if not VALIDATE_URLS:
+        return cand
+    if cand:
+        alive = _rt_alive(cand)
+        if alive or (curated and alive is None):
+            return cand
+    if not is_movie:
+        return ""  # only movie /m/ RT URLs are shipped
+    slug = _rt_slug(title)
+    if not slug:
+        return ""
+    slugs = [f"{slug}_{year}", slug] if year else [slug]
+    for sl in slugs:
+        url = "https://www.rottentomatoes.com/m/%s" % sl
+        if cand and url.rstrip("/") == str(cand).replace(
+                "http://", "https://").rstrip("/"):
+            continue
+        if _rt_alive(url):
+            return "http://www.rottentomatoes.com/m/%s" % sl
+    return ""
 
 
 # ---------------- social account liveness ----------------
@@ -1787,18 +1848,32 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
         _fill(meta, youtube_channel(title_hint))
     meta.setdefault("imdb_id", "http://www.imdb.com/title/" + tt)
 
+    # release-date first for MC & RT (same rule as IMDb): the known year picks
+    # the correct same-named title's page.
+    _yr = _year_from(meta.get("released_on"))
+
     # metacritic: verify what we found. A Wikidata URL is curated (kept unless
-    # definitively 404); the calendar service's slug guess is only kept when
-    # the page really exists; otherwise a verified slug fallback is tried.
+    # definitively 404); the calendar service's slug guess is only kept when the
+    # page really exists; otherwise a year-suffixed slug fallback is tried.
     guess = meta.pop("_metacritic_guess", None)
     curated = bool(meta.get("metacritic"))
     mc = resolve_metacritic(title_hint, is_movie,
                             candidate=meta.get("metacritic") or guess,
-                            curated=curated)
+                            curated=curated, year=_yr)
     if mc:
         meta["metacritic"] = mc
     else:
         meta.pop("metacritic", None)
+
+    # rotten tomatoes: same treatment -- trust a curated Wikidata URL, else try
+    # the year-suffixed /m/ slug; keep a generated URL only if it verifies.
+    rt = resolve_rottentomatoes(title_hint, is_movie,
+                                candidate=meta.get("rottentomatoes"),
+                                curated=bool(meta.get("rottentomatoes")), year=_yr)
+    if rt:
+        meta["rottentomatoes"] = rt
+    else:
+        meta.pop("rottentomatoes", None)
 
     # drop wrong-owner (band/artist) handles first, then dead ones
     verify_socials(meta, title_hint, reject_foreign=True)
@@ -1891,13 +1966,21 @@ def fetch_metadata(title, is_movie=True, year_hint=""):
             _fill(meta, tmdb_meta)
             _fill(meta, wikidata_meta(lookup, qid=wid, is_movie=is_movie))
             _fill(meta, omdb_lookup(lookup, want_year))
+            _yr = want_year or _year_from(meta.get("released_on"))
             mc = resolve_metacritic(lookup, is_movie,
                                     candidate=meta.get("metacritic"),
-                                    curated=bool(meta.get("metacritic")))
+                                    curated=bool(meta.get("metacritic")), year=_yr)
             if mc:
                 meta["metacritic"] = mc
             else:
                 meta.pop("metacritic", None)
+            rt = resolve_rottentomatoes(lookup, is_movie,
+                                        candidate=meta.get("rottentomatoes"),
+                                        curated=bool(meta.get("rottentomatoes")), year=_yr)
+            if rt:
+                meta["rottentomatoes"] = rt
+            else:
+                meta.pop("rottentomatoes", None)
             verify_socials(meta, lookup, reject_foreign=True)
         if sug_ptype:
             meta["program_type"] = sug_ptype  # IMDb's own type beats TMDB's
