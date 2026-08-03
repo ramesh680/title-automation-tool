@@ -144,3 +144,35 @@ class ImdbNmByName(unittest.TestCase):
 
     def test_blank_base_returns_p345(self):
         self.assertEqual(mf._pick_person_imdb("", "nm55", self.KARA), "nm55")
+
+
+class AmbiguousDisambiguation(unittest.TestCase):
+    """Two Wikipedia-notable people share the name + no profession -> flag,
+    don't guess (leave IMDb/details blank)."""
+    def _snak(self, v): return {"mainsnak": {"snaktype": "value", "datavalue": {"value": v}}}
+    def _human(self, imdb, enwiki):
+        return {"claims": {"P31": [self._snak({"id": "Q5"})],
+                           "P345": [self._snak(imdb)]},
+                "labels": {"en": {"value": "Kara Young"}}, "aliases": {"en": []},
+                "sitelinks": {"enwiki": {"title": enwiki}}}
+    def setUp(self):
+        self._e, self._c, self._l, self._gj = mf._entity, mf._search_candidates, mf._labels, mf._get_json
+        mf._CACHE.clear()
+        items = {"Qactress": self._human("nm16990294", "Kara Young (actress)"),
+                 "Qmodel":   self._human("nm0949743",  "Kara Young (model)")}
+        mf._entity = lambda q: items.get(q)
+        mf._search_candidates = lambda t, limit=6: ["Qmodel", "Qactress"]
+        mf._labels = lambda qs: {}
+        mf._get_json = lambda *a, **k: {"d": []}
+    def tearDown(self):
+        mf._entity, mf._search_candidates, mf._labels, mf._get_json = self._e, self._c, self._l, self._gj
+        mf._CACHE.clear()
+
+    def test_ambiguous_name_is_flagged_not_guessed(self):
+        meta = mf.fetch_person("Kara Young")
+        self.assertTrue(meta.get("needs_review"))
+        self.assertIn("more than one", meta.get("review_reason", ""))
+
+    def test_ambiguous_name_emits_no_imdb_id(self):
+        meta = mf.fetch_person("Kara Young")
+        self.assertNotIn("imdb_id", meta)

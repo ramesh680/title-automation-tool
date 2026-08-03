@@ -1417,6 +1417,7 @@ def fetch_person(name, qid=None, profession=""):
         return dict(_CACHE[key])
     meta = {}
     hint_matched = False
+    ambiguous = False  # name maps to 2+ notable people; do not guess
     hint_unconfirmed = False  # entity kept, but the hint did not corroborate it
     had_candidates = False    # any SAME-NAME human found at all
     n_named = 0               # how many same-name humans were seen
@@ -1512,15 +1513,27 @@ def fetch_person(name, qid=None, profession=""):
                     else:
                         entity = None
                 else:
-                    # No Ops hint: among people who actually bear this name,
-                    # pick the notable one -- the person with an English
-                    # Wikipedia article first (then most sitelinks / an IMDb
-                    # id). This stops an obscure namesake (a sports commentator
-                    # called "Kevin Hart") from being chosen over the well-known
-                    # talent, without needing a profession hint.
+                    # No Ops hint. Among the people who bear this name:
                     named = [ent for (_s, nm, ent) in scored if nm]
                     pool = named or [ent for (_s, _nm, ent) in scored]
-                    entity = max(pool, key=_person_prominence)
+                    # If TWO OR MORE are Wikipedia-notable, the bare name is a
+                    # disambiguation page (e.g. 'Kara Young' -> actress & model)
+                    # and nothing distinguishes them. Do NOT guess: flag it and
+                    # leave the ids/details blank until a profession is given.
+                    notable = [e for e in named
+                               if (e.get("sitelinks", {}) or {}).get("enwiki")]
+                    if len(notable) >= 2:
+                        ambiguous = True
+                        entity = None
+                        meta["needs_review"] = True
+                        meta["review_reason"] = (
+                            "Multiple notable people are named '%s' (Wikipedia "
+                            "lists more than one) - add a profession (e.g. "
+                            "'actress') to pick the right one." % clean)
+                    else:
+                        # otherwise prefer the notable person over an obscure
+                        # namesake (a sports commentator called 'Kevin Hart')
+                        entity = max(pool, key=_person_prominence)
         if entity is None and hint_terms and had_candidates:
             # Several people share this name and none support the professional
             # details, so picking the most prominent is a coin flip on the wrong
@@ -1607,7 +1620,7 @@ def fetch_person(name, qid=None, profession=""):
         # mislinked Wikidata P345 (e.g. nm0949743 = 'Mary Young' for 'Kara
         # Young') is replaced by the correctly-named nm rather than shipped.
         base = _person_base_name(entity, meta, clean)
-        if base:
+        if base and not ambiguous:
             m = re.search(r"nm\d+", str(meta.get("imdb_id") or ""))
             p345 = m.group(0) if m else None
             data = _get_json(IMDB_SUGGEST.format(
