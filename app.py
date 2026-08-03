@@ -2172,17 +2172,44 @@ _BAD_FB_SUGG_RE = re.compile(
 
 
 def _review_lines_ci(v):
-    """Case-folded set of lines; any '||suffix' (added-date etc.) stripped."""
+    """Case-folded set of lines; internal whitespace collapsed and any
+    '||suffix' (added-date etc.) stripped, so two values that differ only in
+    line order, spacing or capitalisation compare equal."""
     out = set()
     for ln in str(v or '').split('\n'):
-        ln = ln.strip()
+        ln = re.sub(r'\s+', ' ', ln.split('||', 1)[0]).strip().lower()
         if ln:
-            out.add(ln.split('||', 1)[0].strip().lower())
+            out.add(ln)
     return out
 
 
 def _review_slug(s):
     return re.sub(r'[^a-z0-9]+', '', str(s or '').lower())
+
+
+def _tw_handle_key(v):
+    """Normalised Twitter/X handle for case-insensitive comparison: URL prefix
+    and a leading '@' removed, lower-cased -- so 'OfficialLivePD',
+    'officiallivepd' and 'http://twitter.com/OfficialLivePD' all match."""
+    s = str(v or '').strip().lower()
+    m = re.search(r'(?:twitter|x)\.com/@?([^/?#\s]+)', s)
+    if m:
+        s = m.group(1)
+    return s.lstrip('@').strip('/')
+
+
+def _kw_terms(v):
+    """Case- and structure-insensitive fingerprint of a twitter_search_term_
+    keywords value: the set of quoted phrases plus the set of bare/@/# tokens,
+    ignoring capitalisation, the OR/or connector, parentheses, grouping and
+    pipes. Two clauses with the same terms compare equal regardless of case or
+    how the terms are parenthesised."""
+    s = str(v or '').lower()
+    phrases = frozenset(re.sub(r'\s+', ' ', p).strip()
+                        for p in re.findall(r'"([^"]*)"', s))
+    s = re.sub(r'"[^"]*"', ' ', s)
+    words = frozenset(w for w in re.findall(r'[@#]?[a-z0-9]+', s) if w != 'or')
+    return phrases, words
 
 
 def _review_compare(col, manual_raw, expected_raw, title='', cat='',
@@ -2231,6 +2258,15 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
         # reviewer: "both values are correct" -- curated terms/channels are
         # valid alternatives; only flag when the cell is empty (gap)
         return bool(mval), sugg
+
+    if c == 'twitter_handle':
+        # capitalisation is not meaningful: OfficialLivePD == officiallivepd
+        return _tw_handle_key(mval) == _tw_handle_key(eval_), sugg
+
+    if c == 'twitter_search_term_keywords':
+        # same terms in any case or grouping are equivalent ("both correct");
+        # only a genuinely different term set (or an empty cell) is flagged
+        return bool(mval) and _kw_terms(mval) == _kw_terms(eval_), sugg
 
     if c == 'genre':
         return bool(mval), sugg
