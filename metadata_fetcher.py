@@ -1330,6 +1330,21 @@ def _hint_score(terms, haystack):
     return score
 
 
+def _person_base_name(entity, meta, provided):
+    """Base name for the IMDb nm-code lookup. Rule: use the person's Wikipedia
+    article title when they have one (the canonical spelling -- it corrects a
+    mistyped/variant input and pins the search to the SAME person Wikipedia
+    identifies); with no Wikipedia page, fall back to the provided name."""
+    title = ""
+    if entity:
+        sl = (entity.get("sitelinks", {}) or {}).get("enwiki") or {}
+        title = sl.get("title") or ""
+    if not title and meta.get("wikipedia_page"):
+        title = str(meta["wikipedia_page"]).rsplit("/", 1)[-1].replace("_", " ")
+    title = re.sub(r"\s*\([^)]*\)\s*$", "", title).strip()  # drop "(actress)" etc.
+    return title or provided
+
+
 def fetch_person(name, qid=None, profession=""):
     """Auto-discover a PERSON (talent) via Wikidata + IMDb suggestion API.
     Returns: socials, wikipedia_page, imdb_id (nm), gender line, occupation
@@ -1548,14 +1563,19 @@ def fetch_person(name, qid=None, profession=""):
             meta["occupations"] = [labels[q] for q in occ_qids if labels.get(q)]
             meta["sports"] = [labels[q] for q in sport_qids if labels.get(q)]
             meta["us_citizen"] = "Q30" in set(_claim_values(claims, "P27"))
-        # IMDb nm id fallback via the suggestion API (people come back as nm...)
-        if not meta.get("imdb_id") and clean:
-            q = urllib.parse.quote(clean.strip().lower())
-            data = _get_json(IMDB_SUGGEST.format(q=q), headers=HTML_HEADERS)
-            for it in (data or {}).get("d", []):
-                if str(it.get("id", "")).startswith("nm") and _norm(it.get("l")) == _norm(clean):
-                    meta["imdb_id"] = "https://www.imdb.com/name/" + it["id"]
-                    break
+        # IMDb nm id fallback via the suggestion API (people come back as nm...).
+        # Base the search on the VERIFIED Wikipedia article name when the person
+        # has one -- the canonical spelling corrects a mistyped input (e.g.
+        # 'Kara Young') and pins it to the same person; else the provided name.
+        if not meta.get("imdb_id"):
+            base = _person_base_name(entity, meta, clean)
+            if base:
+                q = urllib.parse.quote(base.strip().lower())
+                data = _get_json(IMDB_SUGGEST.format(q=q), headers=HTML_HEADERS)
+                for it in (data or {}).get("d", []):
+                    if str(it.get("id", "")).startswith("nm") and _norm(it.get("l")) == _norm(base):
+                        meta["imdb_id"] = "https://www.imdb.com/name/" + it["id"]
+                        break
     except Exception as e:  # noqa: BLE001
         log.warning("fetch_person failed for %r: %s", name, e)
     # Keep the Ops hint on the payload for classification, but never overwrite

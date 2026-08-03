@@ -790,6 +790,11 @@ _TALENT_OCC_MAP = [
     ('athlete', 'Athlete', '', ''),
 ]
 
+# Talent Types that are usually a SECONDARY trade -- chosen only when the person
+# has no primary performing/creative occupation. Keeps e.g. Dove Cameron
+# (actor + singer + model) as Actress/Musician rather than Model.
+_SECONDARY_TALENT_TYPES = {'Model'}
+
 # discovered sport label -> template subtype term (rest matched literally)
 _TALENT_SPORT_ALIAS = {
     'association football': 'Soccer', 'american football': 'Football',
@@ -917,15 +922,26 @@ def _talent_classify(metadata):
         if not subtype:
             subtype = f"Talent Subtype - Athlete - {term}"
     elif not ttype:
-        for o in occs:                       # Wikidata's own order, not ours
+        # Walk Wikidata's own order, but let a primary trade (Actor, Musician,
+        # ...) outrank a secondary one (Model): a model who also acts or sings
+        # is classified by the headline trade, not by 'model'.
+        primary = secondary = None
+        for o in occs:
             hit = _occ_entry(o)
-            if hit:
-                ttype, skind, sterm = hit
-                if skind and sterm:
-                    subtype = (_tref().talent_subtype_for(skind, sterm)
-                               if _tref() else '') or \
-                        f"Talent Subtype - {skind} - {sterm}"
+            if not hit:
+                continue
+            if hit[0] in _SECONDARY_TALENT_TYPES:
+                secondary = secondary or hit
+            else:
+                primary = hit
                 break
+        hit = primary or secondary
+        if hit:
+            ttype, skind, sterm = hit
+            if skind and sterm:
+                subtype = (_tref().talent_subtype_for(skind, sterm)
+                           if _tref() else '') or \
+                    f"Talent Subtype - {skind} - {sterm}"
     if ttype == 'Actor' and gender == 'Gender - Woman':
         ttype = 'Actress'
     if ttype == 'Politician':
