@@ -361,11 +361,23 @@ def _facebook_alive(page):
     return _url_status(p.replace("http://", "https://")) not in (404, 410)
 
 
-def verify_socials(meta):
-    """Drop social handles that verifiably no longer exist (deleted, renamed
-    or suspended). Checks fail OPEN: a handle is only removed on a definitive
-    404 -- bot walls and rate limits never strip a valid account."""
-    if not VALIDATE_URLS or not meta:
+def verify_socials(meta, title=None, reject_foreign=False):
+    """Drop social handles that are wrong or dead.
+
+    With reject_foreign set (movies/TV), a handle whose slug signals a different
+    owner -- '...band', 'VEVO', 'Topic' -- is dropped first, so a same-named
+    band's account never rides along on a movie/show (the 'Crawlers' case).
+    Then the live check runs; it fails OPEN, removing a handle only on a
+    definitive 404 -- bot walls and rate limits never strip a valid account."""
+    if not meta:
+        return meta
+    if reject_foreign and title:
+        for k in ("twitter_handle", "instagram_user", "facebook_page"):
+            v = meta.get(k)
+            if v and _handle_foreign_to_title(v, title):
+                log.info("dropping %s %r - looks like a band/artist, not %r", k, v, title)
+                meta.pop(k, None)
+    if not VALIDATE_URLS:
         return meta
     if meta.get("twitter_handle") and not _twitter_alive(meta["twitter_handle"]):
         log.info("dropping dead twitter handle %r", meta["twitter_handle"])
@@ -559,16 +571,23 @@ def wiki_lookup(title, is_movie=True, tt=None):
             if h["title"] not in hits:
                 hits.append(h["title"])
     tl = _norm(title)
+    kind_paren = re.compile(
+        r"\([^)]*\b(film|movie|miniseries|mini-series|tv series|television series|"
+        r"tv film|television film|series)\)\s*$", re.IGNORECASE)
     for pt in hits:
         base = _norm(re.sub(r"\s*\([^)]*\)\s*$", "", pt))
         if base != tl:
             continue
         qid = _page_qid(pt)
-        if tt and qid:
-            ent = _entity(qid)
-            imdbs = _claim_values((ent or {}).get("claims", {}), "P345") if ent else []
-            if imdbs and tt not in imdbs:
+        ent = _entity(qid) if qid else None
+        if ent is not None:
+            imdbs = _claim_values(ent.get("claims", {}) or {}, "P345")
+            if tt and imdbs and tt not in imdbs:
                 continue  # same name, different film
+            # the article must be the film/TV work, not a same-named band/person
+            if not (entity_is_wanted_work(ent, is_movie, tt) or kind_paren.search(pt)):
+                log.info("wiki_lookup: skipped %r (%s) - not a %s", pt, qid, kind)
+                continue
         url = "http://en.wikipedia.org/wiki/" + pt.replace(" ", "_")
         return url, pt, qid
     return None, None, None
@@ -964,19 +983,67 @@ def _is_film_or_tv(claims):
     return bool(set(_claim_values(claims, "P31")) & FILM_TV_TYPES)
 
 
-def wikidata_meta(title, qid=None, is_movie=True):
+def _imdb_title_ids(claims):
+    """IMDb *title* ids (tt...) on a Wikidata item. A person carries nm..., so
+    this also separates a work from a same-named person."""
+    return [v for v in _claim_values(claims, "P345") if str(v).startswith("tt")]
+
+
+def entity_is_wanted_work(ent, is_movie=True, tt=None):
+    """True only when this Wikidata item really is the film/TV title being
+    ingested -- so its social handles belong to the movie/show, not a same-named
+    band, album, person or business.
+
+    Positive evidence only: P31 (instance of) is a film/TV type, or the item
+    carries an IMDb *title* id. A same-named work whose IMDb id contradicts the
+    resolved one (tt) is rejected. This is what keeps a band's Facebook /
+    Instagram / Twitter off a movie row (the 'Crawlers' case)."""
+    if not ent:
+        return False
+    claims = ent.get("claims", {}) or {}
+    ids = _imdb_title_ids(claims)
+    if tt and ids and tt not in ids:
+        return False
+    return bool(_is_film_or_tv(claims) or ids)
+
+
+# Slug tokens that signal a NON film/TV owner (a band or artist channel). A
+# movie/TV handle should not contain these unless the title itself does.
+_FOREIGN_HANDLE_MARKERS = ("band", "vevo", "topic")  # "band" already covers *bandofficial
+
+
+def _handle_foreign_to_title(handle, title):
+    """True when a social handle looks like a band/artist account rather than
+    the title -- e.g. 'crawlersband' for the movie 'Crawlers'. A marker that
+    also appears in the title (a film literally called 'The Band') is allowed."""
+    h = re.sub(r"[^a-z0-9]", "", str(handle or "").lower())
+    t = re.sub(r"[^a-z0-9]", "", str(title or "").lower())
+    if not h:
+        return False
+    return any(m in h and m not in t for m in _FOREIGN_HANDLE_MARKERS)
+
+
+def wikidata_meta(title, qid=None, is_movie=True, tt=None, verify=True):
+    """Socials / RT / metacritic / distributor / genres off the Wikidata item.
+
+    With verify=True (default) the item must be confirmed to be the film/TV
+    title -- see entity_is_wanted_work -- before ANY field, above all its social
+    handles, is trusted. This is the guard that keeps a same-named band, album
+    or person from supplying a movie's Facebook / Instagram / Twitter."""
     entity = _entity(qid) if qid else None
+    if entity is not None and verify and not entity_is_wanted_work(entity, is_movie, tt):
+        log.info("wikidata_meta: rejected %s for %r - not the %s being ingested (P31=%s)",
+                 qid, title, "film" if is_movie else "TV title",
+                 ",".join(_claim_values(entity.get("claims", {}) or {}, "P31")) or "none")
+        entity = None
     if entity is None:
-        fallback = None
-        for cand in _search_candidates(title)[:3]:
+        for cand in _search_candidates(title)[:5]:
             ent = _entity(cand)
-            if not ent:
-                continue
-            fallback = fallback or ent
-            if _is_film_or_tv(ent.get("claims", {})):
+            if ent and entity_is_wanted_work(ent, is_movie, tt):
                 entity = ent
                 break
-        entity = entity or fallback
+        # No untyped fallback: taking the first search hit regardless of type is
+        # exactly how a band's item used to reach a movie row.
     if entity is None:
         return {}
     claims = entity.get("claims", {})
@@ -1689,7 +1756,7 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
             meta["network"] = dist
 
     # 3) Wikidata item -> RT / metacritic / socials / own-YouTube / distributor
-    _fill(meta, wikidata_meta(title_hint, qid=(wqid or wikidata_id), is_movie=is_movie))
+    _fill(meta, wikidata_meta(title_hint, qid=(wqid or wikidata_id), is_movie=is_movie, tt=tt))
 
     # 4) OMDb by exact id -> genre / release fallback (reliable API)
     _fill(meta, omdb_by_id(tt))
@@ -1702,7 +1769,7 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
     prod_co = tmeta.pop("production_company", None)
     _fill(meta, tmeta)
     if not (wqid or wikidata_id) and wid:
-        _fill(meta, wikidata_meta(title_hint, qid=wid, is_movie=is_movie))
+        _fill(meta, wikidata_meta(title_hint, qid=wid, is_movie=is_movie, tt=tt))
 
     # 6) IMDb page scrape -- genre + datePublished as last resort
     imeta = imdb_scrape(tt)
@@ -1733,8 +1800,8 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
     else:
         meta.pop("metacritic", None)
 
-    # drop social accounts that verifiably no longer exist / are suspended
-    verify_socials(meta)
+    # drop wrong-owner (band/artist) handles first, then dead ones
+    verify_socials(meta, title_hint, reject_foreign=True)
     return meta
 
 
@@ -1831,7 +1898,7 @@ def fetch_metadata(title, is_movie=True, year_hint=""):
                 meta["metacritic"] = mc
             else:
                 meta.pop("metacritic", None)
-            verify_socials(meta)
+            verify_socials(meta, lookup, reject_foreign=True)
         if sug_ptype:
             meta["program_type"] = sug_ptype  # IMDb's own type beats TMDB's
         # date is authoritative: if we still hold an IMDb id whose year disagrees
