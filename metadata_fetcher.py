@@ -1341,6 +1341,25 @@ def _person_prominence(ent):
             1 if _claim_values(claims, "P345") else 0)
 
 
+def _pick_person_imdb(base, p345, cands):
+    """Choose a person's IMDb nm from the suggestion candidates for `base`.
+
+    Name is authoritative: keep the Wikidata P345 id only when IMDb associates
+    that id with this name (it appears among the suggestions); otherwise take
+    the exactly-named suggestion. This stops a stale/mislinked P345 -- e.g.
+    nm0949743, which IMDb lists as 'Mary Young' -- from being returned for
+    'Kara Young', substituting the correctly-named nm instead. When nothing can
+    be confirmed the existing P345 is left as-is (fail-open)."""
+    if not base:
+        return p345
+    if p345 and any(it.get("id") == p345 for it in cands):
+        return p345
+    exact = [it for it in cands if _norm(it.get("l")) == _norm(base)]
+    if exact:
+        return exact[0]["id"]
+    return p345
+
+
 def _person_base_name(entity, meta, provided):
     """Base name for the IMDb nm-code lookup. Rule: use the person's Wikipedia
     article title when they have one (the canonical spelling -- it corrects a
@@ -1579,19 +1598,35 @@ def fetch_person(name, qid=None, profession=""):
             meta["occupations"] = [labels[q] for q in occ_qids if labels.get(q)]
             meta["sports"] = [labels[q] for q in sport_qids if labels.get(q)]
             meta["us_citizen"] = "Q30" in set(_claim_values(claims, "P27"))
-        # IMDb nm id fallback via the suggestion API (people come back as nm...).
-        # Base the search on the VERIFIED Wikipedia article name when the person
-        # has one -- the canonical spelling corrects a mistyped input (e.g.
-        # 'Kara Young') and pins it to the same person; else the provided name.
-        if not meta.get("imdb_id"):
-            base = _person_base_name(entity, meta, clean)
-            if base:
-                q = urllib.parse.quote(base.strip().lower())
-                data = _get_json(IMDB_SUGGEST.format(q=q), headers=HTML_HEADERS)
-                for it in (data or {}).get("d", []):
-                    if str(it.get("id", "")).startswith("nm") and _norm(it.get("l")) == _norm(base):
-                        meta["imdb_id"] = "https://www.imdb.com/name/" + it["id"]
-                        break
+        # Resolve & VERIFY the IMDb nm by NAME. The base name is the Wikipedia
+        # article title when the person has one, else the provided name. An nm
+        # is trusted only when IMDb associates it with that name, so a stale or
+        # mislinked Wikidata P345 (e.g. nm0949743 = 'Mary Young' for 'Kara
+        # Young') is replaced by the correctly-named nm rather than shipped.
+        base = _person_base_name(entity, meta, clean)
+        if base:
+            m = re.search(r"nm\d+", str(meta.get("imdb_id") or ""))
+            p345 = m.group(0) if m else None
+            data = _get_json(IMDB_SUGGEST.format(
+                q=urllib.parse.quote(base.strip().lower())), headers=HTML_HEADERS)
+            cands = [it for it in (data or {}).get("d", [])
+                     if str(it.get("id", "")).startswith("nm")]
+            nm = _pick_person_imdb(base, p345, cands)
+            if nm:
+                meta["imdb_id"] = "https://www.imdb.com/name/" + nm
+                if p345 and nm != p345:
+                    # Wikidata's IMDb link named a DIFFERENT person on IMDb; we
+                    # swapped in the correctly-named nm but flag it so a human
+                    # confirms this is the intended person (Wikipedia is the
+                    # source of truth for talent).
+                    meta["needs_review"] = True
+                    meta.setdefault(
+                        "review_reason",
+                        "Wikidata's IMDb link (%s) is not named '%s' on IMDb; used "
+                        "the correctly-named %s instead - please confirm the person."
+                        % (p345, base, nm))
+            elif "imdb_id" in meta:
+                meta.pop("imdb_id", None)
     except Exception as e:  # noqa: BLE001
         log.warning("fetch_person failed for %r: %s", name, e)
     # Keep the Ops hint on the payload for classification, but never overwrite

@@ -94,9 +94,13 @@ class NotableNamesakeWins(unittest.TestCase):
         mf._search_candidates = lambda t, limit=6: ["Qcomm", "Qcom"]  # obscure one first
         mf._labels = lambda qs: {"Qcomedian": "comedian", "Qactor": "actor",
                                  "Qcommentator": "sports commentator"}
+        self._gj = mf._get_json
+        # IMDb suggestion for "Kevin Hart" lists the comedian's nm -> P345 kept
+        mf._get_json = lambda url, **k: {"d": [{"id": "nm2076834", "l": "Kevin Hart"}]}
 
     def tearDown(self):
         mf._entity, mf._search_candidates, mf._labels = self._e, self._c, self._l
+        mf._get_json = self._gj
         mf._CACHE.clear()
 
     def test_prominence_helper_ranks_wikipedia_person_higher(self):
@@ -109,3 +113,27 @@ class NotableNamesakeWins(unittest.TestCase):
         self.assertEqual(meta.get("imdb_id"), "https://www.imdb.com/name/nm2076834")
         self.assertIn("comedian", meta.get("occupations", []))
         self.assertTrue(str(meta.get("wikipedia_page", "")).endswith("Kevin_Hart_(comedian)"))
+
+
+class ImdbNmByName(unittest.TestCase):
+    """nm must be the person IMDb actually names; a mislinked P345 is replaced."""
+    KARA = [{"id": "nm16990294", "l": "Kara Young"},
+            {"id": "nm0000001", "l": "Kara Young Smith"}]
+
+    def test_mislinked_p345_replaced_by_correctly_named_nm(self):
+        # nm0949743 (IMDb: 'Mary Young') is NOT among the 'Kara Young' results
+        self.assertEqual(mf._pick_person_imdb("Kara Young", "nm0949743", self.KARA),
+                         "nm16990294")
+
+    def test_corroborated_p345_is_kept(self):
+        self.assertEqual(mf._pick_person_imdb("Kara Young", "nm16990294", self.KARA),
+                         "nm16990294")
+
+    def test_no_p345_uses_exact_named_suggestion(self):
+        self.assertEqual(mf._pick_person_imdb("Kara Young", None, self.KARA), "nm16990294")
+
+    def test_no_exact_match_keeps_p345_failopen(self):
+        self.assertEqual(mf._pick_person_imdb("Nobody Here", "nm55", []), "nm55")
+
+    def test_blank_base_returns_p345(self):
+        self.assertEqual(mf._pick_person_imdb("", "nm55", self.KARA), "nm55")
