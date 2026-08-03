@@ -2693,6 +2693,9 @@ def build_review(src, auto_fetch=True, progress=None):
     ws.cell(ws.max_row, 1).fill = AMBER
     ws.append(['Red cell', 'Mismatch — differs from template/discovered value (see Findings)'])
     ws.cell(ws.max_row, 1).fill = RED
+    ws.append(['Reviewed sheet', "Each record has two rows: 'INGESTED' (suggested corrections applied) "
+               "and 'FROM DB' (original file values) for side-by-side comparison"])
+    ws.cell(ws.max_row, 1).font = Font(bold=True)
     from collections import Counter as _Counter
     by_col = _Counter(f['column'] for f in findings)
     if by_col:
@@ -2704,20 +2707,77 @@ def build_review(src, auto_fetch=True, progress=None):
     ws.column_dimensions['A'].width = 36
     ws.column_dimensions['B'].width = 64
 
-    # Reviewed copy with highlights
+    # Reviewed copy with highlights.
+    # For every reviewed record we now emit TWO adjacent rows so the suggested
+    # (to-be-ingested) data and the original data can be compared in one sheet:
+    #   record_type = 'INGESTED' -> the record with all suggested changes
+    #                               applied (correct value where flagged,
+    #                               otherwise the original file value)
+    #   record_type = 'FROM DB'  -> the exact values from the uploaded file
+    # INGESTED is written first, FROM DB directly below it. Existing red/amber
+    # color coding is kept, applied to the flagged cells on both rows so the
+    # difference is easy to spot.
     ws2 = wb.create_sheet('Reviewed')
     cols = list(df.columns)
+
+    # Per-cell original + suggested values, captured at compare time. Using the
+    # findings list (rather than the possibly-mutated `records`) guarantees the
+    # 'FROM DB' row shows the true original value even for backfilled gaps.
+    currents_by_cell, suggs_by_cell = {}, {}
+    for f in findings:
+        key = (f['row'] - 2, f['column'])
+        currents_by_cell[key] = f['current']
+        suggs_by_cell[key] = f['suggested']
+
+    # Ensure there is a record_type column to label the two rows.
+    rt_col = lower_cols.get('record_type')
+    if rt_col is None:
+        rt_col = 'record_type'
+        cols = [rt_col] + cols
+
+    def _clean(v):
+        return '' if (v is None or str(v) == 'nan') else v
+
     ws2.append(cols)
     for c in range(1, len(cols) + 1):
         cell = ws2.cell(1, c)
         cell.fill, cell.font = HDR, HDR_FONT
+
+    out_row = 1
     for i, r in enumerate(records):
-        ws2.append(['' if (r.get(c) is None or str(r.get(c)) == 'nan') else r.get(c)
-                    for c in cols])
+        # --- INGESTED row (first): original values + suggested corrections ---
+        out_row += 1
+        ing_vals = []
+        for c in cols:
+            if c == rt_col:
+                ing_vals.append('INGESTED')
+            elif (i, c) in suggs_by_cell and str(suggs_by_cell[(i, c)]) != '':
+                ing_vals.append(_clean(suggs_by_cell[(i, c)]))
+            elif (i, c) in currents_by_cell:
+                ing_vals.append(_clean(currents_by_cell[(i, c)]))
+            else:
+                ing_vals.append(_clean(r.get(c)))
+        ws2.append(ing_vals)
         for j, c in enumerate(cols, start=1):
             st = fills.get((i, c))
             if st:
-                ws2.cell(i + 2, j).fill = RED if st == 'Mismatch' else AMBER
+                ws2.cell(out_row, j).fill = RED if st == 'Mismatch' else AMBER
+
+        # --- FROM DB row (second): exact original file values ---
+        out_row += 1
+        db_vals = []
+        for c in cols:
+            if c == rt_col:
+                db_vals.append('FROM DB')
+            elif (i, c) in currents_by_cell:
+                db_vals.append(_clean(currents_by_cell[(i, c)]))
+            else:
+                db_vals.append(_clean(r.get(c)))
+        ws2.append(db_vals)
+        for j, c in enumerate(cols, start=1):
+            st = fills.get((i, c))
+            if st:
+                ws2.cell(out_row, j).fill = RED if st == 'Mismatch' else AMBER
     ws2.freeze_panes = 'A2'
 
     # Findings detail
