@@ -1330,6 +1330,17 @@ def _hint_score(terms, haystack):
     return score
 
 
+def _person_prominence(ent):
+    """Notability signal for choosing between same-name people: prefer the one
+    with an English Wikipedia article, then the most sitelinks, then one with an
+    IMDb id. Bigger tuple = more notable."""
+    claims = ent.get("claims", {}) or {}
+    sitelinks = ent.get("sitelinks", {}) or {}
+    return (1 if sitelinks.get("enwiki") else 0,
+            len(sitelinks),
+            1 if _claim_values(claims, "P345") else 0)
+
+
 def _person_base_name(entity, meta, provided):
     """Base name for the IMDb nm-code lookup. Rule: use the person's Wikipedia
     article title when they have one (the canonical spelling -- it corrects a
@@ -1438,8 +1449,6 @@ def fetch_person(name, qid=None, profession=""):
                 humans.append((ent, name_match,
                                _claim_values(claims, "P106")[:12],
                                _claim_values(claims, "P641")[:4]))
-                if not hint_terms and name_match:
-                    break        # no hint: first name match wins, as before
                 if len(humans) >= 6:
                     break
             had_candidates = any(h[1] for h in humans)
@@ -1481,8 +1490,15 @@ def fetch_person(name, qid=None, profession=""):
                     else:
                         entity = None
                 else:
-                    scored.sort(key=lambda c: c[1], reverse=True)
-                    entity = scored[0][2]
+                    # No Ops hint: among people who actually bear this name,
+                    # pick the notable one -- the person with an English
+                    # Wikipedia article first (then most sitelinks / an IMDb
+                    # id). This stops an obscure namesake (a sports commentator
+                    # called "Kevin Hart") from being chosen over the well-known
+                    # talent, without needing a profession hint.
+                    named = [ent for (_s, nm, ent) in scored if nm]
+                    pool = named or [ent for (_s, _nm, ent) in scored]
+                    entity = max(pool, key=_person_prominence)
         if entity is None and hint_terms and had_candidates:
             # Several people share this name and none support the professional
             # details, so picking the most prominent is a coin flip on the wrong

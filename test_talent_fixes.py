@@ -70,3 +70,42 @@ class TwitterHandleFormats(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NotableNamesakeWins(unittest.TestCase):
+    """No profession hint: among same-name people, the one WITH a Wikipedia
+    page (the notable talent) must be chosen over an obscure namesake."""
+    def _snak(self, v): return {"mainsnak": {"snaktype": "value", "datavalue": {"value": v}}}
+    def _human(self, p106, imdb, enwiki=None):
+        c = {"P31": [self._snak({"id": "Q5"})],
+             "P106": [self._snak({"id": q}) for q in p106],
+             "P345": [self._snak(imdb)]}
+        e = {"claims": c, "labels": {"en": {"value": "Kevin Hart"}}, "aliases": {"en": []}}
+        if enwiki: e["sitelinks"] = {"enwiki": {"title": enwiki}}
+        return e
+
+    def setUp(self):
+        self._e, self._c, self._l = mf._entity, mf._search_candidates, mf._labels
+        mf._CACHE.clear()
+        comedian = self._human(["Qcomedian", "Qactor"], "nm2076834", enwiki="Kevin Hart (comedian)")
+        commentator = self._human(["Qcommentator"], "nm0366389")  # no Wikipedia
+        items = {"Qcomm": commentator, "Qcom": comedian}
+        mf._entity = lambda q: items.get(q)
+        mf._search_candidates = lambda t, limit=6: ["Qcomm", "Qcom"]  # obscure one first
+        mf._labels = lambda qs: {"Qcomedian": "comedian", "Qactor": "actor",
+                                 "Qcommentator": "sports commentator"}
+
+    def tearDown(self):
+        mf._entity, mf._search_candidates, mf._labels = self._e, self._c, self._l
+        mf._CACHE.clear()
+
+    def test_prominence_helper_ranks_wikipedia_person_higher(self):
+        comedian = self._human(["Qcomedian"], "nm1", enwiki="Kevin Hart")
+        commentator = self._human(["Qcommentator"], "nm2")
+        self.assertGreater(mf._person_prominence(comedian), mf._person_prominence(commentator))
+
+    def test_resolver_picks_the_comedian_not_the_commentator(self):
+        meta = mf.fetch_person("Kevin Hart")
+        self.assertEqual(meta.get("imdb_id"), "https://www.imdb.com/name/nm2076834")
+        self.assertIn("comedian", meta.get("occupations", []))
+        self.assertTrue(str(meta.get("wikipedia_page", "")).endswith("Kevin_Hart_(comedian)"))
