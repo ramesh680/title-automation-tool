@@ -1682,6 +1682,15 @@ def fetch_game(name, qid=None):
                 meta["facebook_page"] = "https://www.facebook.com/" + raw["facebook"]
             if "tiktok" in raw:
                 meta["tiktok_user"] = str(raw["tiktok"]).lstrip("@")
+            # the game's OWN YouTube channel; the app pairs it with the title
+            # variants when building youtube_channel_username, and falls back to
+            # the publisher's channel only when there is none
+            if raw.get("youtube_handle"):
+                meta["youtube_own_channel"] = ("https://www.youtube.com/@"
+                                               + str(raw["youtube_handle"]).lstrip("@"))
+            elif raw.get("youtube_id"):
+                meta["youtube_own_channel"] = ("https://www.youtube.com/channel/"
+                                               + str(raw["youtube_id"]))
             enwiki = entity.get("sitelinks", {}).get("enwiki")
             if enwiki and enwiki.get("title"):
                 meta["wikipedia_page"] = ("https://en.wikipedia.org/wiki/"
@@ -1692,6 +1701,11 @@ def fetch_game(name, qid=None):
         alive = _mc_alive(meta["metacritic"]) if VALIDATE_URLS else True
         if alive is False:
             meta.pop("metacritic")
+    # Wikidata lists a game's channel far less often than a film's, so fall back
+    # to the verified channel search when it has none (see youtube_channel for
+    # the quota note).
+    if not meta.get("youtube_own_channel") and clean:
+        _fill(meta, youtube_channel(clean))
     verify_socials(meta)
     _CACHE[key] = dict(meta)
     return meta
@@ -1803,21 +1817,63 @@ def fetch_brand(name, qid=None):
     return meta
 
 
-def youtube_channel(title):
-    """The title's own channel via the YouTube Data API (optional key)."""
-    if not YOUTUBE_API_KEY:
+_YT_OWN_SUFFIXES = {
+    "", "movie", "the movie", "film", "the film", "official", "official channel",
+    "official movie", "official film", "movie official", "film official",
+    "official trailer", "trailers", "uk", "us", "usa", "india", "latam",
+}
+#: `_norm` strips spaces, so the suffixes are compared in the same shape.
+_YT_OWN_SUFFIXES_NORM = {re.sub(r"[^a-z0-9]", "", s) for s in _YT_OWN_SUFFIXES}
+
+#: Setting YOUTUBE_OWN_CHANNEL_ALWAYS=1 runs the channel search even when
+#: Wikidata already supplied a channel, which widens multi-channel coverage at
+#: the cost of 100 YouTube quota units per title. Off by default: search.list is
+#: the single most expensive call in this module.
+YOUTUBE_OWN_CHANNEL_ALWAYS = os.getenv("YOUTUBE_OWN_CHANNEL_ALWAYS", "0").strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+def _yt_own_channel_matches(channel_title, title):
+    """True when a channel is plausibly the title's OWN channel."""
+    ct, tl = _norm(channel_title), _norm(title)
+    if not ct or not tl:
+        return False
+    if ct == tl:
+        return True
+    if ct.startswith(tl):
+        return ct[len(tl):] in _YT_OWN_SUFFIXES_NORM
+    return False
+
+
+def youtube_channel(title, limit=5):
+    """The title's OWN YouTube channel(s) via the YouTube Data API (optional key).
+
+    Most movies have no channel of their own - trailers live on the
+    distributor's or the production company's channel - but some do, and a few
+    run more than one (a franchise or regional channel alongside the main one).
+    Every verified match is returned, newline separated, so the ingest template
+    can carry them all in a single ``youtube_channel_username`` cell, one per
+    row.
+
+    A hit is only trusted when the channel is named like the title (optionally
+    plus a suffix such as "Movie" or "Official"), so a same-named band, artist
+    or topic channel is not picked up.
+    """
+    if not YOUTUBE_API_KEY or not title:
         return {}
-    data = _get_json(YT_SEARCH, {"part": "snippet", "type": "channel", "maxResults": 1,
+    data = _get_json(YT_SEARCH, {"part": "snippet", "type": "channel",
+                                 "maxResults": max(1, min(int(limit), 10)),
                                  "q": title, "key": YOUTUBE_API_KEY})
-    items = (data or {}).get("items", [])
-    if not items:
-        return {}
-    snip = items[0].get("snippet", {})
-    cid = snip.get("channelId") or items[0].get("id", {}).get("channelId")
-    # only trust the hit when the channel is literally named like the title
-    if not cid or _norm(snip.get("title")) != _norm(title):
-        return {}
-    return {"youtube_own_channel": "http://www.youtube.com/channel/" + cid}
+    urls = []
+    for item in (data or {}).get("items", []) or []:
+        snip = item.get("snippet", {}) or {}
+        cid = snip.get("channelId") or (item.get("id", {}) or {}).get("channelId")
+        if not cid or not _yt_own_channel_matches(snip.get("title"), title):
+            continue
+        url = "http://www.youtube.com/channel/" + cid
+        if url not in urls:
+            urls.append(url)
+    return {"youtube_own_channel": "\n".join(urls)} if urls else {}
 
 
 # ---------------- merge / entry ----------------
@@ -1880,8 +1936,15 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
         if not meta["network"]:
             meta.pop("network")
 
-    if not meta.get("youtube_own_channel"):
-        _fill(meta, youtube_channel(title_hint))
+    # a title can have its own channel(s) alongside the distributor's; collect
+    # every verified one so they share the cell, one per line
+    if YOUTUBE_OWN_CHANNEL_ALWAYS or not meta.get("youtube_own_channel"):
+        own = [u.strip() for u in str(meta.get("youtube_own_channel") or "").splitlines() if u.strip()]
+        for u in str(youtube_channel(title_hint).get("youtube_own_channel") or "").splitlines():
+            if u.strip() and u.strip() not in own:
+                own.append(u.strip())
+        if own:
+            meta["youtube_own_channel"] = "\n".join(own)
     meta.setdefault("imdb_id", "http://www.imdb.com/title/" + tt)
 
     # release-date first for MC & RT (same rule as IMDb): the known year picks

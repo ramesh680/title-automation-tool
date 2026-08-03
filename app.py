@@ -269,13 +269,20 @@ def _title_variants(clean_title):
 
 def build_youtube_username(company_channel, clean_title, own_channel=""):
     """youtube_channel_username lines:
-      - the title's OWN channel URL alone on the first line (if it has one)
+      - the title's OWN channel URL(s) first, one per line
       - then '<network channel>|<title variant>' for each title variant
+
+    A title may legitimately have more than one channel of its own (a franchise
+    or regional channel alongside the main one), so ``own_channel`` accepts a
+    newline-separated list: they share the one cell, one per row. Duplicates and
+    the distributor's own channel are dropped.
     """
     lines = []
-    own = (own_channel or "").strip()
-    if own and own != (company_channel or "").strip():
-        lines.append(own)
+    company = (company_channel or "").strip()
+    for own in str(own_channel or "").splitlines():
+        own = own.strip()
+        if own and own != company and own not in lines:
+            lines.append(own)
     if company_channel:
         lines.extend(f"{company_channel}|{v}" for v in _title_variants(clean_title))
     return "\n".join(lines)
@@ -1147,7 +1154,13 @@ GAME_COLUMNS = [
     'reddit_search_terms', 'url_managers',
 ]
 
-GAME_DAR_BRAND_SET = "LF // Video Games // Games"
+GAME_DAR_BRAND_SET = "LF // Video Games // Games\nPristine DAR Brands"
+
+# Placeholders for the Video Game fields that are mandatory. They are loud on
+# purpose: a flagged cell gets fixed, a blank one ships.
+GAME_CONFIRM_DEVELOPER = "«CONFIRM developer»"
+GAME_CONFIRM_PLATFORMS = "«CONFIRM platforms»"
+GAME_CONFIRM_NETWORK = "«CONFIRM network (publisher)»"
 # fixed clause tails from the ingest template (incl. its 'Swtich 2' spelling)
 _GAME_KW_TAIL = ('"Video Game" OR Playstation OR iOS OR PS4 OR PS5 OR Xbox OR '
                  'Switch OR Swtich 2 OR PC')
@@ -1177,19 +1190,90 @@ def _game_hashtag(name):
     return '#' + s
 
 
+# The six platform values a Video Game title_sub_category may carry, in the
+# order the 2026-07-31 ingest used them. Only the platforms a game actually
+# releases on are emitted - the list is the vocabulary, not a checklist - so a
+# PC-only indie gets one Platform line and a full multiplatform release gets six.
+GAME_PLATFORM_VOCAB = ["PC", "PS5", "PS4", "Switch 2", "Xbox One", "Xbox Series X"]
+
+# Anything outside the vocabulary is folded into its nearest member; a platform
+# with no sensible equivalent (PS2, Game Boy, Mobile) is left out of
+# title_sub_category rather than inventing a seventh value.
+_GAME_PLATFORM_FOLD = {
+    'Switch': 'Switch 2',
+    'Xbox Series S': 'Xbox Series X',
+}
+
+
 def _game_platform_lines(platforms):
-    out = []
-    for p in (platforms or [])[:6]:
+    """`Platform - X` lines for title_sub_category, vocabulary-ordered.
+
+    Returns at most six lines, ordered by :data:`GAME_PLATFORM_VOCAB` rather than
+    by the order the source listed them, so two games on the same platforms
+    always produce byte-identical cells.
+    """
+    wanted = set()
+    for p in (platforms or []):
         pl = str(p).strip()
-        tail = _GAME_PLATFORM_ALIAS.get(pl.lower())
-        line = ''
-        if _tref():
-            line = _tref().game_platform_for(tail or pl)
-        if not line:
-            line = f"Platform - {tail or pl}"
+        if not pl:
+            continue
+        name = _GAME_PLATFORM_ALIAS.get(pl.lower(), pl)
+        name = _GAME_PLATFORM_FOLD.get(name, name)
+        if name in GAME_PLATFORM_VOCAB:
+            wanted.add(name)
+
+    out = []
+    for name in GAME_PLATFORM_VOCAB:
+        if name not in wanted:
+            continue
+        line = (_tref().game_platform_for(name) if _tref() else '') or f"Platform - {name}"
         if line not in out:
             out.append(line)
-    return out
+    return out[:6]
+
+
+def _game_title_variants(clean_title):
+    """Title spellings used in a game's youtube_channel_username lines.
+
+    Titles with a colon get TWO variants: the title as written first, then the
+    punctuation-stripped form. (Note the order is the opposite of the Movies/TV
+    `_title_variants` helper - the games ingest writes them this way round.)
+    """
+    stripped = re.sub(r'\s+', ' ', re.sub(r'\s*:\s*', ' ', clean_title)).strip()
+    return [clean_title, stripped] if stripped != clean_title else [clean_title]
+
+
+def _game_youtube_lines(channels, clean_title):
+    """'<channel>|<title variant>' for every channel x title variant pair.
+
+    Two or more channels therefore share the one cell, one per line - a game can
+    legitimately have a franchise or regional channel besides its main one.
+    """
+    lines = []
+    for ch in channels or []:
+        ch = str(ch).strip()
+        if not ch:
+            continue
+        for variant in _game_title_variants(clean_title):
+            line = ch + variant if ch.endswith('|') else f"{ch}|{variant}"
+            if line not in lines:
+                lines.append(line)
+    return "\n".join(lines)
+
+
+def _game_search_terms(clean_title, is_dar):
+    """twitter_search_terms for a Video Game.
+
+    Deliberately NOT `generate_search_terms`: the games ingest preserves the
+    title's capitalisation, appends the literal 'videoGame' rather than the
+    publisher name, and carries a single '|DAR' label, e.g.
+
+        #Akatori|DAR
+        #AkatorivideoGame|DAR
+    """
+    label = "DAR" if is_dar else "Operations - Core Title"
+    tag = _game_hashtag(clean_title)
+    return f"{tag}|{label}\n{tag}videoGame|{label}"
 
 
 def create_game_row(title, metadata=None):
@@ -1204,14 +1288,20 @@ def create_game_row(title, metadata=None):
     dev_line = developer if developer.startswith('Developer - ') else \
         (f"Developer - {developer}" if developer else '')
     dev_name = dev_line.replace('Developer - ', '', 1)
-    publisher = str(metadata.get('network') or '').strip()
 
-    # sub-category = Developer line + up to 6 Platform lines
+    # network = the PUBLISHER, and it is mandatory for a Video Game. When it is
+    # self-published the developer is the publisher, so fall back to that before
+    # flagging the cell for Ops.
+    publisher = str(metadata.get('network') or '').strip() or dev_name or GAME_CONFIRM_NETWORK
+
+    # sub-category = Developer line + one Platform line per applicable platform.
+    # Both parts are mandatory: a blank cell here silently breaks the ingest, so
+    # a missing half is flagged instead of omitted.
     _sub = str(metadata.get('title_sub_category') or '').strip()
     if not _sub:
-        _sub = "\n".join(x for x in
-                         [dev_line] + _game_platform_lines(metadata.get('platforms'))
-                         if x)
+        _plat_lines = _game_platform_lines(metadata.get('platforms'))
+        _sub = "\n".join([dev_line or GAME_CONFIRM_DEVELOPER]
+                         + (_plat_lines or [GAME_CONFIRM_PLATFORMS]))
 
     # genre (single, per template) + mapped primary
     _genre = str(metadata.get('genre') or '').split('\n')[0].strip()
@@ -1219,13 +1309,19 @@ def create_game_row(title, metadata=None):
     if not _primary and _genre:
         _primary = (_tref().game_primary_genre(_genre) if _tref() else '') or _genre
 
-    # publisher YouTube channel ('...|' entries in the template) + title
+    # youtube_channel_username: '<channel>|<title variant>' per line. The game's
+    # OWN channel(s) win; the publisher's channel is the fallback. A title with a
+    # colon gets two lines per channel - as written, then punctuation-stripped -
+    # so both spellings are matched (as in the 2026-07-31 ingest).
     _yt = str(metadata.get('youtube_channel_username') or '').strip()
-    if not _yt and publisher and _tref():
-        pinfo = _tref().game_publisher(publisher)
-        if pinfo and pinfo.get('youtube'):
-            ch = pinfo['youtube']
-            _yt = ch + clean_title if ch.endswith('|') else f"{ch}|{clean_title}"
+    if not _yt:
+        _channels = [u.strip() for u in
+                     str(metadata.get('youtube_own_channel') or '').splitlines() if u.strip()]
+        if not _channels and publisher and _tref():
+            pinfo = _tref().game_publisher(publisher)
+            if pinfo and pinfo.get('youtube'):
+                _channels = [pinfo['youtube']]
+        _yt = _game_youtube_lines(_channels, clean_title)
 
     # developer keyword clauses (template tables; constructed fallback)
     dinfo = (_tref().game_developer(dev_name) if (_tref() and dev_name) else None) or {}
@@ -1234,11 +1330,7 @@ def create_game_row(title, metadata=None):
     rd_clause = dinfo.get('reddit_clause') or \
         (f'{_game_hashtag(dev_name)} | "{dev_name}"' if dev_name else '"Video Game"')
 
-    # twitter_search_terms: same logic as Movies/TV Shows (publisher plays
-    # the network role for the '#<title><network>' line)
-    gen_terms, _ = generate_search_terms(
-        clean_title, publisher, None, is_dar,
-        twitter_handle=str(metadata.get('twitter_handle') or ''))
+    gen_terms = _game_search_terms(clean_title, is_dar)
     kw_tail = "|DAR|DAR|2021-01-01" if is_dar else \
         "|Operations - Core Title|Operations - Core Title"
     gen_kw = f'("{clean_title}") ({tw_clause} OR {_GAME_KW_TAIL}){kw_tail}'
