@@ -252,6 +252,16 @@ def _split_disambiguator(title):
     return title[:m.start()].strip(), m.group(1).strip()
 
 
+IMDB_YEAR_TOLERANCE = 1  # festival vs wide / regional gaps: allow +/-1 year
+
+
+def _year_from(value):
+    """First 4-digit release year in a date string ('2026-08-05'), a bare year
+    ('2026'), or any text containing one. Returns int or None."""
+    m = re.search(r"(?:19|20)\d{2}", str(value or ""))
+    return int(m.group(0)) if m else None
+
+
 # ---------------- Metacritic URL validation ----------------
 def _mc_slug(title):
     """Slug the way Metacritic builds movie/tv paths (best-effort guess)."""
@@ -458,12 +468,19 @@ _IMDB_QID_PROGRAM_TYPE = {
 }
 
 
-def imdb_suggest_item(title, is_movie=True, year_hint=""):
+def imdb_suggest_item(title, is_movie=True, year_hint="", require_year=False):
     """Best-matching item from IMDb's suggestion API (keyless), or None.
     Handles apostrophes/colons and titles that have no release yet.
-    Prefers an exact title match of the right type; when the input carried a
-    '(year)' disambiguator that exact year wins, else the most recent year
-    (these are upcoming titles, so avoid older same-named films)."""
+
+    Prefers an exact title match of the right type. When a release year is
+    known (year_hint), a candidate whose year matches it (within
+    IMDB_YEAR_TOLERANCE) is preferred over a merely more-recent one -- this is
+    how a same-named title from another year is avoided.
+
+    With require_year=True the year is authoritative: if the best title match
+    has a year that disagrees with year_hint by more than the tolerance, None is
+    returned rather than attaching the wrong title. A candidate with no year (an
+    upcoming title) is never rejected on year."""
     q = urllib.parse.quote(title.strip().lower())
     data = _get_json(IMDB_SUGGEST.format(q=q), headers=HTML_HEADERS)
     items = [it for it in (data or {}).get("d", [])
@@ -472,7 +489,7 @@ def imdb_suggest_item(title, is_movie=True, year_hint=""):
         return None
     tl = _norm(title)
     want_tv = not is_movie
-    want_year = int(year_hint) if str(year_hint).isdigit() and len(str(year_hint)) == 4 else None
+    want_year = _year_from(year_hint)
 
     def type_ok(it):
         qid = str(it.get("qid") or "").lower()
@@ -481,15 +498,32 @@ def imdb_suggest_item(title, is_movie=True, year_hint=""):
         is_tv_item = qid.startswith("tv") and qid != "tvmovie"
         return is_tv_item == want_tv
 
+    def year_rank(it):
+        y = it.get("y")
+        if not (want_year and y):
+            return 0
+        diff = abs(int(y) - want_year)
+        return 2 if diff == 0 else (1 if diff <= IMDB_YEAR_TOLERANCE else -1)
+
     def score(it):
+        # correct media type outranks year: a movie lookup must never return a
+        # TV series of the same name, even one from the wanted year
         return (1 if _norm(it.get("l")) == tl else 0,
-                1 if (want_year and it.get("y") == want_year) else 0,
                 1 if type_ok(it) else 0,
+                year_rank(it),
                 it.get("y") or 0)
 
     best = max(items, key=score)
     # only trust it when the title actually matches
-    return best if _norm(best.get("l")) == tl else None
+    if _norm(best.get("l")) != tl:
+        return None
+    # date is authoritative: reject a same-named title from the wrong year
+    if require_year and want_year and best.get("y") \
+            and abs(int(best["y"]) - want_year) > IMDB_YEAR_TOLERANCE:
+        log.info("imdb_suggest_item: %r best %s is year %s, want ~%s - rejected",
+                 title, best.get("id"), best.get("y"), want_year)
+        return None
+    return best
 
 
 def imdb_suggest(title, is_movie=True):
@@ -628,7 +662,7 @@ def bom_scrape(tt):
 
 
 # ---------------- TMDB ----------------
-def _tmdb_pick(results, title):
+def _tmdb_pick(results, title, want_year=None):
     if not results:
         return None
     tl = title.strip().lower()
@@ -639,6 +673,10 @@ def _tmdb_pick(results, title):
 
     exact = [r for r in results if str(r.get("title") or r.get("name") or "").strip().lower() == tl]
     pool = exact or results
+    if want_year:
+        dated = [r for r in pool if year(r) and abs(year(r) - want_year) <= IMDB_YEAR_TOLERANCE]
+        if dated:  # closest year to the target wins
+            return min(dated, key=lambda r: abs(year(r) - want_year))
     return max(pool, key=year)
 
 
@@ -699,14 +737,17 @@ def _tmdb_details_meta(details, kind):
 _TMDB_APPEND = "external_ids,release_dates"
 
 
-def tmdb_lookup(title, is_movie):
+def tmdb_lookup(title, is_movie, want_year=None):
     if not TMDB_API_KEY:
         return {}, None
     kind = "movie" if is_movie else "tv"
-    search = _get_json(TMDB + "/search/" + kind, {"api_key": TMDB_API_KEY, "query": title})
+    params = {"api_key": TMDB_API_KEY, "query": title}
+    if want_year:
+        params["primary_release_year" if is_movie else "first_air_date_year"] = want_year
+    search = _get_json(TMDB + "/search/" + kind, params)
     if not search:
         return {}, None
-    hit = _tmdb_pick(search.get("results", []), title)
+    hit = _tmdb_pick(search.get("results", []), title, want_year)
     if not hit:
         return {}, None
     details = _get_json(TMDB + "/" + kind + "/" + str(hit["id"]),
@@ -765,10 +806,13 @@ def omdb_by_id(tt):
     return _omdb_meta(_get_json(OMDB, {"i": tt, "apikey": OMDB_API_KEY}))
 
 
-def omdb_lookup(title):
+def omdb_lookup(title, want_year=None):
     if not OMDB_API_KEY:
         return {}
-    return _omdb_meta(_get_json(OMDB, {"t": title, "apikey": OMDB_API_KEY}))
+    params = {"t": title, "apikey": OMDB_API_KEY}
+    if want_year:
+        params["y"] = want_year
+    return _omdb_meta(_get_json(OMDB, params))
 
 
 # ---------------- Wikidata ----------------
@@ -1694,12 +1738,17 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
     return meta
 
 
-def fetch_metadata_by_tt(tt, is_movie=True, title=""):
-    """Preferred entry point when the exact IMDb id is known (reliable)."""
+def fetch_metadata_by_tt(tt, is_movie=True, title="", year_hint=""):
+    """Preferred entry point when the exact IMDb id is known (reliable).
+
+    When a release year is known, the tt's own year is checked against it and a
+    disagreement is surfaced via '_imdb_year_note' -- the id is kept (it was
+    supplied explicitly) but the reviewer is told it looks wrong for the date."""
     tt = _tt(tt)
     if not tt:
         return {}
-    key = ("tt:" + tt, bool(is_movie))
+    want_year = _year_from(year_hint)
+    key = ("tt:" + tt, bool(is_movie), want_year or 0)
     if key in _CACHE:
         return dict(_CACHE[key])
     meta = {}
@@ -1707,42 +1756,63 @@ def fetch_metadata_by_tt(tt, is_movie=True, title=""):
         hint_title, _ = _split_disambiguator(
             re.sub(r"\s*-\s*DAR\s*$", "", title or "", flags=re.IGNORECASE).strip())
         meta = _enrich_by_tt(tt, is_movie, hint_title or tt)
+        if want_year:
+            yr = _year_from(meta.get("released_on"))
+            if yr and abs(yr - want_year) > IMDB_YEAR_TOLERANCE:
+                meta["_imdb_year_note"] = (
+                    "IMDb %s is dated %s but the release year is %s -- verify it is "
+                    "the right title." % (tt, yr, want_year))
     except Exception as e:  # noqa: BLE001
         log.warning("fetch_metadata_by_tt failed for %s: %s", tt, e)
     _CACHE[key] = dict(meta)
     return meta
 
 
-def fetch_metadata(title, is_movie=True):
+def fetch_metadata(title, is_movie=True, year_hint=""):
     """Entry point when only the title is known. Resolution order:
-    IMDb suggestion API (exact, keyless) > TMDB search > OMDb search."""
+    IMDb suggestion API (exact, keyless) > TMDB search > OMDb search.
+
+    When a release date/year is known (year_hint -- e.g. from the ingest sheet
+    a reviewer is checking), it is resolved FIRST and used to pick the IMDb entry
+    for that year, so a same-named title from another year is not matched. If no
+    candidate fits the year, no IMDb id is attached and '_imdb_year_note' is set
+    so the caller can flag it for review."""
     if not title:
         return {}
     clean = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
-    key = (clean.lower(), bool(is_movie))
+    want_year = _year_from(year_hint)  # known release year makes lookup year-specific
+    key = (clean.lower(), bool(is_movie), want_year or 0)
     if key in _CACHE:
         return dict(_CACHE[key])
 
     # a trailing '(2026)' / '(Netflix)' disambiguator is NOT part of the real
-    # name -- all lookups use the stripped title; a year hint helps pick the
-    # right same-named title
+    # name -- all lookups use the stripped title. An explicit release year wins
+    # over a parenthetical one as the same-named-title tie-breaker.
     lookup, hint = _split_disambiguator(clean)
-    year_hint = hint if (hint.isdigit() and len(hint) == 4) else ""
+    if not want_year and hint.isdigit() and len(hint) == 4:
+        want_year = int(hint)
+    year_hint = str(want_year) if want_year else ""
 
     meta = {}
     try:
         # the upcoming-release-movies calendar resolves the tt code by exact
-        # title AND supplies distributor/genre/date/scale in one shot
+        # title AND supplies distributor/genre/date/scale -- but only trust it
+        # when its year agrees with the known release year
         um = _upcoming_index()["by_title"].get(_norm(lookup)) if is_movie else None
-        sug = imdb_suggest_item(lookup, is_movie, year_hint) if not um else None
+        if um and want_year:
+            uy = _year_from(um.get("release_date"))
+            if uy and abs(uy - want_year) > IMDB_YEAR_TOLERANCE:
+                um = None
+        sug = imdb_suggest_item(lookup, is_movie, year_hint,
+                                require_year=bool(want_year)) if not um else None
         tt = _tt((um or {}).get("tt_code")) or (sug or {}).get("id")
         # the IMDb item type gives the TV Program Type (Series / Mini-Series /
         # TV Movie / Special) used by the BrandIngest schema
         sug_ptype = _IMDB_QID_PROGRAM_TYPE.get(str((sug or {}).get("qid") or "").lower())
         tmdb_meta, wid = ({}, None)
         if not tt:
-            tmdb_meta, wid = tmdb_lookup(lookup, is_movie)
-            tt = _tt(tmdb_meta.get("imdb_id")) or _tt(omdb_lookup(lookup).get("imdb_id"))
+            tmdb_meta, wid = tmdb_lookup(lookup, is_movie, want_year)
+            tt = _tt(tmdb_meta.get("imdb_id")) or _tt(omdb_lookup(lookup, want_year).get("imdb_id"))
         if tt:
             meta = _enrich_by_tt(tt, is_movie, lookup, wikidata_id=wid)
             tmdb_meta.pop("production_company", None)
@@ -1753,7 +1823,7 @@ def fetch_metadata(title, is_movie=True):
             tmdb_meta.pop("released_on_us", None)
             _fill(meta, tmdb_meta)
             _fill(meta, wikidata_meta(lookup, qid=wid, is_movie=is_movie))
-            _fill(meta, omdb_lookup(lookup))
+            _fill(meta, omdb_lookup(lookup, want_year))
             mc = resolve_metacritic(lookup, is_movie,
                                     candidate=meta.get("metacritic"),
                                     curated=bool(meta.get("metacritic")))
@@ -1764,6 +1834,20 @@ def fetch_metadata(title, is_movie=True):
             verify_socials(meta)
         if sug_ptype:
             meta["program_type"] = sug_ptype  # IMDb's own type beats TMDB's
+        # date is authoritative: if we still hold an IMDb id whose year disagrees
+        # with the known release year, drop it; if none resolved for that year,
+        # leave IMDb blank and flag for a human reviewer (never guess).
+        if want_year and _tt(meta.get("imdb_id")):
+            yr = _year_from(meta.get("released_on")) \
+                or _year_from(omdb_by_id(_tt(meta["imdb_id"])).get("released_on"))
+            if yr and abs(yr - want_year) > IMDB_YEAR_TOLERANCE:
+                log.info("fetch_metadata: dropping IMDb %s (year %s) for %r, want ~%s",
+                         meta.get("imdb_id"), yr, title, want_year)
+                meta.pop("imdb_id", None)
+        if want_year and not _tt(meta.get("imdb_id")):
+            meta["_imdb_year_note"] = (
+                "No IMDb title found for release year %s; left blank for review."
+                % want_year)
     except Exception as e:  # noqa: BLE001
         log.warning("fetch_metadata failed for %r: %s", title, e)
 

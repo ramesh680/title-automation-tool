@@ -14,10 +14,10 @@ try:
                                   fetch_person, fetch_game, fetch_brand,
                                   warm_upcoming)
 except Exception:  # keep the app running even if the module is missing
-    def fetch_metadata(title, is_movie=True):
+    def fetch_metadata(title, is_movie=True, year_hint=""):
         return {}
 
-    def fetch_metadata_by_tt(tt, is_movie=True, title=""):
+    def fetch_metadata_by_tt(tt, is_movie=True, title="", year_hint=""):
         return {}
 
     def fetch_person(name, qid=None, profession=""):
@@ -1496,11 +1496,13 @@ def _merge_meta(base_meta, title, auto_fetch, is_movie=True):
     if not auto_fetch:
         return base_meta or {}
     base = base_meta or {}
+    # release date first: a known date makes IMDb resolution year-specific
+    yr = str(base.get('released_on') or base.get('street_date') or '')
     tt = re.search(r"tt\d{5,}", str(base.get('imdb_id') or base.get('imdb_url') or ''))
     if tt:
-        discovered = fetch_metadata_by_tt(tt.group(0), is_movie, title) or {}
+        discovered = fetch_metadata_by_tt(tt.group(0), is_movie, title, year_hint=yr) or {}
     else:
-        discovered = fetch_metadata(title, is_movie) or {}
+        discovered = fetch_metadata(title, is_movie, year_hint=yr) or {}
     merged = dict(discovered)
     for k, v in base.items():
         if v not in (None, ''):
@@ -2011,10 +2013,11 @@ def api_lookup():
         row = make_row(title, False, '', dict(meta), game=True)
         return jsonify({'discovered': meta, 'row': row})
     is_movie = 'tv' not in kind
+    yr = request.args.get('released_on', '') or request.args.get('year', '')
     if tt:
-        meta = fetch_metadata_by_tt(tt, is_movie, title)
+        meta = fetch_metadata_by_tt(tt, is_movie, title, year_hint=yr)
     else:
-        meta = fetch_metadata(title, is_movie)
+        meta = fetch_metadata(title, is_movie, year_hint=yr)
     row = make_row(title or tt, is_movie, '', dict(meta))
     return jsonify({'discovered': meta, 'row': row})
 
@@ -2466,14 +2469,22 @@ def build_review(src, auto_fetch=True, progress=None):
 
         meta = {}
         if auto_fetch:
+            rel_year = hints.get('released_on', '')  # check the release date first
             tt = re.search(r'tt\d{5,}', str(r.get(lower_cols.get('imdb_id', ''), '') or ''))
             if tt:
-                meta = dict(fetch_metadata_by_tt(tt.group(0), is_movie, t) or {})
+                meta = dict(fetch_metadata_by_tt(tt.group(0), is_movie, t, year_hint=rel_year) or {})
             else:
-                meta = dict(fetch_metadata(t, is_movie) or {})
+                meta = dict(fetch_metadata(t, is_movie, year_hint=rel_year) or {})
         for k, v in hints.items():
             if meta.get(k) in (None, ''):
                 meta[k] = v
+        # date-first IMDb: surface the resolver's year note as a review finding
+        _imdb_note = meta.pop('_imdb_year_note', '')
+        if _imdb_note:
+            findings.append(dict(
+                row=i + 2, title=t, column='imdb_id', status='Mismatch',
+                current=str(r.get(lower_cols.get('imdb_id', ''), '') or ''),
+                suggested=_imdb_note))
 
         exp_net = str(meta.get('network') or
                       r.get(lower_cols.get('network', ''), '') or '').strip()
