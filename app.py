@@ -148,11 +148,11 @@ _NETWORK_TO_MANAGER = {
 }
 _NETWORK_TO_SUBCATEGORY = {
     "Disney": "Release - Wide\nStudio - Major",
-    "Warner Bros.": "Language Type - English\nRelease - Wide\nStudio - Major",
+    "Warner Bros.": "Release - Wide\nStudio - Major",
     "Sony / Columbia": "Release - Wide\nStudio - Independent",
     "Amazon MGM Studios": "Release - Wide\nStudio - Independent",
     "AMC Network": "Release - Wide\nStudio - Independent",
-    "Neon": "Language Type - English\nRelease - Wide\nStudio - Independent",
+    "Neon": "Release - Wide\nStudio - Independent",
     "Cineverse": "Release - Wide\nStudio - Independent",
 }
 # extra brand_set lines a DAR row carries when its network's parent company
@@ -1293,6 +1293,18 @@ def make_row(title, is_movie, network="", metadata=None, talent=False, game=Fals
     return create_tv_row(title, network, metadata)
 
 
+def _strip_language_subcategory(sub):
+    """Drop any 'Language Type - ...' line from a title_sub_category value.
+
+    Movies do not carry Language Type in their sub-category (it belongs to TV
+    Shows), so it is removed regardless of source: an explicit upload, the
+    per-network subcategory map, or a reference-template default.
+    """
+    lines = [ln for ln in str(sub or '').split('\n')
+             if not ln.strip().lower().startswith('language type')]
+    return '\n'.join(lines)
+
+
 def create_row(title, is_movie, network="", metadata=None):
     """Create a data row for a title - ALL 42 COLUMNS POPULATED.
 
@@ -1321,15 +1333,11 @@ def create_row(title, is_movie, network="", metadata=None):
     _sub = _sub_explicit
     _scale = str(metadata.get('release_scale') or '').strip().title()
     if not _sub and sinfo:
-        # template-driven: Language (when known) + Release scale + Studio Type
-        lang = str(metadata.get('original_language') or '').strip().lower()
-        lang_line = ''
-        if lang:
-            lang_line = 'Language Type - English\n' if lang in ('en', 'english') \
-                else 'Language Type - Other\n'
+        # template-driven: Release scale + Studio Type. Movies deliberately omit
+        # Language Type from title_sub_category.
         scale = _scale if _scale in ('Wide', 'Limited') else 'Limited'
         stype = sinfo.get('studio_type') or 'Studio - Independent'
-        _sub = f"{lang_line}Release - {scale}\n{stype}"
+        _sub = f"Release - {scale}\n{stype}"
     if not _sub and REF is not None:
         _sub = REF.subcategory_for(eff_network)
     if not _sub:
@@ -1338,6 +1346,11 @@ def create_row(title, is_movie, network="", metadata=None):
     # it overrides the per-network default (but never an explicit upload value)
     if _scale in ('Wide', 'Limited') and not _sub_explicit:
         _sub = re.sub(r'Release - (Wide|Limited)', 'Release - ' + _scale, _sub)
+    # Movies never carry a Language Type line in title_sub_category; strip it from
+    # whatever source produced _sub (network subcategory map, reference default,
+    # or an explicit upload).
+    if is_movie:
+        _sub = _strip_language_subcategory(_sub)
     is_wide = 'release - wide' in _sub.lower()
 
     # curated PARENT company of the network (e.g. Warner Bros. -> Warner Bros. Pictures)
