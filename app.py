@@ -2320,6 +2320,13 @@ def _kw_terms(v):
     return phrases, words
 
 
+def _normalize_url_protocol(url):
+    """Normalize http:// and https:// to https:// for comparison."""
+    if not url:
+        return url
+    return str(url).replace('http://', 'https://')
+
+
 def _review_compare(col, manual_raw, expected_raw, title='', cat='',
                     manual_genre='', sub_raw=''):
     """Column-aware comparison. Returns (ok, suggested_str).
@@ -2360,6 +2367,12 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
 
     if c in ('title_sub_category', 'brand_set'):
         return exp_lines <= man_lines, sugg
+
+    # URL protocol normalization: http and https are equivalent
+    if c in ('imdb_id', 'metacritic', 'rottentomatoes'):
+        mval_norm = _normalize_url_protocol(mval)
+        eval_norm = _normalize_url_protocol(eval_)
+        return mval_norm == eval_norm, sugg
 
     if c in ('twitter_search_terms', 'youtube_channel_username',
              'youtube_channel_company'):

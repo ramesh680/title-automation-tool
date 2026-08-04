@@ -1982,7 +1982,7 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
             meta["network"] = dist
 
     # 3) Wikidata item -> RT / metacritic / socials / own-YouTube / distributor
-    _fill(meta, wikidata_meta(title_hint, qid=(wqid or wikidata_id), is_movie=is_movie, tt=tt))
+    _fill(meta, wikidata_meta(title_hint, qid=(wqid or wikidata_id), is_movie=is_movie, tt=tt, verify=True))
 
     # 4) OMDb by exact id -> genre / release fallback (reliable API)
     _fill(meta, omdb_by_id(tt))
@@ -1995,7 +1995,7 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
     prod_co = tmeta.pop("production_company", None)
     _fill(meta, tmeta)
     if not (wqid or wikidata_id) and wid:
-        _fill(meta, wikidata_meta(title_hint, qid=wid, is_movie=is_movie, tt=tt))
+        _fill(meta, wikidata_meta(title_hint, qid=wid, is_movie=is_movie, tt=tt, verify=True))
 
     # 6) IMDb page scrape -- genre + datePublished as last resort
     imeta = imdb_scrape(tt)
@@ -2136,7 +2136,7 @@ def fetch_metadata(title, is_movie=True, year_hint=""):
             tmdb_meta.pop("production_company", None)
             tmdb_meta.pop("released_on_us", None)
             _fill(meta, tmdb_meta)
-            _fill(meta, wikidata_meta(lookup, qid=wid, is_movie=is_movie))
+            _fill(meta, wikidata_meta(lookup, qid=wid, is_movie=is_movie, verify=True))
             _fill(meta, omdb_lookup(lookup, want_year))
             _yr = want_year or _year_from(meta.get("released_on"))
             mc = resolve_metacritic(lookup, is_movie,
