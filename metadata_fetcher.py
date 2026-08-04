@@ -1341,6 +1341,12 @@ def _person_prominence(ent):
             1 if _claim_values(claims, "P345") else 0)
 
 
+def _imdb_prof(item):
+    """The profession an IMDb suggestion item leads with, e.g. 'actress' from
+    's': 'Actress, I'm a Virgo (2023)'. '' when absent."""
+    return str(item.get("s") or "").split(",", 1)[0].strip().lower()
+
+
 def _pick_person_imdb(base, p345, cands):
     """Choose a person's IMDb nm from the suggestion candidates for `base`.
 
@@ -1641,6 +1647,22 @@ def fetch_person(name, qid=None, profession=""):
                         "Wikidata's IMDb link (%s) is not named '%s' on IMDb; used "
                         "the correctly-named %s instead - please confirm the person."
                         % (p345, base, nm))
+                # Several IMDb people share this EXACT name AND profession (e.g.
+                # two 'Kara Young' actresses, nm4526977 and nm16990294). Name
+                # can't tell them apart -- flag so a reviewer confirms the page.
+                chosen = next((it for it in cands if it.get("id") == nm), None)
+                if chosen and _imdb_prof(chosen):
+                    same = [it["id"] for it in cands
+                            if _norm(it.get("l")) == _norm(base)
+                            and _imdb_prof(it) == _imdb_prof(chosen)]
+                    if len(same) >= 2:
+                        meta["needs_review"] = True
+                        meta.setdefault(
+                            "review_reason",
+                            "IMDb lists %d people named '%s' as %s (%s); using %s "
+                            "- verify it is the right page."
+                            % (len(same), base, _imdb_prof(chosen).title(),
+                               ", ".join(same[:5]), nm))
             elif "imdb_id" in meta:
                 meta.pop("imdb_id", None)
     except Exception as e:  # noqa: BLE001

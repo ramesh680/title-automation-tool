@@ -176,3 +176,45 @@ class AmbiguousDisambiguation(unittest.TestCase):
     def test_ambiguous_name_emits_no_imdb_id(self):
         meta = mf.fetch_person("Kara Young")
         self.assertNotIn("imdb_id", meta)
+
+
+class SameNameSameProfessionNote(unittest.TestCase):
+    """When IMDb has 2+ people of the same name AND profession, flag to verify
+    the page (the two 'Kara Young' actresses, nm4526977 vs nm16990294)."""
+    def _snak(self, v): return {"mainsnak": {"snaktype": "value", "datavalue": {"value": v}}}
+    def setUp(self):
+        self._e, self._c, self._l, self._gj = mf._entity, mf._search_candidates, mf._labels, mf._get_json
+        mf._CACHE.clear()
+        actress = {"claims": {"P31": [self._snak({"id": "Q5"})],
+                              "P345": [self._snak("nm4526977")]},
+                   "labels": {"en": {"value": "Kara Young"}}, "aliases": {"en": []},
+                   "sitelinks": {"enwiki": {"title": "Kara Young (actress)"}}}
+        mf._entity = lambda q: actress          # single notable human -> not ambiguous
+        mf._search_candidates = lambda t, limit=6: ["Qactress"]
+        mf._labels = lambda qs: {}
+        mf._get_json = lambda *a, **k: {"d": [
+            {"id": "nm4526977", "l": "Kara Young", "s": "Actress, I'm a Virgo (2023)"},
+            {"id": "nm16990294", "l": "Kara Young", "s": "Actress, Gone (2024)"}]}
+    def tearDown(self):
+        mf._entity, mf._search_candidates, mf._labels, mf._get_json = self._e, self._c, self._l, self._gj
+        mf._CACHE.clear()
+
+    def test_imdb_prof_helper(self):
+        self.assertEqual(mf._imdb_prof({"s": "Actress, I'm a Virgo (2023)"}), "actress")
+        self.assertEqual(mf._imdb_prof({}), "")
+
+    def test_keeps_wikidata_nm_but_flags_same_name_same_profession(self):
+        meta = mf.fetch_person("Kara Young")
+        self.assertEqual(meta.get("imdb_id"), "https://www.imdb.com/name/nm4526977")
+        self.assertTrue(meta.get("needs_review"))
+        r = meta.get("review_reason", "")
+        self.assertIn("Actress", r)
+        self.assertIn("nm16990294", r)   # the alternative is named in the note
+
+    def test_no_note_when_only_one_of_that_profession(self):
+        mf._get_json = lambda *a, **k: {"d": [
+            {"id": "nm4526977", "l": "Kara Young", "s": "Actress, I'm a Virgo (2023)"},
+            {"id": "nm3190176", "l": "Kara Young", "s": "Producer, Short (2016)"}]}
+        meta = mf.fetch_person("Kara Young")
+        self.assertEqual(meta.get("imdb_id"), "https://www.imdb.com/name/nm4526977")
+        self.assertFalse(meta.get("needs_review"))
