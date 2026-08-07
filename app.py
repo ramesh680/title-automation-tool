@@ -2272,11 +2272,15 @@ def _sub_parts(sub):
 # alternatives are no longer flagged as Mismatch.
 
 _FANPAGE_RE = re.compile(r'fan[\s_-]?(page|club)|fanpage', re.I)
-# never valid in a manual value (reviewer: /p/ and /people/ URLs are not valid)
-_BAD_FB_MANUAL_RE = re.compile(r'facebook\.com/(p/|people/)', re.I)
+# never valid in a manual value (Rule 5): /p/, /php/ and /people/ path URLs and
+# profile.php URLs are not real page URLs, so such a Facebook value is not
+# usable data.
+_BAD_FB_MANUAL_RE = re.compile(
+    r'facebook\.com/(?:p|php|people)/|facebook\.com/profile\.php', re.I)
 # additionally never offered as a suggestion (unhelpful discovered URLs)
 _BAD_FB_SUGG_RE = re.compile(
-    r'facebook\.com/(p/|people/|profile\.php|pages/|\d+/*$)', re.I)
+    r'facebook\.com/(?:p|php|people|pages)/|facebook\.com/profile\.php|facebook\.com/\d+/*$',
+    re.I)
 
 
 def _review_lines_ci(v):
@@ -2327,6 +2331,17 @@ def _normalize_url_protocol(url):
     return str(url).replace('http://', 'https://')
 
 
+def _url_equiv_key(url):
+    """Scheme- and trailing-slash-insensitive key for URL comparison (Rule 2).
+    http vs https, a leading 'www.' and any trailing '/' are not meaningful
+    differences, so 'http://www.imdb.com/title/tt1/' and
+    'https://imdb.com/title/tt1' produce the same key."""
+    s = str(url or '').strip().lower()
+    s = re.sub(r'^https?://', '', s)
+    s = re.sub(r'^www\.', '', s)
+    return s.rstrip('/')
+
+
 def _review_compare(col, manual_raw, expected_raw, title='', cat='',
                     manual_genre='', sub_raw=''):
     """Column-aware comparison. Returns (ok, suggested_str).
@@ -2347,10 +2362,14 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
       * wikipedia_page                  - page slug must match the title and
         must not conflict with the title/sub-category (e.g. an
         '(American_football)' page for an Actor is still an error).
-      * facebook_page                   - /p/ and /people/ URLs are never
-        valid (flagged in the manual value); 'Fanpage', profile.php and bare
-        numeric-id URLs are additionally never offered as suggestions.
+      * facebook_page                   - /p/, /php/, /people/ and profile.php
+        URLs are never valid (always flagged in the manual value, even when no
+        value was discovered); 'Fanpage', /pages/ and bare numeric-id URLs are
+        additionally never offered as a suggestion.
       * instagram_user                  - 'Fanpage' handles are ignored.
+      * imdb_id / metacritic /          - compared by identifier, not exact
+        rottentomatoes                    string: http vs https and a trailing
+        '/' are ignored, so those variants are not a mismatch (Rule 2).
     """
     c = str(col or '').strip().lower()
     mval = _review_norm(manual_raw)
@@ -2360,6 +2379,15 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
     if c == 'genre' and sugg:          # top-3 genres only in suggestions
         sugg = '\n'.join([l.strip() for l in sugg.split('\n') if l.strip()][:3])
 
+    # Facebook hygiene (Rule 5) applies regardless of any discovered value: a
+    # /p/, /php/, /people/ or profile.php URL is never usable data and is always
+    # flagged, even when discovery found nothing to compare against (so the
+    # "expected empty -> pass" short-circuit below can't let it through).
+    if c == 'facebook_page' and mval and _BAD_FB_MANUAL_RE.search(mval):
+        good = [l for l in sorted(_review_lines_ci(eval_))
+                if not _BAD_FB_SUGG_RE.search(l) and not _FANPAGE_RE.search(l)]
+        return False, ('\n'.join(good) if good else sugg)
+
     if not eval_ or mval == eval_:
         return True, sugg
 
@@ -2368,11 +2396,12 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
     if c in ('title_sub_category', 'brand_set'):
         return exp_lines <= man_lines, sugg
 
-    # URL protocol normalization: http and https are equivalent
+    # imdb_id / metacritic / rottentomatoes: compared by identifier, not exact
+    # string (Rule 2). http vs https and a trailing '/' are not meaningful, so a
+    # curated URL differing only in scheme or trailing slash is NOT a mismatch
+    # (e.g. http://www.imdb.com/title/tt14125350/ == https://www.imdb.com/title/tt14125350).
     if c in ('imdb_id', 'metacritic', 'rottentomatoes'):
-        mval_norm = _normalize_url_protocol(mval)
-        eval_norm = _normalize_url_protocol(eval_)
-        return mval_norm == eval_norm, sugg
+        return _url_equiv_key(mval) == _url_equiv_key(eval_), sugg
 
     if c in ('twitter_search_terms', 'youtube_channel_username',
              'youtube_channel_company'):
