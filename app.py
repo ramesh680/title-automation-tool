@@ -1167,14 +1167,24 @@ _GAME_KW_TAIL = ('"Video Game" OR Playstation OR iOS OR PS4 OR PS5 OR Xbox OR '
 _GAME_RD_TAIL = ('"Video Game" | Playstation | iOS | PS4 | PS5 | Xbox | '
                  'Switch | Switch 2 | PC')
 
-# discovered platform label -> template platform tail
+# discovered platform label -> template platform tail. Keys are lower-cased and
+# cover the spellings Wikidata AND Metacritic use for the same platform, so a
+# label like 'Xbox Series X and Series S' or 'PlayStation 5 Pro' normalises
+# instead of being silently dropped from the sub-category cell.
 _GAME_PLATFORM_ALIAS = {
-    'playstation 5': 'PS5', 'playstation 4': 'PS4', 'playstation 2': 'PS2',
-    'playstation': 'PS5', 'xbox series x': 'Xbox Series X',
-    'xbox series x/s': 'Xbox Series X', 'xbox series s': 'Xbox Series X',
-    'xbox one': 'Xbox One', 'nintendo switch 2': 'Switch 2',
-    'nintendo switch': 'Switch', 'microsoft windows': 'PC', 'windows': 'PC',
-    'macos': 'PC', 'linux': 'PC', 'ios': 'Mobile', 'android': 'Mobile',
+    'playstation 5': 'PS5', 'playstation 5 pro': 'PS5', 'ps5': 'PS5',
+    'playstation 4': 'PS4', 'playstation 4 pro': 'PS4', 'ps4': 'PS4',
+    'playstation 2': 'PS2', 'playstation': 'PS5',
+    'xbox series x': 'Xbox Series X', 'xbox series x/s': 'Xbox Series X',
+    'xbox series x|s': 'Xbox Series X', 'xbox series s': 'Xbox Series X',
+    'xbox series x and series s': 'Xbox Series X',
+    'xbox series x and s': 'Xbox Series X', 'xbox series': 'Xbox Series X',
+    'xbox one': 'Xbox One', 'xbox one x': 'Xbox One',
+    'nintendo switch 2': 'Switch 2', 'switch 2': 'Switch 2',
+    'nintendo switch': 'Switch', 'switch': 'Switch',
+    'microsoft windows': 'PC', 'windows': 'PC', 'windows pc': 'PC',
+    'pc': 'PC', 'macos': 'PC', 'mac os': 'PC', 'linux': 'PC',
+    'ios': 'Mobile', 'ipados': 'Mobile', 'android': 'Mobile',
     'game boy': 'Game Boy',
 }
 
