@@ -1704,25 +1704,71 @@ _GAME_TYPES = {"Q7889", "Q116776512", "Q865493"}  # video game (+ expansions)
 # each blank with a loud «CONFIRM ...» placeholder. Metacritic's game page lists
 # all three, so we scrape it to fill ONLY the fields Wikidata left empty -- it is
 # a fallback source, never an override (see the gap-fill block in fetch_game).
+# Metacritic /game/ path segments that are platform hubs / listings, never an
+# individual game -- so the search fallback never mistakes one for a result.
+_MC_NONGAME_SLUGS = {
+    "pc", "ps5", "ps4", "ps3", "ps2", "ps1", "playstation-5", "playstation-4",
+    "playstation-3", "playstation", "xbox-series-x", "xbox-one", "xbox-360",
+    "xbox", "switch", "switch-2", "nintendo-switch", "nintendo-switch-2",
+    "nintendo-64", "gamecube", "wii", "wii-u", "3ds", "ds", "vita", "psp",
+    "ios", "android", "stadia", "mobile", "dreamcast", "browser",
+}
+
+
+def _mc_search_game(title):
+    """Best-effort Metacritic /game/ URL via Metacritic's own search, used when
+    the slugged URL doesn't resolve (editions, subtitles, odd punctuation, a
+    renamed game). Returns the first genuine game result that verifies, or ''.
+    Fails soft: any network/parse error yields ''."""
+    q = str(title or "").strip()
+    if not q:
+        return ""
+    enc = urllib.parse.quote(q)
+    for su in ("https://www.metacritic.com/search/%s/?category=13" % enc,
+               "https://www.metacritic.com/search/game/%s/results" % enc):
+        try:
+            html = _get_html(su)
+        except Exception:  # noqa: BLE001
+            html = ""
+        if not html:
+            continue
+        seen = set()
+        for m in re.finditer(r'href=["\'](?:https?://www\.metacritic\.com)?'
+                             r'/game/([a-z0-9][a-z0-9\-]*)/?["\']', html, re.I):
+            slug = m.group(1).lower()
+            if slug in _MC_NONGAME_SLUGS or slug in seen:
+                continue
+            seen.add(slug)
+            url = "https://www.metacritic.com/game/%s/" % slug
+            if not VALIDATE_URLS or _mc_alive(url):
+                return url
+    return ""
+
+
 def _resolve_metacritic_game(title, candidate=None):
     """A Metacritic /game/ URL that is known (or safely presumed) valid, or ''.
 
-    Prefers an already-known ``candidate`` (e.g. Wikidata's P1712). Otherwise it
-    slugs the title the same way Metacritic builds its paths -- so
-    'Agefield High: Rock the School' -> '.../game/agefield-high-rock-the-school/'
-    -- and accepts it only on a verified 200 (or unconditionally when URL
-    validation is switched off)."""
+    Resolution order:
+      1. an already-known ``candidate`` (e.g. Wikidata's P1712), if it verifies;
+      2. the slugged title -- Metacritic builds paths the same way, so
+         'Agefield High: Rock the School' -> '.../game/agefield-high-rock-the-school/';
+      3. Metacritic's own search, for titles whose slug doesn't match the page
+         URL (editions, subtitles, odd punctuation).
+    A slugged/searched URL is accepted only on a verified 200 (or
+    unconditionally when URL validation is switched off)."""
     if candidate:
         cand = str(candidate).replace("http://", "https://")
         if not VALIDATE_URLS or _mc_alive(cand):
             return cand
     slug = _mc_slug(title)
-    if not slug:
-        return ""
-    url = "https://www.metacritic.com/game/%s/" % slug
-    if not VALIDATE_URLS:
-        return url
-    return url if _mc_alive(url) else ""
+    if slug:
+        url = "https://www.metacritic.com/game/%s/" % slug
+        if not VALIDATE_URLS:
+            return url
+        if _mc_alive(url):
+            return url
+    # slug missing or 404 -> ask Metacritic search for the real URL
+    return _mc_search_game(title)
 
 
 def _mc_clean_company(value):
@@ -2054,21 +2100,26 @@ def fetch_game(name, qid=None):
         alive = _mc_alive(meta["metacritic"]) if VALIDATE_URLS else True
         if alive is False:
             meta.pop("metacritic")
-    # ---- Metacritic gap-fill (fallback source, never an override) ----
-    # Wikidata has no entry for brand-new / obscure games, so developer,
-    # publisher (network) and platforms come back blank -- which the ingest then
-    # flags with loud «CONFIRM ...» placeholders. Metacritic's game page lists
-    # all three, so when Wikidata left a gap we resolve the game's Metacritic URL
-    # (reusing a curated one if present) and copy across ONLY the fields our own
-    # meta is still missing. A URL we discover this way is also kept.
-    if clean and not (meta.get("developer") and meta.get("network")
-                      and meta.get("platforms")):
+    # ---- Metacritic is the PRIMARY source for a game's developer, publisher
+    # (network) and platforms. Metacritic's data is more current and complete
+    # than Wikidata's for games -- and its platform labels ('PC', 'PS5',
+    # 'Xbox Series X', 'Switch 2') map straight onto the template -- so when the
+    # Metacritic page is found ITS values win for those three fields, with
+    # Wikidata kept only as the fallback for whatever Metacritic doesn't list.
+    # Genre and release date stay gap-fill (Wikidata's are already clean).
+    # The page is resolved for EVERY game: a curated Wikidata URL first, then the
+    # slug, then a Metacritic search. A URL discovered here is kept only when the
+    # scrape actually yielded data (so a bad search hit never pollutes the cell).
+    if clean:
         mc_url = _resolve_metacritic_game(clean, candidate=meta.get("metacritic"))
         if mc_url:
             mc = fetch_metacritic_game(mc_url)
-            for k in ("developer", "network", "platforms", "genre", "released_on"):
+            for k in ("developer", "network", "platforms"):
+                if mc.get(k):
+                    meta[k] = mc[k]           # Metacritic wins
+            for k in ("genre", "released_on"):
                 if not meta.get(k) and mc.get(k):
-                    meta[k] = mc[k]
+                    meta[k] = mc[k]           # gap-fill only
             if mc and not meta.get("metacritic"):
                 meta["metacritic"] = mc_url
     # Wikidata lists a game's channel far less often than a film's, so fall back
