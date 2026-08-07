@@ -18,6 +18,7 @@ in later (they can reuse metadata_fetcher / the repo logic).
 import csv
 import io
 import re
+from datetime import datetime
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment
@@ -68,6 +69,12 @@ DEFAULT_RULES = {
         {"sheet": "*", "column": "wikipedia_page",
          "check": "english_wikipedia_url_matches_title", "accepted_host": "en.wikipedia.org",
          "message": "Wikipedia URLs must be en.wikipedia.org/wiki/... and match the title."},
+        {"sheet": "*", "column": "facebook_page", "check": "facebook_page_hygiene",
+         "message": "Facebook page must not be a /p/, /php/, /people/ or profile.php URL."},
+        {"sheet": "*", "column": "released_on", "check": "release_date_valid",
+         "applies_to": ["Movies", "TV Shows"],
+         "message": "released_on must be a valid release date (YYYY-MM-DD) for Movies and "
+                    "TV Shows."},
         {"sheet": "*", "column": "url_managers",
          "check": "contains_companies_and_platform_accounts",
          "company_column": "companies",
@@ -289,6 +296,59 @@ def _chk_contains_companies_and_platform_accounts(val, row, rule):
     return None, ""
 
 
+# Facebook page hygiene (Rule 5, Aug 2026): a Facebook value that is a /p/,
+# /php/ or /people/ path URL, or a profile.php URL, is not a usable page URL --
+# such values must not be kept in the data, so the cell fails.
+_FB_BAD_PATH_RE = re.compile(
+    r"facebook\.com/(?:p|php|people)/|facebook\.com/profile\.php", re.I)
+
+
+def _chk_facebook_page_valid(val, row, rule):
+    v = _s(val)
+    if v == "":
+        return None, ""  # blank is a gap, not a bad value
+    for line in v.splitlines():
+        line = line.strip()
+        if line and _FB_BAD_PATH_RE.search(line):
+            return SEV_FAIL, rule.get(
+                "message",
+                "Facebook page must not be a /p/, /php/, /people/ or profile.php URL.")
+    return None, ""
+
+
+# Release date validation (Rule 6, Aug 2026): Movies and TV Shows must carry a
+# valid release date in released_on. A missing date is a pending-lookup warning
+# (consistent with the imdb/metacritic checks); a present-but-malformed or
+# impossible date is a hard failure.
+_DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y", "%b %d, %Y",
+                 "%B %d, %Y", "%d %b %Y", "%d %B %Y")
+
+
+def _chk_release_date_valid(val, row, rule):
+    applies = [a.lower() for a in rule.get("applies_to", [])]
+    if applies and _norm(_row_get(row, "title_category")) not in applies:
+        return None, ""
+    v = _s(val)
+    if v == "":
+        return SEV_WARN, "Release date missing (lookup from title pending)."
+    parsed = None
+    for fmt in _DATE_FORMATS:
+        try:
+            parsed = datetime.strptime(v, fmt)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        # accept a bare, plausible 4-digit year as a softer signal
+        if re.fullmatch(r"\d{4}", v) and 1888 <= int(v) <= datetime.now().year + 10:
+            return SEV_WARN, "Release date is a year only; a full YYYY-MM-DD date is preferred."
+        return SEV_FAIL, rule.get("message", "released_on is not a valid date.")
+    if not (1888 <= parsed.year <= datetime.now().year + 10):
+        return SEV_FAIL, rule.get(
+            "message", "released_on year is outside the plausible range.")
+    return None, ""
+
+
 CHECKS = {
     "not_blank_and_not_placeholder": _chk_not_blank_and_not_placeholder,
     "approved_category": _chk_approved_category,
@@ -304,6 +364,9 @@ CHECKS = {
     "english_wikipedia_url_matches_title": _chk_english_wikipedia_url_matches_title,
     "wikidata_english_wikipedia_url_matches_title": _chk_english_wikipedia_url_matches_title,
     "contains_companies_and_platform_accounts": _chk_contains_companies_and_platform_accounts,
+    "facebook_page_hygiene": _chk_facebook_page_valid,
+    "release_date_valid": _chk_release_date_valid,
+    "lookup_release_date_from_title": _chk_release_date_valid,  # alias
 }
 
 

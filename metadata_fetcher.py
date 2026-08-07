@@ -422,6 +422,13 @@ def _facebook_alive(page):
     return _url_status(p.replace("http://", "https://")) not in (404, 410)
 
 
+# Facebook page hygiene (Rule 5, Aug 2026): a /p/, /php/ or /people/ path URL,
+# or a profile.php URL, is not a real usable page URL -- such values are dropped
+# from discovery so they never reach the export or the review's expected value.
+_FB_BAD_PATH_RE = re.compile(
+    r"facebook\.com/(?:p|php|people)/|facebook\.com/profile\.php", re.I)
+
+
 def verify_socials(meta, title=None, reject_foreign=False):
     """Drop social handles that are wrong or dead.
 
@@ -438,6 +445,13 @@ def verify_socials(meta, title=None, reject_foreign=False):
             if v and _handle_foreign_to_title(v, title):
                 log.info("dropping %s %r - looks like a band/artist, not %r", k, v, title)
                 meta.pop(k, None)
+    # Facebook /p/, /php/, /people/ and profile.php URLs are never usable data;
+    # drop them here so they reach neither the export nor the review's expected
+    # value. This is a format rule, so it runs even when VALIDATE_URLS is off.
+    fb = meta.get("facebook_page")
+    if fb and _FB_BAD_PATH_RE.search(str(fb)):
+        log.info("dropping unusable facebook page %r (/p/, /php/, /people/ or profile.php)", fb)
+        meta.pop("facebook_page", None)
     if not VALIDATE_URLS:
         return meta
     if meta.get("twitter_handle") and not _twitter_alive(meta["twitter_handle"]):
