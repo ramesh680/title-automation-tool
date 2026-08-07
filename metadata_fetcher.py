@@ -1698,6 +1698,272 @@ def fetch_person(name, qid=None, profession=""):
 _GAME_TYPES = {"Q7889", "Q116776512", "Q865493"}  # video game (+ expansions)
 
 
+# ---------------- Metacritic game scraping (Wikidata gap-fill) ----------------
+# Wikidata carries no entry for brand-new or obscure games, so fetch_game leaves
+# developer / publisher (network) / platforms blank and the ingest then flags
+# each blank with a loud «CONFIRM ...» placeholder. Metacritic's game page lists
+# all three, so we scrape it to fill ONLY the fields Wikidata left empty -- it is
+# a fallback source, never an override (see the gap-fill block in fetch_game).
+def _resolve_metacritic_game(title, candidate=None):
+    """A Metacritic /game/ URL that is known (or safely presumed) valid, or ''.
+
+    Prefers an already-known ``candidate`` (e.g. Wikidata's P1712). Otherwise it
+    slugs the title the same way Metacritic builds its paths -- so
+    'Agefield High: Rock the School' -> '.../game/agefield-high-rock-the-school/'
+    -- and accepts it only on a verified 200 (or unconditionally when URL
+    validation is switched off)."""
+    if candidate:
+        cand = str(candidate).replace("http://", "https://")
+        if not VALIDATE_URLS or _mc_alive(cand):
+            return cand
+    slug = _mc_slug(title)
+    if not slug:
+        return ""
+    url = "https://www.metacritic.com/game/%s/" % slug
+    if not VALIDATE_URLS:
+        return url
+    return url if _mc_alive(url) else ""
+
+
+def _mc_clean_company(value):
+    """Trim a developer/publisher string, dropping a leading 'Developer -' /
+    'Publisher -' prefix and surrounding whitespace/punctuation."""
+    s = re.sub(r"^\s*(developer|publisher)s?\s*[-:]\s*", "", str(value or ""),
+               flags=re.IGNORECASE)
+    return s.strip().strip(",").strip()
+
+
+def _mc_label_values(soup, labels):
+    """Values that follow a 'Label:' heading on a Metacritic game page.
+
+    Anchors on the visible label TEXT (confirmed present: 'Developer:',
+    'Publisher:', 'Platforms:') rather than CSS class names, so it survives
+    Metacritic's frequent markup churn. Climbs at most three ancestors from the
+    label node to the row that also holds the value(s); prefers <a>/<li> text,
+    then falls back to the row's remaining text (comma/newline split). Returns a
+    case-insensitively de-duplicated, order-preserving list."""
+    wanted = {str(l).lower().rstrip(":").strip() for l in labels}
+    found = []
+    for node in soup.find_all(string=True):
+        if str(node).strip().rstrip(":").strip().lower() not in wanted:
+            continue
+        row = node.parent
+        for _ in range(3):
+            if row is None:
+                break
+            vals = [a.get_text(" ", strip=True) for a in row.find_all("a")]
+            if not vals:
+                vals = [li.get_text(" ", strip=True) for li in row.find_all("li")]
+            if not vals:
+                text = row.get_text("\n", strip=True)
+                # drop the label itself, then split the remainder
+                text = re.sub(r"(?i)^\s*(developer|publisher|platform)s?\s*:?",
+                              "", text).strip()
+                vals = re.split(r"[\n,]+", text)
+            vals = [v.strip() for v in vals if v and
+                    v.strip().rstrip(":").strip().lower() not in wanted]
+            if vals:
+                found = vals
+                break
+            row = row.parent
+        if found:
+            break
+    seen, out = set(), []
+    for v in found:
+        if v.lower() not in seen:
+            seen.add(v.lower())
+            out.append(v)
+    return out
+
+
+def _mc_from_jsonld(html, out):
+    """Fill developer / network / platforms / genre / released_on from any
+    schema.org VideoGame JSON-LD block. Best-effort; silent on malformed JSON."""
+    for m in re.finditer(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html, re.S):
+        try:
+            data = json.loads(m.group(1))
+        except Exception:  # noqa: BLE001
+            continue
+        for node in (data if isinstance(data, list) else [data]):
+            if not isinstance(node, dict):
+                continue
+            t = node.get("@type", "")
+            types = t if isinstance(t, list) else [t]
+            if not any("VideoGame" in str(x) or "Game" == str(x) for x in types):
+                continue
+
+            def _name(v):
+                if isinstance(v, dict):
+                    return str(v.get("name") or "").strip()
+                return str(v or "").strip()
+
+            def _names(v):
+                if isinstance(v, list):
+                    return [n for n in (_name(x) for x in v) if n]
+                n = _name(v)
+                return [n] if n else []
+
+            devs = _names(node.get("author") or node.get("creator"))
+            if devs and not out.get("developer"):
+                out["developer"] = devs[0]
+            pubs = _names(node.get("publisher"))
+            if pubs and not out.get("network"):
+                out["network"] = pubs[0]
+            plats = _names(node.get("gamePlatform"))
+            if plats and not out.get("platforms"):
+                out["platforms"] = plats
+            genres = _names(node.get("genre"))
+            if genres and not out.get("genre"):
+                out["genre"] = genres[0]
+            dp = node.get("datePublished")
+            if dp and not out.get("released_on"):
+                d = _parse_time(str(dp)) or str(dp).strip()
+                if d:
+                    out["released_on"] = d
+
+
+def _mc_from_next_data(html, out):
+    """Fill fields from the Next.js __NEXT_DATA__ blob. Deep-searches for the
+    game item (a dict carrying a platform list) and reads its developer /
+    publisher / platform / genre / release fields under whichever of the several
+    key spellings Metacritic is using. Best-effort; silent on any mismatch."""
+    m = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+                  html, re.S)
+    if not m:
+        return
+    try:
+        data = json.loads(m.group(1))
+    except Exception:  # noqa: BLE001
+        return
+
+    def _names(v):
+        acc = []
+        for x in (v if isinstance(v, list) else [v]):
+            if isinstance(x, dict):
+                n = x.get("name") or x.get("title") or x.get("companyName")
+                if n:
+                    acc.append(str(n).strip())
+            elif x:
+                acc.append(str(x).strip())
+        return [n for n in acc if n]
+
+    item = None
+
+    def _walk(obj):
+        nonlocal item
+        if item is not None:
+            return
+        if isinstance(obj, dict):
+            plats = obj.get("platforms")
+            if isinstance(plats, list) and plats and (
+                    obj.get("title") or obj.get("name") or obj.get("production")
+                    or obj.get("developers") or obj.get("publishers")):
+                item = obj
+                return
+            for v in obj.values():
+                _walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                _walk(v)
+
+    _walk(data)
+    if not isinstance(item, dict):
+        return
+
+    if not out.get("platforms"):
+        plats = _names(item.get("platforms"))
+        if plats:
+            out["platforms"] = plats
+    if not out.get("genre"):
+        genres = _names(item.get("genres") or item.get("genre"))
+        if genres:
+            out["genre"] = genres[0]
+    if not out.get("released_on"):
+        rd = (item.get("releaseDate") or item.get("date")
+              or (item.get("releaseDates") or {}).get("release")
+              if isinstance(item.get("releaseDates"), dict) else item.get("releaseDate"))
+        if rd:
+            out["released_on"] = _parse_time(str(rd)) or str(rd).strip()
+
+    devs, pubs = [], []
+    if item.get("developers"):
+        devs = _names(item.get("developers"))
+    if item.get("publishers"):
+        pubs = _names(item.get("publishers"))
+    prod = item.get("production")
+    if isinstance(prod, dict):
+        devs = devs or _names(prod.get("developers"))
+        pubs = pubs or _names(prod.get("publishers"))
+        for c in (prod.get("companies") or []):
+            if not isinstance(c, dict):
+                continue
+            role = str(c.get("typeName") or c.get("type") or "").lower()
+            nm = str(c.get("name") or "").strip()
+            if not nm:
+                continue
+            if "develop" in role:
+                devs.append(nm)
+            elif "publish" in role:
+                pubs.append(nm)
+    if devs and not out.get("developer"):
+        out["developer"] = devs[0]
+    if pubs and not out.get("network"):
+        out["network"] = pubs[0]
+
+
+def fetch_metacritic_game(url):
+    """Scrape a Metacritic /game/ page for developer, publisher (as ``network``),
+    platforms, genre and release date. Tries structured data first (JSON-LD,
+    then the Next.js __NEXT_DATA__ blob) and falls back to the visible-label DOM
+    parse. Fails soft: returns {} on any network/parse error, and never raises.
+
+    NOTE: used only to fill blanks Wikidata left in fetch_game -- the caller
+    copies a value across ONLY when its own field is empty."""
+    out = {}
+    if not url:
+        return out
+    try:
+        html = _get_html(url.replace("http://", "https://"))
+    except Exception:  # noqa: BLE001
+        return out
+    if not html:
+        return out
+    try:
+        _mc_from_jsonld(html, out)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _mc_from_next_data(html, out)
+    except Exception:  # noqa: BLE001
+        pass
+    if not (out.get("developer") and out.get("network") and out.get("platforms")):
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
+            if not out.get("developer"):
+                devs = _mc_label_values(soup, ("Developer", "Developers"))
+                if devs:
+                    out["developer"] = _mc_clean_company(devs[0])
+            if not out.get("network"):
+                pubs = _mc_label_values(soup, ("Publisher", "Publishers"))
+                if pubs:
+                    out["network"] = _mc_clean_company(pubs[0])
+            if not out.get("platforms"):
+                plats = _mc_label_values(soup, ("Platform", "Platforms"))
+                if plats:
+                    out["platforms"] = plats
+        except Exception:  # noqa: BLE001
+            pass
+    # tidy company strings that came from structured data too
+    if out.get("developer"):
+        out["developer"] = _mc_clean_company(out["developer"])
+    if out.get("network"):
+        out["network"] = _mc_clean_company(out["network"])
+    return out
+
+
 def fetch_game(name, qid=None):
     """Auto-discover a VIDEO GAME via Wikidata: developer (P178), publisher
     (P123), platforms (P400), genres (P136), release (P577), socials,
@@ -1788,6 +2054,23 @@ def fetch_game(name, qid=None):
         alive = _mc_alive(meta["metacritic"]) if VALIDATE_URLS else True
         if alive is False:
             meta.pop("metacritic")
+    # ---- Metacritic gap-fill (fallback source, never an override) ----
+    # Wikidata has no entry for brand-new / obscure games, so developer,
+    # publisher (network) and platforms come back blank -- which the ingest then
+    # flags with loud «CONFIRM ...» placeholders. Metacritic's game page lists
+    # all three, so when Wikidata left a gap we resolve the game's Metacritic URL
+    # (reusing a curated one if present) and copy across ONLY the fields our own
+    # meta is still missing. A URL we discover this way is also kept.
+    if clean and not (meta.get("developer") and meta.get("network")
+                      and meta.get("platforms")):
+        mc_url = _resolve_metacritic_game(clean, candidate=meta.get("metacritic"))
+        if mc_url:
+            mc = fetch_metacritic_game(mc_url)
+            for k in ("developer", "network", "platforms", "genre", "released_on"):
+                if not meta.get(k) and mc.get(k):
+                    meta[k] = mc[k]
+            if mc and not meta.get("metacritic"):
+                meta["metacritic"] = mc_url
     # Wikidata lists a game's channel far less often than a film's, so fall back
     # to the verified channel search when it has none (see youtube_channel for
     # the quota note).
