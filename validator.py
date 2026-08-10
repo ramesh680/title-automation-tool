@@ -82,6 +82,18 @@ DEFAULT_RULES = {
          "platform_columns": ["facebook_page", "youtube_channel_company",
                               "instagram_user", "twitter_handle", "tiktok_user", "threads_page"],
          "message": "url_managers must reference the row's social accounts (Unknown / Pristine Brand skipped)."},
+        {"sheet": "*", "column": "network", "check": "network_boxofficemojo_checkpoint",
+         "applies_to": ["Movies", "TV Shows"],
+         "message": "network should be a specific Box Office Mojo distribution label "
+                    "(blank is allowed when Box Office Mojo lists no distributor); "
+                    "not a parent/umbrella studio."},
+        {"sheet": "*", "column": "twitter_search_terms", "check": "twitter_search_terms_structure",
+         "message": "twitter_search_terms lines must be '#hashtag or @handle|label|label' "
+                    "(DAR rows use DAR|DAR; no duplicate terms; no runs of spaces in labels)."},
+        {"sheet": "*", "column": "twitter_search_term_keywords",
+         "check": "twitter_search_term_keywords_query",
+         "message": "twitter_search_term_keywords must be boolean (\"title\") (...) queries; "
+                    "a bare #hashtag/@handle belongs in twitter_search_terms, not here."},
     ]
 }
 
@@ -349,6 +361,129 @@ def _chk_release_date_valid(val, row, rule):
     return None, ""
 
 
+# ----- Movies/Film column rules (Aug 2026) --------------------------------
+# network parent-vs-child checkpoint: Box Office Mojo is the source of truth for
+# a movie's distributor, but it often reports the studio UMBRELLA rather than the
+# specific label. These checks are SOFT (warn) so a genuinely new label is never
+# hard-blocked -- extend the lists via rule params ("parents", "approved") or here.
+NETWORK_PARENTS = {
+    # umbrella / holding distributor (lowercased) -> suggested child labels
+    "walt disney studios motion pictures":
+        ["Disney", "20th Century Studios", "Searchlight Pictures", "Pixar", "Marvel Studios", "Lucasfilm"],
+    "the walt disney company":
+        ["Disney", "20th Century Studios", "Searchlight Pictures", "Pixar", "Marvel Studios", "Lucasfilm"],
+    "walt disney studios":
+        ["Disney", "20th Century Studios", "Searchlight Pictures", "Pixar", "Marvel Studios", "Lucasfilm"],
+    "walt disney pictures":
+        ["Disney", "20th Century Studios", "Searchlight Pictures", "Pixar", "Marvel Studios", "Lucasfilm"],
+    "sony pictures releasing":
+        ["Sony / Columbia", "Columbia Pictures", "TriStar Pictures", "Screen Gems", "Sony Pictures Classics", "Affirm Films"],
+    "sony pictures entertainment":
+        ["Sony / Columbia", "Columbia Pictures", "TriStar Pictures", "Screen Gems", "Sony Pictures Classics", "Affirm Films"],
+    "sony pictures":
+        ["Sony / Columbia", "Columbia Pictures", "TriStar Pictures", "Screen Gems", "Sony Pictures Classics", "Affirm Films"],
+    "sony group corporation":
+        ["Sony / Columbia", "Columbia Pictures", "TriStar Pictures", "Screen Gems", "Sony Pictures Classics", "Affirm Films"],
+    "nbcuniversal": ["Universal Pictures", "Focus Features"],
+    "comcast": ["Universal Pictures", "Focus Features"],
+    "nbcu enterprise": ["Universal Pictures", "Focus Features"],
+    "warner bros. discovery": ["Warner Bros.", "New Line Cinema"],
+    "warnermedia": ["Warner Bros.", "New Line Cinema"],
+    "paramount global": ["Paramount Pictures"],
+    "paramount skydance": ["Paramount Pictures"],
+}
+# Approved distribution labels (leaf/child). Seeded from the Box Office Mojo
+# distributor list + the LF film feed. Off-list values only WARN.
+APPROVED_NETWORKS = {n.lower() for n in [
+    "Cineverse", "Warner Bros.", "New Line Cinema", "Disney", "20th Century Studios",
+    "Searchlight Pictures", "Pixar", "Marvel Studios", "Lucasfilm", "Universal Pictures",
+    "Focus Features", "Neon", "Sony / Columbia", "Columbia Pictures", "TriStar Pictures",
+    "Screen Gems", "Sony Pictures Classics", "Affirm Films", "A24", "IFC Films",
+    "IFC Midnight", "Angel Studios", "Vertical Entertainment", "Greenwich Entertainment",
+    "Paramount Pictures", "Lionsgate", "Lionsgate / Summit", "Roadside Attractions",
+    "GKIDS", "MUBI", "StudioCanal", "Kino Lorber", "Well Go USA Entertainment",
+    "Janus Films", "Strand Releasing", "Oscilloscope", "Variance Films",
+    "Ketchup Entertainment", "Brainstorm Media", "Indican Pictures", "Rialto Distribution",
+    "Watermelon Pictures", "Black Bear", "Dark Sky Films", "AV Entertainment Company",
+    "Trafalgar Releasing", "Fathom Events", "Iconic Events Releasing", "PBS network",
+]}
+
+
+def _chk_network_checkpoint(val, row, rule):
+    """SOFT checkpoint for the movie `network` (distribution label).
+    Blank is allowed (Box Office Mojo may list no distributor). A parent/umbrella
+    distributor warns with the child labels to use; an off-list value warns."""
+    applies = [a.lower() for a in rule.get("applies_to", [])]
+    if applies and _norm(_row_get(row, "title_category")) not in applies:
+        return None, ""
+    v = _s(val)
+    if v == "":
+        return None, ""  # blank allowed: no distributor on Box Office Mojo
+    key = v.lower()
+    parents = dict(NETWORK_PARENTS)
+    for k, kids in (rule.get("parents") or {}).items():
+        parents[k.lower()] = kids
+    if key in parents:
+        kids = ", ".join(parents[key])
+        return SEV_WARN, (rule.get("message", "network is a parent/umbrella distributor.")
+                          + f" Use the specific label (e.g. {kids}).")
+    approved = set(APPROVED_NETWORKS) | {a.lower() for a in rule.get("approved", [])}
+    if approved and key not in approved:
+        return SEV_WARN, (f"network '{v}' is not on the approved distributor-label list; "
+                          "confirm it against Box Office Mojo (or add it to the list).")
+    return None, ""
+
+
+def _chk_twitter_search_terms(val, row, rule):
+    """twitter_search_terms lines must be `#hashtag or @handle|label|label`.
+    Blank is a gap (handled elsewhere), not a bad value. DAR rows expect DAR|DAR."""
+    v = _s(val)
+    if v == "":
+        return None, ""
+    dar = _is_dar(row)
+    seen = set()
+    for raw in v.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split("|")
+        if len(parts) != 3:
+            return SEV_FAIL, (rule.get("message", "Lines must be term|label|label.")
+                              + f" Offending line: {line}")
+        term = parts[0].strip()
+        if not (term.startswith("#") or term.startswith("@")):
+            return SEV_FAIL, f"Term must start with # or @. Offending line: {line}"
+        for lab in parts[1:]:
+            if re.search(r"\s{2,}", lab):
+                return SEV_FAIL, ("Label has runs of spaces (join groups with ' + '). "
+                                  f"Offending line: {line}")
+        if dar and (parts[1].strip() != "DAR" or parts[2].strip() != "DAR"):
+            return SEV_WARN, f"DAR row labels should be 'DAR|DAR'. Offending line: {line}"
+        if term.lower() in seen:
+            return SEV_WARN, f"Duplicate term '{term}' (dedupe to avoid ingest conflicts)."
+        seen.add(term.lower())
+    return None, ""
+
+
+def _chk_twitter_search_term_keywords(val, row, rule):
+    """twitter_search_term_keywords lines must be boolean queries, never a bare
+    #hashtag/@handle (those belong in twitter_search_terms)."""
+    v = _s(val)
+    if v == "":
+        return None, ""
+    for raw in v.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#") or line.startswith("@"):
+            return SEV_FAIL, (rule.get("message", "A hashtag/handle is not a keyword.")
+                              + f" Move it to twitter_search_terms. Offending line: {line}")
+        if not line.startswith("("):
+            return SEV_WARN, ('Line should be a (\"title\") (network-clause ...) query. '
+                              f"Offending line: {line}")
+    return None, ""
+
+
 CHECKS = {
     "not_blank_and_not_placeholder": _chk_not_blank_and_not_placeholder,
     "approved_category": _chk_approved_category,
@@ -367,6 +502,10 @@ CHECKS = {
     "facebook_page_hygiene": _chk_facebook_page_valid,
     "release_date_valid": _chk_release_date_valid,
     "lookup_release_date_from_title": _chk_release_date_valid,  # alias
+    "network_boxofficemojo_checkpoint": _chk_network_checkpoint,
+    "network_checkpoint": _chk_network_checkpoint,  # alias
+    "twitter_search_terms_structure": _chk_twitter_search_terms,
+    "twitter_search_term_keywords_query": _chk_twitter_search_term_keywords,
 }
 
 
