@@ -2351,11 +2351,16 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
     _fill(meta, imeta)
 
     # production company is a LAST RESORT for network (it caused wrong
-    # distributor attributions before -- e.g. prod-co instead of Neon)
+    # distributor attributions before -- e.g. prod-co instead of Neon).
+    # MOVIES rule (Box Office Mojo is the source of truth): when BOM / Wikipedia /
+    # Wikidata yield no distributor, leave `network` BLANK rather than guessing it
+    # from a production company. TV titles may still use the prod-co last resort.
     if not meta.get("network"):
-        meta["network"] = imdb_prod_co or prod_co or ""
-        if not meta["network"]:
-            meta.pop("network")
+        fallback = "" if is_movie else (imdb_prod_co or prod_co or "")
+        if fallback:
+            meta["network"] = fallback
+        else:
+            meta.pop("network", None)
 
     # a title can have its own channel(s) alongside the distributor's; collect
     # every verified one so they share the cell, one per line
