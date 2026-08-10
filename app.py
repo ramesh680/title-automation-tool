@@ -2398,6 +2398,14 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
                 if not _BAD_FB_SUGG_RE.search(l) and not _FANPAGE_RE.search(l)]
         return False, ('\n'.join(good) if good else sugg)
 
+    # twitter_search_term_keywords: a bare #hashtag/@handle is never a keyword --
+    # it belongs in twitter_search_terms. Flag it even when discovery found no
+    # expected value to compare against (mirrors the ingest platform rule).
+    if c == 'twitter_search_term_keywords' and mval and any(
+            ln.strip().startswith(('#', '@'))
+            for ln in str(manual_raw or '').split('\n') if ln.strip()):
+        return False, sugg
+
     if not eval_ or mval == eval_:
         return True, sugg
 
@@ -2427,6 +2435,23 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
         # same terms in any case or grouping are equivalent ("both correct");
         # only a genuinely different term set (or an empty cell) is flagged
         return bool(mval) and _kw_terms(mval) == _kw_terms(eval_), sugg
+
+    if c == 'network':
+        # network blank is allowed (Box Office Mojo may list no distributor).
+        # Accept a manual value that normalises to the same LF label as the
+        # discovered one (e.g. "Walt Disney Studios Motion Pictures" -> "Disney").
+        # A parent/umbrella that cannot resolve to the expected label stays flagged.
+        if not mval:
+            return True, sugg
+        mlabel = _review_norm(_ref_normalize_network(str(manual_raw or '').strip()))
+        return mlabel.lower() == eval_.lower(), sugg
+
+    if c == 'companies':
+        # DAR rows must be "Pristine Brand"; regular rows accept any non-blank
+        # company (a real distributor name or the literal "Unknown").
+        if str(title).strip().lower().endswith('- dar'):
+            return mval.strip().lower() == 'pristine brand', 'Pristine Brand'
+        return bool(mval), sugg
 
     if c == 'genre':
         return bool(mval), sugg
