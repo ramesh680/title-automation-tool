@@ -75,6 +75,12 @@ DEFAULT_RULES = {
          "applies_to": ["Movies", "TV Shows"],
          "message": "released_on must be a valid release date (YYYY-MM-DD) for Movies and "
                     "TV Shows."},
+        {"sheet": "*", "column": "genre", "check": "mandatory_for_category",
+         "applies_to": ["Movies", "TV Shows"],
+         "message": "genre is mandatory for Movies and TV Shows and cannot be blank."},
+        {"sheet": "*", "column": "primary_genre", "check": "mandatory_for_category",
+         "applies_to": ["Movies", "TV Shows"],
+         "message": "primary_genre is mandatory for Movies and TV Shows and cannot be blank."},
         {"sheet": "*", "column": "url_managers",
          "check": "contains_companies_and_platform_accounts",
          "company_column": "companies",
@@ -132,6 +138,19 @@ def _chk_approved_category(val, row, rule):
     approved = set(a.lower() for a in rule.get("approved", APPROVED_CATEGORIES))
     if _norm(val) not in approved:
         return SEV_FAIL, rule.get("message", "Category not approved.")
+    return None, ""
+
+
+def _chk_mandatory_for_category(val, row, rule):
+    """Blank -> hard failure, but only for the categories in applies_to. Used for
+    columns that are mandatory for certain title categories (genre and
+    primary_genre for Movies & TV Shows). When applies_to is omitted the column
+    is treated as mandatory for every category."""
+    applies = [a.lower() for a in rule.get("applies_to", [])]
+    if applies and _norm(_row_get(row, "title_category")) not in applies:
+        return None, ""
+    if _s(val) == "":
+        return SEV_FAIL, rule.get("message", "This column is mandatory and cannot be blank.")
     return None, ""
 
 
@@ -342,7 +361,11 @@ def _chk_release_date_valid(val, row, rule):
         return None, ""
     v = _s(val)
     if v == "":
-        return SEV_WARN, "Release date missing (lookup from title pending)."
+        # Rule 1 (Aug 2026): released_on is MANDATORY for Movies & TV Shows --
+        # a blank is a hard failure, not a soft "lookup pending" warning.
+        return SEV_FAIL, rule.get(
+            "message",
+            "released_on is mandatory for Movies and TV Shows and cannot be blank.")
     parsed = None
     for fmt in _DATE_FORMATS:
         try:
@@ -487,6 +510,7 @@ def _chk_twitter_search_term_keywords(val, row, rule):
 CHECKS = {
     "not_blank_and_not_placeholder": _chk_not_blank_and_not_placeholder,
     "approved_category": _chk_approved_category,
+    "mandatory_for_category": _chk_mandatory_for_category,
     "dar_or_competitive_brand_set": _chk_dar_or_competitive_brand_set,
     "brand_set_present_for_category": _chk_brand_set_present_for_category,
     "dar_company_rule": _chk_dar_company_rule,
