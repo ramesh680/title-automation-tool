@@ -25,8 +25,19 @@ from typing import Any, Dict, List, Optional
 
 # reuse the exact same helpers as the ingest module
 from titleforge_ingest_ext import (
-    _get, _is_standard, _hashtag, GENERAL_TITLE_CATEGORIES,
+    _get, _is_standard, _hashtag, GENERAL_TITLE_CATEGORIES, SCHEMAS,
 )
+
+
+def _required_brand_set(schema_key: str, row: Dict[str, Any]) -> str:
+    """The brand set the ingest template requires for this row: the Standard
+    (DAR) brand set for a Standard-perspective row, otherwise the Competitive
+    one. Empty for the General schema (its brand set is carried through from the
+    source sheet), in which case the caller falls back to the first dropdown
+    value."""
+    sc = SCHEMAS.get(schema_key, {})
+    return (sc.get("brand_set_standard") if _is_standard(row)
+            else sc.get("brand_set_competitive")) or ""
 
 
 def load_rules(path: str = "titleforge_validation_rules.json") -> Dict[str, Any]:
@@ -74,13 +85,25 @@ def validate_row(row: Dict[str, Any], schema_key: str,
                 out.append(_finding(field, "mismatch", val, rule["value"], rule["msg"]))
 
         elif t == "enum":
-            if val and val not in rule["values"]:
-                # brand_set can be updated by anyone -- extra values are fine
-                # as long as at least one canonical value is present
-                if field == "brand_set":
-                    lines = [ln.strip() for ln in val.splitlines() if ln.strip()]
-                    if any(ln in rule["values"] for ln in lines):
-                        continue
+            if field == "brand_set":
+                # Brand sets already in the file are NEVER removed. Extra /
+                # curated brand sets are fine; the cell passes as long as at
+                # least one canonical (ingest-template) brand set is present.
+                # If the required brand set is missing, flag it -- Gap when the
+                # cell is empty, else Mismatch -- and suggest the file's own
+                # value with the required brand set appended, so nothing is
+                # dropped.
+                lines = [ln.strip() for ln in str(val or "").splitlines() if ln.strip()]
+                if any(ln in rule["values"] for ln in lines):
+                    continue
+                required = _required_brand_set(schema_key, row) or (
+                    rule["values"][0] if rule.get("values") else "")
+                if not lines:
+                    out.append(_finding(field, "gap", "", required, rule["msg"]))
+                else:
+                    merged = "\n".join(lines + ([required] if required else []))
+                    out.append(_finding(field, "mismatch", val, merged, rule["msg"]))
+            elif val and val not in rule["values"]:
                 out.append(_finding(field, "mismatch", val, "one of dropdown", rule["msg"]))
 
         elif t == "enum_ref":
