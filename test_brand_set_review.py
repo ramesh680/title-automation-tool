@@ -112,5 +112,55 @@ class TfxBrandSet(unittest.TestCase):
         self.assertEqual(f[0]["expected"], "LF // Beauty")
 
 
+class KeywordFormattingNoise(unittest.TestCase):
+    """twitter_search_term_keywords (Aug 2026): the tool-generated clause is
+    lowercased and emits both an @handle and a #hashtag for a network; a curator
+    often writes only the #hashtag + quoted name in mixed case. Those are the
+    SAME query and must not be flagged as a Mismatch. A genuinely different
+    distributor/year still is. Strings below are the real Current/Suggested
+    values from the reviewed file."""
+
+    # Row 2 -- equivalent (case + extra @handle only)
+    R2_CUR = ('("The Last Picture Shows") (#FoghornFeatures OR "Foghorn Features" OR '
+              '"2026" OR "All New" OR Episode OR Watch OR tv OR Show OR Series OR season '
+              'OR binge OR Stream OR Film OR Movie OR Premiere OR Screening OR Feature OR '
+              'Trailer OR Teaser OR theater OR release)|DAR|DAR|2021-01-01')
+    R2_SUGG = ('("the last picture shows") ("foghorn features" or @foghornfeatures or '
+               '#foghornfeatures or "2026" or "all new" or episode or watch or tv or show '
+               'or series or season or binge or stream or film or movie or premiere or '
+               'screening or feature or trailer or teaser or theater or release)'
+               '|DAR|DAR|2021-01-01')
+
+    # Row 3 -- equivalent
+    R3_CUR = ('("Awarapan 2") (#MarudharFilms OR "Marudhar Films" OR "2026" OR "All New" '
+              'OR Episode OR Watch OR tv OR Show OR Series OR season OR binge OR Stream OR '
+              'Film OR Movie OR Premiere OR Screening OR Feature OR Trailer OR Teaser OR '
+              'theater OR release)|DAR|DAR|2021-01-01')
+    R3_SUGG = ('("awarapan 2") ("marudhar films" or @marudharfilms or #marudharfilms or '
+               '"2026" or "all new" or episode or watch or tv or show or series or season '
+               'or binge or stream or film or movie or premiere or screening or feature or '
+               'trailer or teaser or theater or release)|DAR|DAR|2021-01-01')
+
+    # Row 4 -- genuinely different (Rialto Pictures / 2026 vs Anglo-Amalgamated / 1963)
+    R4_CUR = ('("Billy Liar") ("Rialto Pictures" OR @RialtoPictures OR #RialtoPictures OR '
+              '"2026" OR "All New" OR Episode OR release)|DAR|DAR|2021-01-01')
+    R4_SUGG = ('("billy liar") ("anglo-amalgamated film distributors" or '
+               '@angloamalgamatedfilmdistributors or #angloamalgamatedfilmdistributors or '
+               '"1963" or "all new" or episode or release)|DAR|DAR|2021-01-01')
+
+    def test_row2_case_and_handle_variant_not_flagged(self):
+        # current is correct; suggested differs only in case + an extra @handle
+        self.assertTrue(cmp('twitter_search_term_keywords', self.R2_CUR, self.R2_SUGG)[0])
+
+    def test_row3_case_and_handle_variant_not_flagged(self):
+        self.assertTrue(cmp('twitter_search_term_keywords', self.R3_CUR, self.R3_SUGG)[0])
+
+    def test_row4_different_distributor_still_flagged(self):
+        self.assertFalse(cmp('twitter_search_term_keywords', self.R4_CUR, self.R4_SUGG)[0])
+
+    def test_empty_current_still_gap(self):
+        self.assertFalse(cmp('twitter_search_term_keywords', '', self.R2_SUGG)[0])
+
+
 if __name__ == "__main__":
     unittest.main()
