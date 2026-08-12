@@ -2321,17 +2321,36 @@ def _tw_handle_key(v):
 
 
 def _kw_terms(v):
-    """Case- and structure-insensitive fingerprint of a twitter_search_term_
-    keywords value: the set of quoted phrases plus the set of bare/@/# tokens,
-    ignoring capitalisation, the OR/or connector, parentheses, grouping and
-    pipes. Two clauses with the same terms compare equal regardless of case or
-    how the terms are parenthesised."""
+    """Case-, representation- and structure-insensitive fingerprint of a
+    twitter_search_term_keywords value.
+
+    Every term is reduced to an alphanumeric slug and collected into ONE set, so
+    the same term written as a quoted "phrase", a #hashtag or an @handle all
+    collapse to a single token -- e.g. "Foghorn Features", #FoghornFeatures and
+    @foghornfeatures every one -> 'foghornfeatures'. Capitalisation, the OR/or
+    connector, parentheses, pipes, internal spacing and punctuation are ignored.
+
+    This is what lets the tool-generated clause (lowercased, and emitting BOTH an
+    @handle and a #hashtag for a network) compare EQUAL to a curator's clause
+    that carries the same terms in a different case, or with only the #hashtag
+    and the quoted name -- so those cosmetic/format differences are no longer
+    flagged as a Mismatch. A clause that carries a genuinely different term (a
+    different distributor or a different year) still differs and is still flagged."""
     s = str(v or '').lower()
-    phrases = frozenset(re.sub(r'\s+', ' ', p).strip()
-                        for p in re.findall(r'"([^"]*)"', s))
+    terms = set()
+    # quoted phrases first (they may contain spaces): "foghorn features" -> foghornfeatures
+    for p in re.findall(r'"([^"]*)"', s):
+        slug = re.sub(r'[^a-z0-9]+', '', p)
+        if slug:
+            terms.add(slug)
+    # then bare words / @handles / #hashtags -- drop the leading @ or # so a
+    # handle and a hashtag for the same name are the same token
     s = re.sub(r'"[^"]*"', ' ', s)
-    words = frozenset(w for w in re.findall(r'[@#]?[a-z0-9]+', s) if w != 'or')
-    return phrases, words
+    for w in re.findall(r'[@#]?[a-z0-9]+', s):
+        w = w.lstrip('@#')
+        if w and w != 'or':
+            terms.add(w)
+    return terms
 
 
 def _normalize_url_protocol(url):
