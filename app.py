@@ -2352,6 +2352,31 @@ def _url_equiv_key(url):
     return s.rstrip('/')
 
 
+def _merge_brand_set(manual_raw, expected_raw):
+    """Merge the required brand set(s) into the file's existing brand_set value
+    WITHOUT removing anything already there.
+
+    Returns the manual lines (original order preserved) with any required line
+    that is not already present appended to the end. Comparison ignores case,
+    internal spacing and any '||suffix' (added-date etc.) so an existing brand
+    set is never duplicated. Used so the Review never drops brand sets a curator
+    put in the file -- it only tops up the ones the ingest template requires."""
+    def _key(ln):
+        return re.sub(r'\s+', ' ', ln.split('||', 1)[0]).strip().lower()
+    manual_lines = [ln.strip() for ln in
+                    str(manual_raw if manual_raw is not None else '')
+                    .replace('\r\n', '\n').split('\n') if ln.strip()]
+    have = {_key(ln) for ln in manual_lines}
+    for ln in str(expected_raw if expected_raw is not None else '') \
+            .replace('\r\n', '\n').split('\n'):
+        ln = ln.strip()
+        k = _key(ln)
+        if k and k not in have:
+            manual_lines.append(ln)
+            have.add(k)
+    return '\n'.join(manual_lines)
+
+
 def _review_compare(col, manual_raw, expected_raw, title='', cat='',
                     manual_genre='', sub_raw=''):
     """Column-aware comparison. Returns (ok, suggested_str).
@@ -2411,7 +2436,18 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
 
     man_lines, exp_lines = _review_lines_ci(mval), _review_lines_ci(eval_)
 
-    if c in ('title_sub_category', 'brand_set'):
+    if c == 'brand_set':
+        # Never remove the brand sets already present in the uploaded file. Only
+        # verify that the brand set(s) required by the ingest template are there;
+        # any extra / curated brand sets are always kept. When a required brand
+        # set is missing, flag it (Gap when the cell is empty, else Mismatch) and
+        # suggest the MERGED value -- the file's own brand sets with the missing
+        # required line(s) appended -- so nothing already in the file is dropped.
+        if exp_lines <= man_lines:
+            return True, sugg
+        return False, _merge_brand_set(manual_raw, expected_raw)
+
+    if c == 'title_sub_category':
         return exp_lines <= man_lines, sugg
 
     # imdb_id / metacritic / rottentomatoes: compared by identifier, not exact
