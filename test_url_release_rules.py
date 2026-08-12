@@ -50,8 +50,10 @@ class ReleaseDateRule6(unittest.TestCase):
     def test_valid_us_date_passes(self):
         self.assertIsNone(self.chk("08/05/2026")[0])
 
-    def test_missing_date_is_warning(self):
-        self.assertEqual(self.chk("")[0], validator.SEV_WARN)
+    def test_missing_date_is_mandatory_failure(self):
+        # Rule 1 (Aug 2026): released_on is mandatory for Movies & TV Shows, so a
+        # blank is now a hard failure rather than a soft "lookup pending" warning.
+        self.assertEqual(self.chk("")[0], validator.SEV_FAIL)
 
     def test_bare_year_is_warning(self):
         self.assertEqual(self.chk("2026")[0], validator.SEV_WARN)
@@ -67,7 +69,8 @@ class ReleaseDateRule6(unittest.TestCase):
         self.assertIsNone(self.chk("", cat="Talent")[0])
 
     def test_tv_shows_checked(self):
-        self.assertEqual(self.chk("", cat="TV Shows")[0], validator.SEV_WARN)
+        # blank released_on for a TV Show is mandatory -> hard failure
+        self.assertEqual(self.chk("", cat="TV Shows")[0], validator.SEV_FAIL)
 
     def test_rule_registered_and_in_defaults(self):
         self.assertIn("release_date_valid", validator.CHECKS)
