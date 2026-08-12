@@ -1585,6 +1585,22 @@ def create_row(title, is_movie, network="", metadata=None):
     if not row.get('url_managers'):
         row['url_managers'] = generate_url_managers(row)
 
+    # Rule 1 (Aug 2026): Movies & TV Shows must carry genre, primary_genre and
+    # released_on. If auto-discovery could not fill one, surface the row in
+    # "Needs Review" rather than shipping a blank mandatory column.
+    _missing = [c for c in ('genre', 'primary_genre', 'released_on')
+                if not str(row.get(c) or '').strip()]
+    if metadata.get('needs_review'):
+        row['_needs_review'] = True
+        row['_review_reason'] = str(metadata.get('review_reason')
+                                    or row.get('_review_reason') or '')
+    if _missing:
+        row['_needs_review'] = True
+        _reason = (f"Missing mandatory {', '.join(_missing)} "
+                   f"(required for {title_category})")
+        _prev = str(row.get('_review_reason') or '').strip()
+        row['_review_reason'] = (_prev + '; ' + _reason) if _prev else _reason
+
     return row
 
 
@@ -2371,6 +2387,16 @@ def _url_equiv_key(url):
     return s.rstrip('/')
 
 
+def _cat_is_movie_or_tv(cat):
+    """True when a title_category is Movies or TV Shows (used for the Movies/TV
+    mandatory-column rule). Talent / Video Game / Publisher / Beauty / Beverages
+    / Sports categories are excluded even though some contain the substring."""
+    s = str(cat or '').strip().lower()
+    if any(x in s for x in ('talent', 'game', 'publish', 'beauty', 'beverage', 'sport')):
+        return False
+    return ('movie' in s) or ('film' in s) or ('tv' in s)
+
+
 def _merge_brand_set(manual_raw, expected_raw):
     """Merge the required brand set(s) into the file's existing brand_set value
     WITHOUT removing anything already there.
@@ -2448,6 +2474,14 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
     if c == 'twitter_search_term_keywords' and mval and any(
             ln.strip().startswith(('#', '@'))
             for ln in str(manual_raw or '').split('\n') if ln.strip()):
+        return False, sugg
+
+    # Rule 1 (Aug 2026): for Movies and TV Shows, genre, primary_genre and
+    # released_on are MANDATORY. Flag a blank cell (as a Gap) even when
+    # auto-discovery found nothing to compare against, so the "expected empty ->
+    # pass" short-circuit below can never let a blank mandatory column through.
+    if c in ('genre', 'primary_genre', 'released_on') and not mval \
+            and _cat_is_movie_or_tv(cat):
         return False, sugg
 
     if not eval_ or mval == eval_:
