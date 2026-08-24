@@ -100,5 +100,82 @@ class TalentAndPublisher(unittest.TestCase):
         self.assertIn('Pristine DAR Brands', row['brand_set'])
 
 
+
+
+class GeneralSchemaBrandSet(unittest.TestCase):
+    """The 'Spotify (India) - DAR' class of bug: rows routed to the General
+    schema had NO vertical brand set defined, so the required value came back
+    empty and the caller fell back to the first dropdown entry -- literally
+    'Competitive View' -- for every row, DAR or not."""
+
+    @classmethod
+    def setUpClass(cls):
+        from titleforge_ingest_ext import detect_schema
+        from titleforge_validator import load_rules, validate_row
+        import os
+        cls.detect = staticmethod(detect_schema)
+        cls.validate = staticmethod(validate_row)
+        cls.rules = load_rules(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'titleforge_validation_rules.json'))
+
+    def _finding(self, title, brand_set,
+                 cat="Music and Entertainment", sub=""):
+        row = {"title": title, "title_category": cat,
+               "brand_set": brand_set, "title_sub_category": sub}
+        schema = self.detect(row) or 'general'
+        fds = [f for f in self.validate(row, schema, self.rules)
+               if f['field'] == 'brand_set']
+        return fds[0] if fds else None
+
+    def test_dar_row_with_correct_set_is_not_flagged(self):
+        for t in ["Spotify (Singapore) - DAR", "Spotify (Malaysia) - DAR",
+                  "Spotify (India) - DAR", "Spotify (Philippines) - DAR",
+                  "Spotify (Japan) - DAR"]:
+            self.assertIsNone(
+                self._finding(t, "Pristine DAR Brands\nSpotify Global Roll-Up"), t)
+
+    def test_dar_row_never_told_to_add_competitive_view(self):
+        fd = self._finding("Spotify (Chile) - DAR", "Spotify Global Roll-Up")
+        self.assertIsNotNone(fd)
+        self.assertIn("Pristine DAR Brands", fd['expected'])
+        self.assertNotIn("Competitive View", fd['expected'])
+
+    def test_dar_row_with_competitive_view_is_corrected(self):
+        fd = self._finding("Spotify (Korea) - DAR",
+                           "Competitive View\nSpotify Global Roll-Up")
+        self.assertEqual(fd['expected'],
+                         "Spotify Global Roll-Up\nPristine DAR Brands")
+
+    def test_non_dar_row_with_dar_set_is_corrected(self):
+        fd = self._finding("Deezer", "Pristine DAR Brands\nMusic Roll-Up")
+        self.assertEqual(fd['expected'], "Music Roll-Up\nCompetitive View")
+
+    def test_non_dar_row_with_competitive_view_is_not_flagged(self):
+        self.assertIsNone(self._finding("Spotify (Brazil)", "Competitive View"))
+
+    def test_empty_cell_gaps_to_the_right_perspective(self):
+        self.assertEqual(
+            self._finding("Spotify (Chile) - DAR", "")['expected'],
+            "Pristine DAR Brands")
+        self.assertEqual(
+            self._finding("Tidal", "")['expected'], "Competitive View")
+
+    def test_schema_vertical_still_wins_where_defined(self):
+        # Beauty defines its own vertical; that behaviour is unchanged
+        self.assertIsNone(self._finding(
+            "Fenty Beauty - DAR", "LF // Beauty",
+            cat="Health & Beauty", sub="Beauty Type - Makeup"))
+        fd = self._finding("Fenty Beauty - DAR", "LF // Beauty\nCompetitive View",
+                           cat="Health & Beauty", sub="Beauty Type - Makeup")
+        self.assertEqual(fd['expected'], "LF // Beauty")
+
+    def test_dar_suffix_is_normalised_not_doubled(self):
+        from titleforge_ingest_ext import _dar
+        for t in ["Spotify-DAR", "Spotify - dar", "Spotify \u2013 DAR", "Spotify"]:
+            self.assertEqual(_dar(t, {"Perspective": "Standard"}),
+                             "Spotify - DAR", t)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
