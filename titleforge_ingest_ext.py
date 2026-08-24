@@ -57,20 +57,40 @@ def _has_col(row: Dict[str, Any], *names: str) -> bool:
     return any(_norm(n) in idx for n in names)
 
 
+_DAR_SUFFIX_RE = re.compile(r'[\s\u00a0]*[-\u2010-\u2015][\s\u00a0]*DAR\b[\s\u00a0]*$',
+                            re.IGNORECASE)
+
+
+def _has_dar_suffix(title: str) -> bool:
+    """True when a title carries a '- DAR' suffix, in any spacing/case/dash
+    form. A literal endswith(' - DAR') missed '- DAR', ' -DAR', ' - Dar' and
+    en/em dashes, which were then treated as competitive rows."""
+    return bool(_DAR_SUFFIX_RE.search(str(title or "")))
+
+
 def _is_standard(row: Dict[str, Any]) -> bool:
     """Standard perspective: explicit Perspective column (Ingest Template sheets)
     OR a ' - DAR' title suffix (finished BrandDef sheets have no Perspective col)."""
     if _get(row, "Perspective").lower() == "standard":
         return True
-    title = _get(row, "title", "Title", "Title Name")
-    return title.endswith(" - DAR")
+    return _has_dar_suffix(_get(row, "title", "Title", "Title Name"))
+
+
+def _strip_dar_suffix(title: str) -> str:
+    """Remove a trailing '- DAR' in any spacing/case/dash form."""
+    return _DAR_SUFFIX_RE.sub("", str(title or "")).strip()
 
 
 def _dar(title: str, row: Dict[str, Any]) -> str:
-    """append ' - DAR' when Perspective == Standard  (=B & IF(A="Standard"," - DAR",""))"""
-    if title and _is_standard(row) and not title.endswith(" - DAR"):
-        return f"{title} - DAR"
-    return title
+    """append ' - DAR' when Perspective == Standard  (=B & IF(A="Standard"," - DAR",""))
+
+    Normalises an existing suffix rather than testing for the exact string:
+    'Spotify-DAR' must become 'Spotify - DAR', not 'Spotify-DAR - DAR'."""
+    if not title:
+        return title
+    if not _is_standard(row):
+        return title
+    return f"{_strip_dar_suffix(title)} - DAR"
 
 
 _HASHTAG_STRIP = str.maketrans({c: "" for c in " :,-!'.?"})
