@@ -25,19 +25,41 @@ from typing import Any, Dict, List, Optional
 
 # reuse the exact same helpers as the ingest module
 from titleforge_ingest_ext import (
-    _get, _is_standard, _hashtag, GENERAL_TITLE_CATEGORIES, SCHEMAS,
+    _get, _is_standard, _hashtag, _strip_dar_suffix,
+    GENERAL_TITLE_CATEGORIES, SCHEMAS,
 )
 
 
+# The two perspective brand sets are mutually exclusive: a row is either a DAR
+# (Standard) row or a competitive one, never both.
+DAR_BRAND_SET = "Pristine DAR Brands"
+COMPETITIVE_BRAND_SET = "Competitive View"
+
+
 def _required_brand_set(schema_key: str, row: Dict[str, Any]) -> str:
-    """The brand set the ingest template requires for this row: the Standard
-    (DAR) brand set for a Standard-perspective row, otherwise the Competitive
-    one. Empty for the General schema (its brand set is carried through from the
-    source sheet), in which case the caller falls back to the first dropdown
-    value."""
+    """The brand set the ingest template requires for this row.
+
+    A Standard-perspective row (Perspective == Standard, or a ' - DAR' title
+    suffix) requires 'Pristine DAR Brands'; every other row requires
+    'Competitive View'. Where the schema also defines a vertical brand set
+    ('LF // Beauty', 'LF // Beverages', ...) that line is required alongside it.
+
+    The General schema defines NO vertical (its brand sets are carried through
+    from the source sheet). That used to make this function return '', and the
+    caller then fell back to the first value in the dropdown list -- which is
+    literally 'Competitive View'. So every General row, DAR or not, was told to
+    add 'Competitive View'. The perspective is now resolved here so that
+    fallback can never mislabel a DAR row.
+    """
     sc = SCHEMAS.get(schema_key, {})
-    return (sc.get("brand_set_standard") if _is_standard(row)
-            else sc.get("brand_set_competitive")) or ""
+    key = "brand_set_standard" if _is_standard(row) else "brand_set_competitive"
+    vertical = sc.get(key) or ""
+    if vertical:
+        return vertical
+    # No vertical defined (General schema) -> the perspective brand set IS the
+    # requirement. This is the line that used to be blank, sending the caller to
+    # rule["values"][0] == "Competitive View" for every General row, DAR or not.
+    return DAR_BRAND_SET if _is_standard(row) else COMPETITIVE_BRAND_SET
 
 
 def load_rules(path: str = "titleforge_validation_rules.json") -> Dict[str, Any]:
@@ -86,23 +108,33 @@ def validate_row(row: Dict[str, Any], schema_key: str,
 
         elif t == "enum":
             if field == "brand_set":
-                # Brand sets already in the file are NEVER removed. Extra /
-                # curated brand sets are fine; the cell passes as long as at
-                # least one canonical (ingest-template) brand set is present.
-                # If the required brand set is missing, flag it -- Gap when the
-                # cell is empty, else Mismatch -- and suggest the file's own
-                # value with the required brand set appended, so nothing is
-                # dropped.
+                # Curated brand sets already in the file are NEVER removed --
+                # with one exception: 'Pristine DAR Brands' and
+                # 'Competitive View' are mutually exclusive, so the one that
+                # contradicts the row's perspective is dropped from the
+                # suggestion rather than sitting alongside its opposite.
+                #
+                # The cell passes when the perspective brand set the row
+                # requires is already present. Merely containing SOME value
+                # from the dropdown is not enough: that is what let a DAR row
+                # carrying 'Competitive View' through, and what made a DAR row
+                # carrying the correct 'Pristine DAR Brands' fail (it is not in
+                # the General dropdown at all).
+                standard = _is_standard(row)
+                opposite = COMPETITIVE_BRAND_SET if standard else DAR_BRAND_SET
+
                 lines = [ln.strip() for ln in str(val or "").splitlines() if ln.strip()]
-                if any(ln in rule["values"] for ln in lines):
+                required = _required_brand_set(schema_key, row)
+                req_lines = [ln for ln in required.splitlines() if ln]
+                if all(ln in lines for ln in req_lines) and opposite not in lines:
                     continue
-                required = _required_brand_set(schema_key, row) or (
-                    rule["values"][0] if rule.get("values") else "")
                 if not lines:
                     out.append(_finding(field, "gap", "", required, rule["msg"]))
                 else:
-                    merged = "\n".join(lines + ([required] if required else []))
-                    out.append(_finding(field, "mismatch", val, merged, rule["msg"]))
+                    merged = [ln for ln in lines if ln != opposite]
+                    merged += [ln for ln in req_lines if ln not in merged]
+                    out.append(_finding(field, "mismatch", val,
+                                        "\n".join(merged), rule["msg"]))
             elif val and val not in rule["values"]:
                 out.append(_finding(field, "mismatch", val, "one of dropdown", rule["msg"]))
 
@@ -123,8 +155,12 @@ def validate_row(row: Dict[str, Any], schema_key: str,
                                         "valid type/company", rule["msg"]))
 
         elif t == "dar_suffix":
+            # normalise rather than append: a title already ending in '-DAR'
+            # or ' - Dar' needs its suffix tidied, not a second one bolted on
             if val and _is_standard(row) and not val.endswith(" - DAR"):
-                out.append(_finding(field, "mismatch", val, val + " - DAR", rule["msg"]))
+                out.append(_finding(field, "mismatch", val,
+                                    _strip_dar_suffix(val) + " - DAR",
+                                    rule["msg"]))
 
         elif t == "companies_logic":
             if _is_standard(row) and val != rule["standard_value"]:
@@ -134,7 +170,7 @@ def validate_row(row: Dict[str, Any], schema_key: str,
         elif t == "hashtag_format":
             title = _get(row, "title", "Title", "Title Name")
             # strip the DAR suffix before deriving the expected hashtag
-            base = title[:-6].strip() if title.endswith(" - DAR") else title
+            base = _strip_dar_suffix(title)
             expected = _hashtag(base)
             # reviewer feedback: manually curated terms are valid alternatives;
             # only flag when the value contains no #hashtag/@handle at all
