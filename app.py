@@ -603,11 +603,38 @@ def _tv_keywords_and_reddit(title, network, year, program_type, is_dar,
     return kw, reddit
 
 
+# --------------------------------------------------------------------------
+# DAR suffix detection (single source of truth)
+#
+# The brand_set rule is: a title carrying a '- DAR' suffix is a DAR row and
+# takes 'Pristine DAR Brands'; a title without it takes 'Competitive View'.
+#
+# Detection used to be the literal substring `" - DAR" in title`, which is
+# case-sensitive and demands exactly one ASCII space either side of an ASCII
+# hyphen. Real files carry '- DAR', ' -DAR', '  -  DAR', ' - Dar' and en/em
+# dashes, all of which slipped through as NOT-DAR and were handed
+# 'Competitive View'. The strip regex below was already lenient, so the two
+# disagreed: the suffix was removed from the title while the row was still
+# classified as a base row.
+_DAR_SUFFIX_RE = re.compile(r'[\s\u00a0]*[-\u2010-\u2015][\s\u00a0]*DAR\b[\s\u00a0]*',
+                            re.IGNORECASE)
+
+
+def _is_dar_title(title):
+    """True when a title carries a '- DAR' suffix, in any spacing/case/dash."""
+    return bool(_DAR_SUFFIX_RE.search(str(title or '')))
+
+
+def _strip_dar_suffix(title):
+    """Remove a trailing '- DAR' suffix, in any spacing/case/dash form."""
+    return _DAR_SUFFIX_RE.sub('', str(title or '')).strip()
+
+
 def create_tv_row(title, network="", metadata=None):
     """Create a TV Shows row in the 39-column BrandIngest schema.
     Values present in `metadata` always win over computed defaults."""
     metadata = metadata or {}
-    is_dar = " - DAR" in title
+    is_dar = _is_dar_title(title)
     clean_title = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
 
     eff_network = (str(metadata.get('network') or network or '')).strip()
@@ -749,6 +776,8 @@ TALENT_COLUMNS = [
 ]
 
 TALENT_DEFAULT_BRAND_SET = "LF // Talent\nPristine DAR Brands"
+# a Talent row WITHOUT a '- DAR' suffix is a base row -> Competitive View
+TALENT_BASE_BRAND_SET = "LF // Talent\nCompetitive View"
 
 # discovered occupation keyword -> (Talent Type, subtype kind, subtype term)
 # checked in order; 'Actor' becomes 'Actress' for Gender - Woman
@@ -958,13 +987,20 @@ def _talent_classify(metadata):
     return (f"Talent Type - {ttype}" if ttype else '', subtype)
 
 
-def create_talent_row(title, metadata=None):
+def create_talent_row(title, metadata=None, respect_title_dar=False):
     """Create a Talent row in the 38-column BrandDef schema.
-    Values present in `metadata` always win over computed defaults."""
+    Values present in `metadata` always win over computed defaults.
+
+    respect_title_dar: when False (generation) talent brands are always
+    emitted as DAR rows, which is the ingest template's behaviour. When True
+    (Review) the uploaded title governs: a name WITHOUT a '- DAR' suffix is a
+    base row and must be checked against 'Competitive View', not
+    'Pristine DAR Brands'."""
     metadata = metadata or {}
-    clean_name = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
+    clean_name = _strip_dar_suffix(title)
     clean_name = _clean_title_text(clean_name)
-    out_title = f"{clean_name} - DAR"   # talent brands are DAR rows
+    is_dar = _is_dar_title(title) if respect_title_dar else True
+    out_title = f"{clean_name} - DAR" if is_dar else clean_name
     _review = bool(metadata.get('needs_review'))
 
     # sub-category: Subtype \n Gender \n Talent Type (template CONCAT order)
@@ -981,7 +1017,7 @@ def create_talent_row(title, metadata=None):
 
     # twitter_search_terms: same logic as Movies/TV Shows (talent = DAR row)
     gen_terms, _ = generate_search_terms(
-        clean_name, '', None, True,
+        clean_name, '', None, is_dar,
         twitter_handle=str(metadata.get('twitter_handle') or ''))
 
     def mv(key, default=''):
@@ -999,7 +1035,8 @@ def create_talent_row(title, metadata=None):
         'ticker_symbol': metadata.get('ticker_symbol', ''),
         'title_content_windows': metadata.get('title_content_windows', ''),
         'companies': mv('companies', 'Pristine Brand'),
-        'brand_set': mv('brand_set', TALENT_DEFAULT_BRAND_SET),
+        'brand_set': mv('brand_set', TALENT_DEFAULT_BRAND_SET
+                        if is_dar else TALENT_BASE_BRAND_SET),
         'active': mv('active', 't'),
         'released_on': metadata.get('released_on', ''),
         'box_office': metadata.get('box_office', ''),
@@ -1063,9 +1100,10 @@ PUBLISHER_COLUMNS = [
 ]
 
 PUBLISHER_DEFAULT_BRAND_SET = "LF // Publishing\nPristine DAR Brands"
+PUBLISHER_BASE_BRAND_SET = "LF // Publishing\nCompetitive View"
 
 
-def create_publisher_row(title, metadata=None):
+def create_publisher_row(title, metadata=None, respect_title_dar=False):
     """Create a Publisher row in the 40-column BrandDefinitionReport schema.
 
     Publisher brands are DAR rows: one ' - DAR' row per publication, no twin.
@@ -1074,8 +1112,9 @@ def create_publisher_row(title, metadata=None):
     row builders.
     """
     metadata = metadata or {}
-    clean_name = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
-    out_title = f"{clean_name} - DAR"   # publisher brands are DAR rows
+    clean_name = _strip_dar_suffix(title)
+    is_dar = _is_dar_title(title) if respect_title_dar else True
+    out_title = f"{clean_name} - DAR" if is_dar else clean_name
 
     # sub-category: 'Publication Type - X' when known; blank is valid (some
     # template rows carry no publication type, e.g. iMore).
@@ -1083,7 +1122,7 @@ def create_publisher_row(title, metadata=None):
 
     # twitter_search_terms: DAR row -> '@handle|DAR|DAR' + '#name|DAR|DAR'
     gen_terms, _ = generate_search_terms(
-        clean_name, '', None, True,
+        clean_name, '', None, is_dar,
         twitter_handle=str(metadata.get('twitter_handle') or ''))
 
     def mv(key, default=''):
@@ -1103,7 +1142,8 @@ def create_publisher_row(title, metadata=None):
         'stock_exchange': metadata.get('stock_exchange', ''),
         'ticker_symbol': metadata.get('ticker_symbol', ''),
         'companies': mv('companies', 'Pristine Brand'),
-        'brand_set': mv('brand_set', PUBLISHER_DEFAULT_BRAND_SET),
+        'brand_set': mv('brand_set', PUBLISHER_DEFAULT_BRAND_SET
+                        if is_dar else PUBLISHER_BASE_BRAND_SET),
         'composite_brand_set': metadata.get('composite_brand_set', ''),
         'active': _norm_bool(metadata.get('active', True)),
         'released_on': metadata.get('released_on', ''),
@@ -1290,7 +1330,7 @@ def create_game_row(title, metadata=None):
     """Create a Video Game row in the 39-column BDR schema.
     Values present in `metadata` always win over computed defaults."""
     metadata = metadata or {}
-    is_dar = " - DAR" in title
+    is_dar = _is_dar_title(title)
     clean_title = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
     label = "DAR" if is_dar else "Operations - Core Title"
 
@@ -1397,15 +1437,17 @@ def create_game_row(title, metadata=None):
 
 
 def make_row(title, is_movie, network="", metadata=None, talent=False, game=False,
-             publisher=False):
+             publisher=False, respect_title_dar=False):
     """Dispatch: movies (42-col), TV (39-col BrandIngest), Talent (38-col
     BrandDef), Video Games (39-col BDR), Publishers (40-col BrandDefinitionReport)."""
     if talent:
-        return create_talent_row(title, metadata)
+        return create_talent_row(title, metadata,
+                                 respect_title_dar=respect_title_dar)
     if game:
         return create_game_row(title, metadata)
     if publisher:
-        return create_publisher_row(title, metadata)
+        return create_publisher_row(title, metadata,
+                                    respect_title_dar=respect_title_dar)
     if is_movie:
         return create_row(title, is_movie, network, metadata)
     return create_tv_row(title, network, metadata)
@@ -1430,7 +1472,7 @@ def create_row(title, is_movie, network="", metadata=None):
     uploaded row's channels (and every other field) are preserved.
     """
     metadata = metadata or {}
-    is_dar = " - DAR" in title
+    is_dar = _is_dar_title(title)
     clean_title = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
     # a trailing '(2026)' / '(Studio)' disambiguator stays in the title column
     # but is ignored for social fields and search terms
@@ -1758,7 +1800,7 @@ def create_tfx_row(title, kind, seed=None):
             handle = handle.rstrip('/').rsplit('/', 1)[-1]  # URL -> handle
         terms, _ = generate_search_terms(base_title,
                                          str(row.get('network') or ''),
-                                         None, ' - DAR' in out_title,
+                                         None, _is_dar_title(out_title),
                                          twitter_handle=handle)
         if terms:
             row['twitter_search_terms'] = terms
@@ -2740,7 +2782,8 @@ def build_review(src, auto_fetch=True, progress=None):
                     ('Talent Type - ' + sub['Talent Type']) if sub.get('Talent Type') else '') if x]
                 if not (meta.get('occupations') or meta.get('sports')):
                     meta['title_sub_category'] = '\n'.join(lines)
-            expected = make_row(t, False, '', meta, talent=True)
+            expected = make_row(t, False, '', meta, talent=True,
+                            respect_title_dar=True)
             for col in TALENT_COLUMNS:
                 if col in REVIEW_SKIP_COLS or col.lower() not in lower_cols:
                     continue
