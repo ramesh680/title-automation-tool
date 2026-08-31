@@ -110,9 +110,13 @@
             <div class="form-group file-upload">
                 <input type="file" id="fileUpload" accept=".csv,.xlsx,.xls">
                 <label for="fileUpload" class="file-upload-label">📁 Click to select or drag file here</label>
-                <span class="hint">Works with all four schemas: Movies export (42 cols), TV BrandIngest (39),
-                Talent BrandDef (38) and Video Game BDR (39). The kind is detected per row from
-                <b>title_category</b> (Movies / TV Shows / Talent / Video Game).</span>
+                <span class="hint">Works with every schema: Movies export (42 cols), TV BrandIngest (39),
+                Talent BrandDef (38), Video Game BDR (39), Publishers BrandDefinitionReport (40)
+                and the Beauty / Beverages / Sports Teams / General brand templates. The kind is
+                detected per row from <b>title_category</b> (Movies / TV Shows / Talent /
+                Video Game / Publishers / brand categories) — a publication is recognised even
+                when its category is Media or TV Network, from its
+                <b>Publication Type</b> sub-category or <b>LF // Publishing</b> brand set.</span>
             </div>
 
             <div class="form-group">
