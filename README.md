@@ -97,13 +97,25 @@ git push -u origin main
    - Render will automatically deploy on push to main
 
 ### Environment Variables (if needed)
-None required for basic deployment
+None required for basic deployment.
+
+The optional **Gemini comparison columns** feature (see below) reads:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `GEMINI_API_KEY` | *(unset)* | Enables the feature. Without it the toggle reports itself unavailable and nothing else changes. |
+| `GEMINI_MODEL` | `gemini-flash-latest` | Pin an explicit model (e.g. `gemini-3.7-flash`) if you want stable behaviour across runs. |
+| `GEMINI_MODE` | `consolidated` | `consolidated` = one grounded request per title for all 7 platforms. `per_platform` = one request per platform, exactly as the Ops sheet did. |
+| `GEMINI_WORKERS` | `4` | Concurrent grounded requests. |
+| `GEMINI_MAX_REQUESTS` | `400` | Hard ceiling on grounded requests per run, so one large upload cannot drain the monthly search allowance. `0` = no cap. |
+| `GEMINI_TIMEOUT_MS` | `60000` | Per-request timeout. |
 
 ## File Structure
 
 ```
 .
 ├── app.py                 # Flask backend
+├── gemini_resolver.py     # Optional Gemini-grounded handle resolver (comparison only)
 ├── requirements.txt       # Python dependencies
 ├── Procfile              # Deployment config
 ├── runtime.txt           # Python version
@@ -130,6 +142,71 @@ None required for basic deployment
 ### Options
 - **Include DAR versions**: Toggle to create both regular and DAR versions
 - **Title Type**: Select Movies, TV Shows, or Mixed
+- **Add Gemini comparison columns**: See below
+
+## Gemini Comparison Columns
+
+A benchmarking feature: it asks Gemini the *same question* the Ops team's
+`=GEMINI()` sheet formulas asked (the NYFW SS27 brand sheet, columns
+U/W/Y/Z/AB/AG/AI), then puts its answers next to the tool's own so the two
+handle sources can be scored against each other.
+
+**It never changes an ingest column.** The existing resolver (Wikidata / IMDb /
+Rotten Tomatoes / Metacritic) remains the only thing that writes
+`instagram_user` and friends. Gemini's answers land on two extra sheets:
+
+- **Gemini Compare** — one row per generated row, with a column triple per
+  platform:
+
+  | title | instagram_user | instagram_user_gemini | instagram_user_match |
+  | --- | --- | --- | --- |
+  | Grace Ling - DAR | gracelingofficial | gracelingofficial | match |
+  | Jane Wade - DAR | | janewade_ | gemini only |
+
+  `_match` is one of `match`, `mismatch`, `existing only`, `gemini only`,
+  `both blank`. Comparison is done on canonical forms, so
+  `http://www.facebook.com/x` and `https://facebook.com/x/` count as a match,
+  as do `MagdaButrym` and `@magdabutrym`.
+
+- **Gemini Summary** — per-field tallies plus `agreement_when_both_filled`,
+  which is the number the exercise exists to produce.
+
+Covered fields: `facebook_page`, `twitter_handle`, `instagram_user`,
+`youtube_channel_username`, `tiktok_user`, `wikipedia_page`, `imdb_id`.
+
+### Three things this does differently from the sheet
+
+1. **One request per title, not seven.** Each of the sheet's seven prompts
+   already carried the return-format rules for *all* platforms; only the first
+   sentence differed. `consolidated` mode asks once and reads a JSON object
+   back — same information, 1/7th the grounded requests. `GEMINI_MODE=per_platform`
+   restores the sheet's exact 7-call behaviour for A/B purposes.
+2. **Answers are validated.** The sheet run put prose in a data column
+   (`"I do not have enough information to answer the query..."` in Wiederhoeft's
+   IMDb cell). Every answer is coerced into the column's expected shape —
+   handle charset and length limits, platform-specific URL hosts, `tt`/`nm` IDs —
+   and anything that fails becomes blank.
+3. **One answer per entity.** The sheet gave the same entity different answers
+   on its DAR and non-DAR rows (Wiederhoeft: `wiederhoeft_` vs `wiederhoeft` on
+   Twitter). Resolution is cached per normalised name, so twins always agree and
+   a DAR run costs the same as a non-DAR one.
+
+### Cost
+
+Grounding is the cost driver, not tokens: 5,000 free Google Search requests per
+month across Gemini 3.x models, then $14 per 1,000. In `consolidated` mode that
+is one request per title (~5,000 titles/month free, ~$0.014/title after);
+`per_platform` is seven (~710 titles/month free, ~$0.10/title after). Every run
+reports its request count and estimated search cost in the preview panel and via
+`GET /api/gemini_status`.
+
+### Caveat worth knowing before trusting the numbers
+
+Gemini returns handles it has not verified exist (`giovannaflor3s`,
+`hikarinoyamii` in the source sheet run). Validation checks *shape*, not
+existence. The tool's own path already drops dead Instagram handles
+(`metadata_fetcher._instagram_alive`), so a `mismatch` is not automatically a
+Gemini error — treat the comparison as a candidate generator, not a verdict.
 
 ## API Endpoints
 

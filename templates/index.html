@@ -220,6 +220,18 @@
                     </label>
                 </div>
 
+                <div class="form-group">
+                    <label class="toggle">
+                        <input type="checkbox" id="geminiCompare"><span class="slider"></span>
+                        <span class="t-txt">Add Gemini comparison columns
+                            <span class="t-sub" id="geminiHint">Asks Gemini the same question the Ops sheet's
+                            <code>=GEMINI()</code> formulas asked, then adds a <b>Gemini Compare</b> sheet with
+                            <code>instagram_user</code> / <code>instagram_user_gemini</code> / <code>_match</code>
+                            column triples. Existing results are never changed.</span>
+                        </span>
+                    </label>
+                </div>
+
                 <div class="button-group">
                     <button class="btn-primary" onclick="previewData()">👁️ Preview</button>
                     <button class="btn-secondary" onclick="resetForm()">↻ Reset</button>
@@ -326,6 +338,7 @@
             const method = document.getElementById('inputMethod').value;
             const includeDar = document.getElementById('includeDar').checked;
             const autoFetch = document.getElementById('autoFetch').checked;
+            const geminiCompare = (document.getElementById('geminiCompare') || {}).checked || false;
             const titleType = document.getElementById('titleType').value;
 
             if (method === 'file') {
@@ -339,6 +352,7 @@
                 fd.append('file', file);
                 fd.append('includeDar', includeDar);
                 fd.append('autoFetch', autoFetch);
+                fd.append('geminiCompare', geminiCompare);
                 fd.append('titleType', titleType);
                 const defProf = (document.getElementById('talentProfession') || {}).value || '';
                 if (defProf.trim()) fd.append('talentProfession', defProf.trim());
@@ -355,7 +369,7 @@
 
             // every title always gets an explicit type (fixes mixed runs
             // silently defaulting to movies)
-            const payload = { titles: titles, includeDar: includeDar, autoFetch: autoFetch, titles_type: parsed.types, professions: parsed.professions };
+            const payload = { titles: titles, includeDar: includeDar, autoFetch: autoFetch, geminiCompare: geminiCompare, titles_type: parsed.types, professions: parsed.professions };
             return {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -456,12 +470,79 @@
             });
 
             html += '</tbody></table></div>';
+            html += renderGeminiCompare(data.gemini);
             document.getElementById('previewContent').innerHTML = html;
 
             document.getElementById('totalRows').textContent = data.total_rows;
             document.getElementById('totalTitles').textContent = Math.floor(data.total_rows / (document.getElementById('includeDar').checked ? 2 : 1));
             document.getElementById('previewStats').style.display = 'block';
         }
+
+        // Side-by-side Gemini comparison: agreement summary + the paired columns.
+        function renderGeminiCompare(g) {
+            if (!g || !g.rows || !g.rows.length) return '';
+            const badge = v => {
+                const c = { 'match': '#22c55e', 'mismatch': '#ef4444',
+                            'gemini only': '#3b82f6', 'existing only': '#a855f7',
+                            'both blank': '#6b7280' }[v] || '#6b7280';
+                return `<span style="color:${c};font-weight:600">${escapeHtml(v || '')}</span>`;
+            };
+            let h = `<h3 style="margin:22px 0 6px;font-size:14px">Gemini comparison
+                     <span style="color:#666;font-weight:400">(preview sample &mdash; the export carries every row)</span></h3>`;
+            h += '<div class="preview-section"><table class="preview-table"><thead><tr>'
+               + ['field', 'existing filled', 'gemini filled', 'match', 'mismatch',
+                  'existing only', 'gemini only', 'agreement when both filled']
+                   .map(x => `<th>${x}</th>`).join('')
+               + '</tr></thead><tbody>';
+            (g.summary || []).forEach(s => {
+                h += `<tr><td>${escapeHtml(s.field)}</td><td>${s.existing_filled}</td>`
+                   + `<td>${s.gemini_filled}</td><td>${s.match}</td><td>${s.mismatch}</td>`
+                   + `<td>${s.existing_only}</td><td>${s.gemini_only}</td>`
+                   + `<td>${escapeHtml(s.agreement_when_both_filled || '—')}</td></tr>`;
+            });
+            h += '</tbody></table></div>';
+
+            const cols = g.columns || [];
+            h += '<div class="preview-section" style="margin-top:10px"><table class="preview-table"><thead><tr>'
+               + cols.map(c => `<th>${escapeHtml(c)}</th>`).join('')
+               + '</tr></thead><tbody>';
+            g.rows.slice(0, 8).forEach(r => {
+                h += '<tr>' + cols.map(c => {
+                    const raw = r[c] === null || r[c] === undefined ? '' : String(r[c]);
+                    if (c.endsWith('_match')) return `<td>${badge(raw)}</td>`;
+                    const v = raw.replace(/\n/g, ' ');
+                    const d = v.length > 40 ? v.substring(0, 40) + '\u2026' : v;
+                    return `<td title="${escapeHtml(v)}">${escapeHtml(d)}</td>`;
+                }).join('') + '</tr>';
+            });
+            h += '</tbody></table></div>';
+            if (g.stats && g.stats.requests) {
+                h += `<p style="color:#666;font-size:12px;margin-top:6px">`
+                   + `${g.stats.requests} grounded request(s) &bull; ${g.stats.cached || 0} served from cache`
+                   + (g.stats.errors ? ` &bull; ${g.stats.errors} error(s)` : '')
+                   + ` &bull; est. search cost $${(g.stats.est_search_cost_usd || 0).toFixed(3)}</p>`;
+            }
+            return h;
+        }
+
+        // Tell the user up front when the comparison cannot run, instead of
+        // letting it silently produce nothing.
+        document.addEventListener('DOMContentLoaded', function () {
+            const box = document.getElementById('geminiCompare');
+            if (!box) return;
+            fetch('/api/gemini_status').then(r => r.json()).then(s => {
+                if (s && s.available) {
+                    const hint = document.getElementById('geminiHint');
+                    if (hint) hint.innerHTML += ` <b>Model:</b> ${escapeHtml(s.model)} (${escapeHtml(s.mode)}).`;
+                    return;
+                }
+                box.checked = false;
+                box.disabled = true;
+                const hint = document.getElementById('geminiHint');
+                if (hint) hint.innerHTML = 'Unavailable: ' + escapeHtml((s && s.reason) || 'not configured')
+                                         + '. Set <code>GEMINI_API_KEY</code> on the server to enable.';
+            }).catch(() => {});
+        });
 
         // Full-file generation runs as a background job (no request timeout).
         function generateExcel() {
@@ -549,6 +630,8 @@
         function resetForm() {
             document.getElementById('titlesList').value = '';
             document.getElementById('includeDar').checked = true;
+            const _g = document.getElementById('geminiCompare');
+            if (_g && !_g.disabled) _g.checked = false;
             document.getElementById('previewContent').innerHTML = '<p style="color: #999; text-align: center; padding: 40px 0;">Click "Preview" to see how your data will be formatted</p>';
             document.getElementById('previewStats').style.display = 'none';
             document.getElementById('generateBtn').style.display = 'none';
