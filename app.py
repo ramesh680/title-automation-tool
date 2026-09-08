@@ -2261,6 +2261,82 @@ def _gemini_summary_records(records):
     return out
 
 
+# ---------------------------------------------------------------------------
+# comparison-sheet flow (GEMINI_SOURCE=sheet)
+#
+# =GEMINI() will not evaluate headlessly, so this source is deliberately three
+# steps: push the batch as inert formula text, have someone activate it with
+# the workbook open, then pull the computed values back and score them here
+# with the same match logic the API path uses.
+# ---------------------------------------------------------------------------
+
+_TYPE_COLUMNS = {}
+
+
+def _type_columns():
+    if not _TYPE_COLUMNS:
+        _TYPE_COLUMNS.update({
+            'Movies': COLUMNS, 'TV Shows': TV_COLUMNS, 'Talent': TALENT_COLUMNS,
+            'Video Games': GAME_COLUMNS, 'Publishers': PUBLISHER_COLUMNS,
+        })
+        if TFX_OK:
+            for k, v in _TFX_COLUMNS.items():
+                _TYPE_COLUMNS[_TFX_SHEET_LABELS.get(k, k.title())] = v
+    return _TYPE_COLUMNS
+
+
+def gemini_sheet_rows(rows):
+    """TitleForge rows -> the payload the comparison sheet wants."""
+    out = []
+    for r in rows:
+        if not isinstance(r, dict) or not str(r.get('title') or '').strip():
+            continue
+        out.append({
+            'title': r.get('title', ''),
+            'title_type': _gemini_row_type(r),
+            'context': _gemini_context(r),
+            'existing': {f: (r.get(f) or '') for f in GEMINI_COMPARE_FIELDS},
+        })
+    return out
+
+
+def gemini_records_from_pull(pulled):
+    """Scored comparison records built from what the sheet returned."""
+    cols_by_type = _type_columns()
+    out = []
+    for row in pulled:
+        ttype = row.get('title_type') or 'Movies'
+        schema = cols_by_type.get(ttype, COLUMNS)
+        existing = row.get('existing') or {}
+        rec = {
+            'title': row.get('title', ''),
+            'title_type': ttype,
+            'title_category': '',
+            'context_sent_to_gemini': row.get('context', ''),
+        }
+        for f in GEMINI_COMPARE_FIELDS:
+            have = existing.get(f) or ''
+            guess = row.get(f) or ''
+            rec[f] = have
+            rec[f'{f}_gemini'] = guess
+            rec[f'{f}_match'] = ('not in schema' if f not in schema
+                                 else _gemini_match_label(f, have, guess))
+        out.append(rec)
+    return out
+
+
+def gemini_sheet_workbook(records):
+    """Just the two comparison sheets, for the pulled-batch download."""
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine='openpyxl') as xw:
+        df = pd.DataFrame(records).reindex(columns=_gemini_compare_columns())
+        df.where(pd.notnull(df), '').to_excel(xw, sheet_name='Gemini Compare', index=False)
+        pd.DataFrame(_gemini_summary_records(records)).to_excel(
+            xw, sheet_name='Gemini Summary', index=False)
+    out.seek(0)
+    return out
+
+
 def _rows_to_workbook(rows):
     """Write rows to an xlsx BytesIO. Movies use the 42-col schema, TV the
     39-col BrandIngest, Talent the 38-col BrandDef, Video Games the 39-col
@@ -2502,6 +2578,91 @@ def gemini_status():
         st['reason'] = ('google-genai not installed' if not st['sdk_installed']
                         else 'GEMINI_API_KEY not set on the server')
     return jsonify(st)
+
+
+@app.route('/api/gemini_sheet/push', methods=['POST'])
+def gemini_sheet_push():
+    """Step 1: build the rows as usual, then write them to a new tab in the
+    comparison workbook with the GEMINI formulas stored as text."""
+    if not (GEMINI_OK and GEMINI.available()):
+        return jsonify({'error': 'comparison sheet is not configured'}), 400
+    try:
+        rows = collect_rows()
+        if not rows:
+            return jsonify({'error': 'No titles provided'}), 400
+        payload = gemini_sheet_rows(rows)
+        if not payload:
+            return jsonify({'error': 'nothing to compare'}), 400
+        res = GEMINI.sheet_push(payload)
+        res['next'] = ('Open the link, leave the tab open, then click '
+                       'Activate formulas.')
+        return jsonify(res)
+    except GEMINI.ScriptError as e:
+        return jsonify({'error': str(e)}), 502
+    except Exception as e:  # noqa: BLE001
+        logging.error(f"gemini sheet push failed: {e}")
+        return jsonify({'error': f"Error: {e}"}), 500
+
+
+@app.route('/api/gemini_sheet/activate', methods=['POST'])
+def gemini_sheet_activate():
+    """Step 2: text -> live formulas. Only works while a person has the
+    workbook open; that open session is what evaluates =GEMINI()."""
+    batch = (request.get_json(silent=True) or {}).get('batch', '')
+    if not batch:
+        return jsonify({'error': 'batch is required'}), 400
+    try:
+        return jsonify(GEMINI.sheet_activate(batch))
+    except GEMINI.ScriptError as e:
+        return jsonify({'error': str(e)}), 502
+
+
+@app.route('/api/gemini_sheet/status')
+def gemini_sheet_status():
+    batch = request.args.get('batch', '')
+    if not batch:
+        return jsonify({'error': 'batch is required'}), 400
+    try:
+        return jsonify({'status': GEMINI.sheet_status(batch)})
+    except GEMINI.ScriptError as e:
+        return jsonify({'error': str(e)}), 502
+
+
+@app.route('/api/gemini_sheet/pull', methods=['POST'])
+def gemini_sheet_pull():
+    """Step 3: read the computed values back and score them."""
+    batch = (request.get_json(silent=True) or {}).get('batch', '')
+    if not batch:
+        return jsonify({'error': 'batch is required'}), 400
+    try:
+        status, pulled = GEMINI.sheet_pull(batch)
+    except GEMINI.ScriptError as e:
+        return jsonify({'error': str(e)}), 502
+    records = gemini_records_from_pull(pulled)
+    return jsonify({
+        'batch': batch,
+        'status': status,
+        'columns': _gemini_compare_columns(),
+        'rows': records,
+        'summary': _gemini_summary_records(records),
+    })
+
+
+@app.route('/api/gemini_sheet/download')
+def gemini_sheet_download():
+    batch = request.args.get('batch', '')
+    if not batch:
+        return jsonify({'error': 'batch is required'}), 400
+    try:
+        _status, pulled = GEMINI.sheet_pull(batch)
+    except GEMINI.ScriptError as e:
+        return jsonify({'error': str(e)}), 502
+    out = gemini_sheet_workbook(gemini_records_from_pull(pulled))
+    return send_file(
+        out,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=f'Gemini_Comparison_{batch}.xlsx')
 
 
 @app.route('/validator')

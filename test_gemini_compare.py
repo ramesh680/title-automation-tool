@@ -381,3 +381,364 @@ class EveryTitleType(unittest.TestCase):
         hdr = [c.value for c in ws[1]]
         self.assertEqual(ws.cell(row=2, column=hdr.index('imdb_id_match') + 1).value,
                          'gemini only')
+
+
+class _FakeHTTP:
+    """Stand-in for requests.post: records payloads, replays canned bodies."""
+
+    def __init__(self, body, status=200):
+        self.body = body
+        self.status = status
+        self.calls = []
+
+    def __call__(self, url, json=None, timeout=None, allow_redirects=None):
+        self.calls.append({'url': url, 'json': json})
+        outer = self
+
+        class R:
+            status_code = outer.status
+
+            def raise_for_status(self):
+                if outer.status >= 400:
+                    raise RuntimeError('HTTP %s' % outer.status)
+
+            def json(self):
+                return outer.body() if callable(outer.body) else outer.body
+
+        return R()
+
+
+class AppsScriptSource(unittest.TestCase):
+    """The Apps Script bridge: native Sheets =GEMINI(), no API quota."""
+
+    URL = 'https://script.google.com/macros/s/EXAMPLE/exec'
+    TOKEN = 'shared-secret'
+
+    def setUp(self):
+        gr.clear_cache()
+        gr.reset_stats()
+
+    def _as(self, **extra):
+        patches = {'SOURCE': 'appsscript', 'SCRIPT_URL': self.URL,
+                   'SCRIPT_TOKEN': self.TOKEN}
+        patches.update(extra)
+        return [mock.patch.object(gr, k, v) for k, v in patches.items()]
+
+    def _run(self, fake, fn, **extra):
+        stack = self._as(**extra)
+        for p in stack:
+            p.start()
+        try:
+            with mock.patch.dict('sys.modules'):
+                with mock.patch('requests.post', fake):
+                    return fn()
+        finally:
+            for p in reversed(stack):
+                p.stop()
+
+    def test_availability_needs_url_and_token(self):
+        with mock.patch.object(gr, 'SOURCE', 'appsscript'), \
+             mock.patch.object(gr, 'SCRIPT_URL', ''), \
+             mock.patch.object(gr, 'SCRIPT_TOKEN', self.TOKEN):
+            self.assertFalse(gr.available())
+        with mock.patch.object(gr, 'SOURCE', 'appsscript'), \
+             mock.patch.object(gr, 'SCRIPT_URL', self.URL), \
+             mock.patch.object(gr, 'SCRIPT_TOKEN', ''):
+            self.assertFalse(gr.available())
+        with mock.patch.object(gr, 'SOURCE', 'appsscript'), \
+             mock.patch.object(gr, 'SCRIPT_URL', self.URL), \
+             mock.patch.object(gr, 'SCRIPT_TOKEN', self.TOKEN):
+            self.assertTrue(gr.available())
+
+    def test_availability_does_not_need_an_api_key(self):
+        """The whole point: no GEMINI_API_KEY, still available."""
+        with mock.patch.object(gr, 'SOURCE', 'appsscript'), \
+             mock.patch.object(gr, 'API_KEY', ''), \
+             mock.patch.object(gr, 'SCRIPT_URL', self.URL), \
+             mock.patch.object(gr, 'SCRIPT_TOKEN', self.TOKEN):
+            self.assertTrue(gr.available())
+            st = gr.status()
+        self.assertEqual(st['source'], 'appsscript')
+        self.assertFalse(st['metered'])
+
+    def test_api_source_reports_metered(self):
+        with mock.patch.object(gr, 'SOURCE', 'api'):
+            self.assertTrue(gr.status()['metered'])
+
+    def test_values_are_sanitised_like_the_api_path(self):
+        fake = _FakeHTTP({'results': [{
+            'name': 'Tom Hanks', 'context': 'Talent',
+            'facebook': 'http://www.facebook.com/TomHanks',
+            'twitter': '@tomhanks', 'instagram': 'TOMHANKS',
+            'youtube': '', 'tiktok': '',
+            'wikipedia': 'https://en.wikipedia.org/wiki/Tom_Hanks',
+            'imdb': 'I do not have enough information.'}]})
+        out = self._run(fake, lambda: gr.resolve('Tom Hanks - DAR', 'Talent'))
+        self.assertEqual(out['facebook_page'], 'https://www.facebook.com/TomHanks')
+        self.assertEqual(out['twitter_handle'], 'tomhanks')
+        self.assertEqual(out['instagram_user'], 'tomhanks')
+        self.assertEqual(out['wikipedia_page'], 'https://en.wikipedia.org/wiki/Tom_Hanks')
+        self.assertEqual(out['imdb_id'], '')          # prose rejected here too
+
+    def test_dar_suffix_and_token_are_sent_correctly(self):
+        fake = _FakeHTTP({'results': []})
+        self._run(fake, lambda: gr.resolve('Tom Hanks - DAR', 'Talent'))
+        self.assertEqual(len(fake.calls), 1)
+        sent = fake.calls[0]['json']
+        self.assertEqual(sent['token'], self.TOKEN)
+        self.assertEqual(sent['entities'], [{'name': 'Tom Hanks', 'context': 'Talent'}])
+        self.assertEqual(fake.calls[0]['url'], self.URL)
+
+    def test_reply_is_matched_by_name_not_order(self):
+        fake = _FakeHTTP({'results': [
+            {'name': 'Zendaya', 'instagram': 'zendaya'},
+            {'name': 'Tom Hanks', 'instagram': 'tomhanks'},
+        ]})
+        got = self._run(fake, lambda: gr.resolve_many(
+            [('Tom Hanks', 'Talent'), ('Zendaya', 'Talent')]))
+        self.assertEqual(got[('Tom Hanks', 'Talent')]['instagram_user'], 'tomhanks')
+        self.assertEqual(got[('Zendaya', 'Talent')]['instagram_user'], 'zendaya')
+
+    def test_entities_are_batched_not_one_request_each(self):
+        fake = _FakeHTTP({'results': []})
+        items = [('Brand %d' % i, 'Fashion') for i in range(7)]
+        self._run(fake, lambda: gr.resolve_many(items), SCRIPT_BATCH=3, WORKERS=1)
+        self.assertEqual(len(fake.calls), 3)          # 3 + 3 + 1
+        sizes = sorted(len(c['json']['entities']) for c in fake.calls)
+        self.assertEqual(sizes, [1, 3, 3])
+
+    def test_dar_twins_collapse_into_one_entity(self):
+        fake = _FakeHTTP({'results': [{'name': 'AGMES', 'instagram': 'agmesnyc'}]})
+        got = self._run(fake, lambda: gr.resolve_many(
+            [('AGMES', 'Fashion'), ('AGMES - DAR', 'Fashion')]), WORKERS=1)
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(len(fake.calls[0]['json']['entities']), 1)
+        self.assertEqual(got[('AGMES', 'Fashion')]['instagram_user'], 'agmesnyc')
+        self.assertEqual(got[('AGMES - DAR', 'Fashion')]['instagram_user'], 'agmesnyc')
+
+    def test_progress_counts_every_original_pair(self):
+        fake = _FakeHTTP({'results': []})
+        seen = []
+        self._run(fake, lambda: gr.resolve_many(
+            [('A', 'X'), ('A - DAR', 'X'), ('B', 'X')],
+            progress=lambda d, t: seen.append((d, t))), WORKERS=1)
+        self.assertTrue(seen)
+        self.assertEqual(seen[-1], (3, 3))
+
+    def test_error_body_yields_blanks_not_an_exception(self):
+        fake = _FakeHTTP({'error': 'unauthorized'})
+        out = self._run(fake, lambda: gr.resolve('Tom Hanks', 'Talent'))
+        self.assertEqual(out, {f: '' for f in gr.FIELDS})
+        self.assertEqual(gr.stats()['errors'], 1)
+
+    def test_http_failure_yields_blanks_not_an_exception(self):
+        fake = _FakeHTTP({}, status=500)
+        out = self._run(fake, lambda: gr.resolve('Tom Hanks', 'Talent'))
+        self.assertEqual(out, {f: '' for f in gr.FIELDS})
+        self.assertEqual(gr.stats()['errors'], 1)
+
+    def test_no_search_cost_is_attributed_to_this_source(self):
+        fake = _FakeHTTP({'results': [{'name': 'Tom Hanks', 'instagram': 'tomhanks'}]})
+        self._run(fake, lambda: gr.resolve('Tom Hanks', 'Talent'))
+        s = gr.stats()
+        self.assertEqual(s['grounded'], 0)
+        self.assertEqual(s['est_search_cost_usd'], 0)
+
+    def test_end_to_end_export_uses_the_script_source(self):
+        fake = _FakeHTTP({'results': [{'name': 'Tom Hanks', 'instagram': 'tomhanks',
+                                       'imdb': 'nm0000158'}]})
+
+        def _go():
+            return app.app.test_client().post('/api/generate', json={
+                'titles': ['Tom Hanks'], 'includeDar': False, 'autoFetch': False,
+                'geminiCompare': True, 'titles_type': {'Tom Hanks': 'talent'}})
+
+        resp = self._run(fake, _go)
+        self.assertEqual(resp.status_code, 200)
+        wb = openpyxl.load_workbook(io.BytesIO(resp.data))
+        self.assertIn('Gemini Compare', wb.sheetnames)
+        ws = wb['Gemini Compare']
+        hdr = [c.value for c in ws[1]]
+        self.assertEqual(
+            ws.cell(row=2, column=hdr.index('instagram_user_gemini') + 1).value,
+            'tomhanks')
+        self.assertEqual(
+            ws.cell(row=2, column=hdr.index('imdb_id_gemini') + 1).value,
+            'nm0000158')
+
+    def test_status_endpoint_describes_the_script_source(self):
+        stack = self._as()
+        for p in stack:
+            p.start()
+        try:
+            body = app.app.test_client().get('/api/gemini_status').get_json()
+        finally:
+            for p in reversed(stack):
+                p.stop()
+        self.assertTrue(body['available'])
+        self.assertEqual(body['source'], 'appsscript')
+        self.assertFalse(body['metered'])
+
+
+class SheetSource(unittest.TestCase):
+    """GEMINI_SOURCE=sheet: the three-phase, Workspace-covered flow."""
+
+    URL = 'https://script.google.com/macros/s/EXAMPLE/exec'
+    TOKEN = 'shared-secret'
+
+    def setUp(self):
+        gr.clear_cache()
+        gr.reset_stats()
+
+    def _on(self, **extra):
+        base = {'SOURCE': 'sheet', 'SCRIPT_URL': self.URL, 'SCRIPT_TOKEN': self.TOKEN}
+        base.update(extra)
+        return [mock.patch.object(gr, k, v) for k, v in base.items()]
+
+    def _run(self, fake, fn, **extra):
+        stack = self._on(**extra)
+        for p in stack:
+            p.start()
+        try:
+            with mock.patch('requests.post', fake):
+                return fn()
+        finally:
+            for p in reversed(stack):
+                p.stop()
+
+    def test_source_is_interactive_and_available_without_a_key(self):
+        stack = self._on(API_KEY='')
+        for p in stack:
+            p.start()
+        try:
+            self.assertTrue(gr.available())
+            self.assertTrue(gr.interactive())
+            st = gr.status()
+        finally:
+            for p in reversed(stack):
+                p.stop()
+        self.assertEqual(st['source'], 'sheet')
+        self.assertTrue(st['interactive'])
+        self.assertFalse(st['metered'])
+
+    def test_synchronous_resolve_returns_nothing_for_this_source(self):
+        """There is no synchronous answer -- the flow needs a human step, and
+        pretending otherwise would silently produce blank columns."""
+        stack = self._on()
+        for p in stack:
+            p.start()
+        try:
+            self.assertEqual(gr.resolve('Tom Hanks', 'Talent'), {})
+            self.assertEqual(gr.resolve_many([('Tom Hanks', 'Talent')]), {})
+        finally:
+            for p in reversed(stack):
+                p.stop()
+
+    def test_push_sends_action_token_and_existing_values(self):
+        fake = _FakeHTTP({'batch': 'cmp_1', 'url': 'https://x/#gid=1', 'rows': 1})
+        res = self._run(fake, lambda: gr.sheet_push([{
+            'title': 'Tom Hanks', 'title_type': 'Talent', 'context': 'Talent',
+            'existing': {'instagram_user': 'tomhanks'}}]))
+        sent = fake.calls[0]['json']
+        self.assertEqual(sent['action'], 'push')
+        self.assertEqual(sent['token'], self.TOKEN)
+        self.assertEqual(sent['rows'][0]['existing']['instagram_user'], 'tomhanks')
+        self.assertEqual(sent['rows'][0]['existing']['imdb_id'], '')
+        self.assertEqual(res['batch'], 'cmp_1')
+
+    def test_activate_and_status_pass_the_batch(self):
+        fake = _FakeHTTP({'batch': 'cmp_1', 'activated': 14})
+        self._run(fake, lambda: gr.sheet_activate('cmp_1'))
+        self.assertEqual(fake.calls[0]['json']['action'], 'activate')
+        self.assertEqual(fake.calls[0]['json']['batch'], 'cmp_1')
+
+        fake2 = _FakeHTTP({'status': {'filled': 9, 'text': 0, 'pending': 5}})
+        st = self._run(fake2, lambda: gr.sheet_status('cmp_1'))
+        self.assertEqual(fake2.calls[0]['json']['action'], 'status')
+        self.assertEqual(st['filled'], 9)
+
+    def test_pull_sanitises_and_keeps_existing_values(self):
+        fake = _FakeHTTP({'status': {'filled': 2},
+                          'results': [{
+                              'title': 'Tom Hanks', 'title_type': 'Talent',
+                              'context': 'Talent / Actor',
+                              'existing': {'instagram_user': 'tomhanks'},
+                              'instagram_user': '@TOMHANKS',
+                              'imdb_id': 'I do not have enough information.'}]})
+        status, rows = self._run(fake, lambda: gr.sheet_pull('cmp_1'))
+        self.assertEqual(status['filled'], 2)
+        self.assertEqual(rows[0]['instagram_user'], 'tomhanks')
+        self.assertEqual(rows[0]['imdb_id'], '')
+        self.assertEqual(rows[0]['existing']['instagram_user'], 'tomhanks')
+
+    def test_script_errors_surface_rather_than_being_swallowed(self):
+        fake = _FakeHTTP({'error': 'unauthorized'})
+        stack = self._on()
+        for p in stack:
+            p.start()
+        try:
+            with mock.patch('requests.post', fake):
+                with self.assertRaises(gr.ScriptError):
+                    gr.sheet_activate('cmp_1')
+        finally:
+            for p in reversed(stack):
+                p.stop()
+
+    def test_scoring_from_a_pulled_batch_is_schema_aware(self):
+        pulled = [
+            {'title': 'Tom Hanks', 'title_type': 'Talent', 'context': 'Talent',
+             'existing': {'instagram_user': 'tomhanks'},
+             'instagram_user': 'tomhanks', 'imdb_id': 'nm0000158'},
+            {'title': 'Rare Beauty', 'title_type': 'Beauty', 'context': 'Beauty',
+             'existing': {'instagram_user': ''},
+             'instagram_user': 'rarebeauty', 'imdb_id': 'nm9999999'},
+        ]
+        recs = app.gemini_records_from_pull(pulled)
+        self.assertEqual(recs[0]['instagram_user_match'], 'match')
+        self.assertEqual(recs[0]['imdb_id_match'], 'gemini only')
+        self.assertEqual(recs[1]['instagram_user_match'], 'gemini only')
+        # Beauty has no imdb_id column, so it must not be scored as a find
+        self.assertEqual(recs[1]['imdb_id_match'], 'not in schema')
+        summary = {(r['title_type'], r['field']): r
+                   for r in app._gemini_summary_records(recs)}
+        self.assertEqual(summary[('Beauty', 'imdb_id')]['not_in_schema'], 1)
+        self.assertEqual(summary[('Beauty', 'imdb_id')]['gemini_only'], 0)
+
+    def test_pull_endpoint_returns_scored_rows_and_summary(self):
+        fake = _FakeHTTP({'status': {'filled': 1, 'text': 0, 'pending': 6},
+                          'results': [{
+                              'title': 'Tom Hanks', 'title_type': 'Talent',
+                              'context': 'Talent',
+                              'existing': {'instagram_user': 'tomhanks'},
+                              'instagram_user': 'tomhanks'}]})
+        body = self._run(fake, lambda: app.app.test_client().post(
+            '/api/gemini_sheet/pull', json={'batch': 'cmp_1'}).get_json())
+        self.assertEqual(body['batch'], 'cmp_1')
+        self.assertEqual(body['rows'][0]['instagram_user_match'], 'match')
+        self.assertIn('title_type', body['columns'])
+        self.assertTrue(body['summary'])
+
+    def test_download_endpoint_builds_the_two_sheets(self):
+        fake = _FakeHTTP({'status': {}, 'results': [{
+            'title': 'Tom Hanks', 'title_type': 'Talent', 'context': 'Talent',
+            'existing': {'instagram_user': 'tomhanks'},
+            'instagram_user': 'tomhanks'}]})
+        resp = self._run(fake, lambda: app.app.test_client().get(
+            '/api/gemini_sheet/download?batch=cmp_1'))
+        self.assertEqual(resp.status_code, 200)
+        wb = openpyxl.load_workbook(io.BytesIO(resp.data))
+        self.assertEqual(wb.sheetnames, ['Gemini Compare', 'Gemini Summary'])
+
+    def test_endpoints_require_a_batch(self):
+        c = app.app.test_client()
+        self.assertEqual(c.post('/api/gemini_sheet/activate', json={}).status_code, 400)
+        self.assertEqual(c.get('/api/gemini_sheet/status').status_code, 400)
+        self.assertEqual(c.post('/api/gemini_sheet/pull', json={}).status_code, 400)
+
+    def test_push_endpoint_refuses_when_unconfigured(self):
+        with mock.patch.object(gr, 'SOURCE', 'sheet'), \
+             mock.patch.object(gr, 'SCRIPT_URL', ''), \
+             mock.patch.object(gr, 'SCRIPT_TOKEN', ''):
+            r = app.app.test_client().post('/api/gemini_sheet/push',
+                                           json={'titles': ['Inception']})
+        self.assertEqual(r.status_code, 400)
