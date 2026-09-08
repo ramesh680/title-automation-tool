@@ -232,6 +232,24 @@
                     </label>
                 </div>
 
+                <div class="form-group" id="geminiSheetPanel" style="display:none">
+                    <div style="border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:14px">
+                        <div style="font-weight:600;margin-bottom:4px">Comparison sheet</div>
+                        <div class="hint" style="margin-bottom:10px">
+                            <code>=GEMINI()</code> only calculates while the workbook is
+                            open in a browser, so this runs in three steps.
+                        </div>
+                        <div class="button-group" style="flex-wrap:wrap;gap:8px">
+                            <button class="btn-secondary" onclick="gsPush()">1 · Send titles</button>
+                            <button class="btn-secondary" onclick="gsActivate()">2 · Activate formulas</button>
+                            <button class="btn-secondary" onclick="gsStatus()">3 · Check progress</button>
+                            <button class="btn-download" onclick="gsDownload()">4 · Download comparison</button>
+                        </div>
+                        <div id="gsMessage" class="message"></div>
+                        <div id="gsSummary"></div>
+                    </div>
+                </div>
+
                 <div class="button-group">
                     <button class="btn-primary" onclick="previewData()">👁️ Preview</button>
                     <button class="btn-secondary" onclick="resetForm()">↻ Reset</button>
@@ -478,6 +496,78 @@
             document.getElementById('previewStats').style.display = 'block';
         }
 
+        // ---- comparison-sheet flow (GEMINI_SOURCE=sheet) --------------------
+        let gsBatch = null;
+        let gsUrl = null;
+
+        function gsSay(html, kind) {
+            const el = document.getElementById('gsMessage');
+            el.className = 'message ' + (kind || 'success');
+            el.innerHTML = html;
+            el.style.display = 'block';
+        }
+
+        function gsPush() {
+            const init = buildRequestInit();
+            if (!init) return;
+            gsSay('Building rows and writing them to the sheet…');
+            fetch('/api/gemini_sheet/push', init)
+                .then(r => r.json())
+                .then(d => {
+                    if (d.error) return gsSay(escapeHtml(d.error), 'error');
+                    gsBatch = d.batch;
+                    gsUrl = d.url;
+                    gsSay('Batch <b>' + escapeHtml(d.batch) + '</b> created &mdash; '
+                        + d.rows + ' row(s), ' + d.gemini_cells + ' formula(s).<br>'
+                        + '<a href="' + escapeHtml(d.url) + '" target="_blank" rel="noopener">'
+                        + 'Open the comparison tab</a>, leave it open, then click '
+                        + '<b>Activate formulas</b>.');
+                })
+                .catch(e => gsSay(escapeHtml(e.message), 'error'));
+        }
+
+        function gsActivate() {
+            if (!gsBatch) return gsSay('Send the titles first.', 'error');
+            gsSay('Activating… make sure the sheet tab is open in another window.');
+            fetch('/api/gemini_sheet/activate', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({batch: gsBatch})
+            }).then(r => r.json()).then(d => {
+                if (d.error) return gsSay(escapeHtml(d.error), 'error');
+                gsSay(d.activated + ' formula(s) are now live. Keep the sheet open; '
+                    + 'they fill in gradually. Use <b>Check progress</b>.');
+            }).catch(e => gsSay(escapeHtml(e.message), 'error'));
+        }
+
+        function gsStatus() {
+            if (!gsBatch) return gsSay('Send the titles first.', 'error');
+            fetch('/api/gemini_sheet/status?batch=' + encodeURIComponent(gsBatch))
+                .then(r => r.json()).then(d => {
+                    if (d.error) return gsSay(escapeHtml(d.error), 'error');
+                    const s = d.status || {};
+                    gsSay('Filled <b>' + (s.filled || 0) + '</b> of ' + (s.cells || 0)
+                        + ' &bull; still text (not activated): ' + (s.text || 0)
+                        + ' &bull; computing/blank: ' + (s.pending || 0));
+                }).catch(e => gsSay(escapeHtml(e.message), 'error'));
+        }
+
+        function gsDownload() {
+            if (!gsBatch) return gsSay('Send the titles first.', 'error');
+            gsSay('Reading the sheet back and scoring…');
+            fetch('/api/gemini_sheet/pull', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({batch: gsBatch})
+            }).then(r => r.json()).then(d => {
+                if (d.error) return gsSay(escapeHtml(d.error), 'error');
+                document.getElementById('gsSummary').innerHTML =
+                    renderGeminiCompare({columns: d.columns, rows: d.rows,
+                                         summary: d.summary, stats: {}});
+                gsSay('Scored ' + d.rows.length + ' row(s). '
+                    + '<a href="/api/gemini_sheet/download?batch='
+                    + encodeURIComponent(gsBatch) + '">Download the Excel comparison</a>.');
+            }).catch(e => gsSay(escapeHtml(e.message), 'error'));
+        }
+
         // Side-by-side Gemini comparison: agreement summary + the paired columns.
         function renderGeminiCompare(g) {
             if (!g || !g.rows || !g.rows.length) return '';
@@ -487,17 +577,31 @@
                             'both blank': '#6b7280' }[v] || '#6b7280';
                 return `<span style="color:${c};font-weight:600">${escapeHtml(v || '')}</span>`;
             };
-            let h = `<h3 style="margin:22px 0 6px;font-size:14px">Gemini comparison
+            let h = '';
+            const note = (g.notes || []).find(n => n.item === 'status');
+            const why = (g.notes || []).find(n => n.item === 'what this means');
+            if (note && note.value !== 'OK') {
+                const bad = note.value === 'FAILED';
+                h += `<div style="margin:18px 0 4px;padding:10px 12px;border-radius:6px;`
+                   + `border-left:3px solid ${bad ? '#ef4444' : '#f59e0b'};`
+                   + `background:rgba(${bad ? '239,68,68' : '245,158,11'},.10)">`
+                   + `<b>Gemini run: ${escapeHtml(note.value)}</b><br>`
+                   + `<span style="font-size:12px">${escapeHtml((why || {}).value || '')}</span></div>`;
+            }
+            h += `<h3 style="margin:22px 0 6px;font-size:14px">Gemini comparison
                      <span style="color:#666;font-weight:400">(preview sample &mdash; the export carries every row)</span></h3>`;
             h += '<div class="preview-section"><table class="preview-table"><thead><tr>'
-               + ['field', 'existing filled', 'gemini filled', 'match', 'mismatch',
-                  'existing only', 'gemini only', 'agreement when both filled']
+               + ['title type', 'field', 'existing filled', 'gemini filled', 'match',
+                  'mismatch', 'existing only', 'gemini only', 'not in schema',
+                  'agreement when both filled']
                    .map(x => `<th>${x}</th>`).join('')
                + '</tr></thead><tbody>';
             (g.summary || []).forEach(s => {
-                h += `<tr><td>${escapeHtml(s.field)}</td><td>${s.existing_filled}</td>`
+                h += `<tr><td>${escapeHtml(s.title_type || '')}</td>`
+                   + `<td>${escapeHtml(s.field)}</td><td>${s.existing_filled}</td>`
                    + `<td>${s.gemini_filled}</td><td>${s.match}</td><td>${s.mismatch}</td>`
                    + `<td>${s.existing_only}</td><td>${s.gemini_only}</td>`
+                   + `<td>${s.not_in_schema || 0}</td>`
                    + `<td>${escapeHtml(s.agreement_when_both_filled || '—')}</td></tr>`;
             });
             h += '</tbody></table></div>';
@@ -517,10 +621,14 @@
             });
             h += '</tbody></table></div>';
             if (g.stats && g.stats.requests) {
+                const metered = (g.stats.grounded || 0) > 0;
                 h += `<p style="color:#666;font-size:12px;margin-top:6px">`
-                   + `${g.stats.requests} grounded request(s) &bull; ${g.stats.cached || 0} served from cache`
+                   + `${g.stats.requests} request(s) &bull; ${g.stats.cached || 0} served from cache`
                    + (g.stats.errors ? ` &bull; ${g.stats.errors} error(s)` : '')
-                   + ` &bull; est. search cost $${(g.stats.est_search_cost_usd || 0).toFixed(3)}</p>`;
+                   + (metered
+                        ? ` &bull; est. search cost $${(g.stats.est_search_cost_usd || 0).toFixed(3)}`
+                        : ' &bull; no API quota used')
+                   + `</p>`;
             }
             return h;
         }
@@ -532,8 +640,24 @@
             if (!box) return;
             fetch('/api/gemini_status').then(r => r.json()).then(s => {
                 if (s && s.available) {
+                    if (s.interactive) {
+                        const panel = document.getElementById('geminiSheetPanel');
+                        if (panel) panel.style.display = 'block';
+                        const hint = document.getElementById('geminiHint');
+                        if (hint) hint.innerHTML = 'Answers come from <b>=GEMINI() in Google '
+                            + 'Sheets</b> &mdash; covered by the Workspace subscription, no API '
+                            + 'quota. Use the <b>Comparison sheet</b> steps below; this toggle '
+                            + 'is not needed for that flow.';
+                        return;
+                    }
                     const hint = document.getElementById('geminiHint');
-                    if (hint) hint.innerHTML += ` <b>Model:</b> ${escapeHtml(s.model)} (${escapeHtml(s.mode)}).`;
+                    if (hint) {
+                        hint.innerHTML += s.source === 'appsscript'
+                            ? ' <b>Source:</b> Gemini in Google Sheets via Apps Script'
+                              + ' &mdash; covered by the Workspace subscription, no API quota used.'
+                            : ` <b>Source:</b> Gemini API &mdash; ${escapeHtml(s.model || '')}`
+                              + ` (${escapeHtml(s.mode || '')}), metered.`;
+                    }
                     return;
                 }
                 box.checked = false;

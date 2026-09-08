@@ -37,9 +37,29 @@ log = logging.getLogger(__name__)
 # configuration (all env-driven; nothing here needs a code change to tune)
 # --------------------------------------------------------------------------
 
+# Where the answers come from:
+#   'api'        -> the Gemini Developer API (metered: grounded search requests)
+#   'appsscript' -> an Apps Script web app that evaluates the native Sheets
+#                   =GEMINI() function, so the work is covered by the Workspace
+#                   subscription instead of API quota.
+#   'sheet'      -> the three-phase Apps Script flow: TitleForge writes the
+#                   formulas as text, a person activates them with the workbook
+#                   open (=GEMINI() only evaluates in an interactive session),
+#                   then TitleForge reads the values back. No API quota.
+SOURCE = os.getenv('GEMINI_SOURCE', 'api').strip().lower()
+if SOURCE not in ('api', 'appsscript', 'sheet'):
+    SOURCE = 'api'
+
 API_KEY = (os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY') or '').strip()
 MODEL = os.getenv('GEMINI_MODEL', 'gemini-flash-latest').strip()
 MODE = os.getenv('GEMINI_MODE', 'consolidated').strip().lower()
+
+# Apps Script bridge settings (source='appsscript')
+SCRIPT_URL = os.getenv('GEMINI_SCRIPT_URL', '').strip()
+SCRIPT_TOKEN = os.getenv('GEMINI_SCRIPT_TOKEN', '').strip()
+# entities per POST; the script caps at 40 and Sheets slows down past ~20
+SCRIPT_BATCH = max(1, min(40, int(os.getenv('GEMINI_SCRIPT_BATCH', '15') or 15)))
+SCRIPT_TIMEOUT_S = max(30, int(os.getenv('GEMINI_SCRIPT_TIMEOUT_S', '300') or 300))
 WORKERS = max(1, int(os.getenv('GEMINI_WORKERS', '4') or 4))
 TIMEOUT_MS = max(5000, int(os.getenv('GEMINI_TIMEOUT_MS', '60000') or 60000))
 # hard ceiling on grounded requests per generation run -- stops a 5,000-title
@@ -71,18 +91,41 @@ except Exception as _e:  # pragma: no cover - import guard
 
 def available():
     """True when a Gemini comparison run can actually be attempted."""
+    if SOURCE in ('appsscript', 'sheet'):
+        return bool(SCRIPT_URL and SCRIPT_TOKEN)
     return bool(SDK_OK and API_KEY)
 
 
+def interactive():
+    """True when the source needs a person to activate formulas mid-flow, so
+    the UI must offer the push / activate / pull steps instead of one button."""
+    return SOURCE == 'sheet'
+
+
 def status():
-    return {
+    st = {
         'available': available(),
-        'sdk_installed': SDK_OK,
-        'api_key_set': bool(API_KEY),
-        'model': MODEL,
-        'mode': MODE if MODE in ('consolidated', 'per_platform') else 'consolidated',
+        'source': SOURCE,
         'max_requests_per_run': MAX_REQUESTS,
     }
+    if SOURCE in ('appsscript', 'sheet'):
+        st.update({
+            'interactive': interactive(),
+            'script_url_set': bool(SCRIPT_URL),
+            'script_token_set': bool(SCRIPT_TOKEN),
+            'batch_size': SCRIPT_BATCH,
+            # the Workspace subscription covers this; there is no per-call charge
+            'metered': False,
+        })
+    else:
+        st.update({
+            'sdk_installed': SDK_OK,
+            'api_key_set': bool(API_KEY),
+            'model': MODEL,
+            'mode': MODE if MODE in ('consolidated', 'per_platform') else 'consolidated',
+            'metered': True,
+        })
+    return st
 
 
 # --------------------------------------------------------------------------
@@ -253,6 +296,9 @@ _client_lock = threading.Lock()
 _stats_lock = threading.Lock()
 _STATS = {'requests': 0, 'grounded': 0, 'errors': 0, 'cached': 0,
           'input_tokens': 0, 'output_tokens': 0, 'capped': 0}
+# the most recent failure, so an empty run can say WHY it is empty instead of
+# looking identical to "the model found nothing"
+_LAST_ERROR = {'text': ''}
 # entity-level cache: the sheet gave the same entity different answers on its
 # DAR and non-DAR rows (Wiederhoeft: twitter 'wiederhoeft_' vs 'wiederhoeft').
 # Resolving once per normalised name removes that inconsistency and halves the
@@ -270,9 +316,20 @@ def _get_client():
         return _client
 
 
+def _note_error(exc):
+    with _stats_lock:
+        _LAST_ERROR['text'] = str(exc)[:400]
+
+
+def last_error():
+    with _stats_lock:
+        return _LAST_ERROR['text']
+
+
 def stats():
     with _stats_lock:
         s = dict(_STATS)
+        s['last_error'] = _LAST_ERROR['text']
     # 5,000 grounded search requests/month are free across Gemini 3.x, then
     # $14 per 1,000 -- so the request count *is* the cost.
     s['est_search_cost_usd'] = round(s['grounded'] * 0.014, 4)
@@ -283,6 +340,7 @@ def reset_stats():
     with _stats_lock:
         for k in _STATS:
             _STATS[k] = 0
+        _LAST_ERROR['text'] = ''
 
 
 def clear_cache():
@@ -317,6 +375,7 @@ def _generate(prompt):
             model=MODEL, contents=prompt, config=cfg)
     except Exception as e:  # noqa: BLE001 -- fail soft per entity
         log.warning("gemini call failed: %s", e)
+        _note_error(e)
         return None
 
 
@@ -366,26 +425,164 @@ def _parse_json_answer(text):
 # public API
 # --------------------------------------------------------------------------
 
-def resolve(name, context=''):
-    """Resolve one entity to the seven handle fields.
+def _clean_name(name):
+    """The entity name as the sheet prompt wants it: no ' - DAR' suffix."""
+    return re.sub(r'\s*[-–—]\s*DAR\s*$', '', str(name or ''), flags=re.I).strip()
 
-    ``name`` is the title as-is; the ' - DAR' suffix is ignored exactly as the
-    sheet prompt instructs.  Returns ``{field: value}`` with '' for anything
-    unconfirmed, and ``{}`` when the feature is unavailable.
+
+def _cache_key(clean, ctx):
+    return (clean.casefold(), ctx.casefold(), SOURCE, MODE)
+
+
+# --------------------------------------------------------------------------
+# backend: Apps Script bridge (native Sheets =GEMINI(), Workspace-covered)
+# --------------------------------------------------------------------------
+
+def _resolve_batch_script(pairs):
+    """POST one batch of (clean_name, ctx) to the Apps Script web app.
+
+    Returns ``{(clean, ctx): {field: value}}`` for whatever came back; a failed
+    batch yields an empty dict rather than raising, so one bad batch cannot
+    lose a whole run.
     """
-    if not available():
+    if not pairs:
         return {}
-    clean = re.sub(r'\s*[-–—]\s*DAR\s*$', '', str(name or ''), flags=re.I).strip()
-    if not clean:
+    import requests
+
+    payload = {
+        'token': SCRIPT_TOKEN,
+        'entities': [{'name': n, 'context': c} for n, c in pairs],
+    }
+    _bump(requests=1)
+    try:
+        resp = requests.post(SCRIPT_URL, json=payload,
+                             timeout=SCRIPT_TIMEOUT_S,
+                             allow_redirects=True)
+        resp.raise_for_status()
+        body = resp.json()
+    except Exception as e:  # noqa: BLE001 -- fail soft per batch
+        _bump(errors=1)
+        log.warning("gemini apps-script batch failed: %s", e)
         return {}
-    ctx = str(context or '').strip() or 'Unknown'
-    key = (clean.casefold(), ctx.casefold(), MODE)
 
-    with _CACHE_LOCK:
-        if key in _CACHE:
-            _bump(cached=1)
-            return dict(_CACHE[key])
+    if isinstance(body, dict) and body.get('error'):
+        _bump(errors=1)
+        log.warning("gemini apps-script returned error: %s (%s)",
+                    body.get('error'), body.get('detail', ''))
+        return {}
 
+    rows = (body or {}).get('results') or []
+    # index the reply by casefolded name so ordering differences cannot mismatch
+    by_name = {}
+    for row in rows:
+        if isinstance(row, dict):
+            by_name[str(row.get('name', '')).casefold()] = row
+
+    out = {}
+    for n, c in pairs:
+        row = by_name.get(n.casefold(), {})
+        vals = {f: '' for f in FIELDS}
+        for jkey, field in _JSON_KEYS.items():
+            vals[field] = sanitize(field, row.get(jkey, ''))
+        out[(n, c)] = vals
+    return out
+
+
+# --------------------------------------------------------------------------
+# backend: comparison-sheet flow (source='sheet')
+#
+# Three phases, because =GEMINI() will not evaluate headlessly:
+#   push     -> create a tab holding existing handles + formulas AS TEXT
+#   activate -> convert them to live formulas while a person has the tab open
+#   pull     -> read the computed values back
+# --------------------------------------------------------------------------
+
+def _script_call(action, **body):
+    """One POST to the Apps Script web app. Returns the parsed body.
+
+    Raises ScriptError with a readable message -- callers here are user-facing
+    endpoints, so a failure needs to be reportable rather than swallowed.
+    """
+    if not (SCRIPT_URL and SCRIPT_TOKEN):
+        raise ScriptError('GEMINI_SCRIPT_URL / GEMINI_SCRIPT_TOKEN are not set')
+    import requests
+
+    payload = dict(body)
+    payload['action'] = action
+    payload['token'] = SCRIPT_TOKEN
+    _bump(requests=1)
+    try:
+        resp = requests.post(SCRIPT_URL, json=payload,
+                             timeout=SCRIPT_TIMEOUT_S, allow_redirects=True)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:  # noqa: BLE001
+        _bump(errors=1)
+        _note_error(e)
+        raise ScriptError('could not reach the comparison sheet: %s' % e)
+    if isinstance(data, dict) and data.get('error'):
+        _bump(errors=1)
+        detail = data.get('detail') or ''
+        raise ScriptError(('%s %s' % (data['error'], detail)).strip())
+    return data or {}
+
+
+class ScriptError(RuntimeError):
+    """The Apps Script bridge could not do what was asked."""
+
+
+def sheet_push(rows):
+    """rows = [{title, title_type, context, existing:{field: value}}, ...]
+
+    Returns {batch, url, rows, gemini_cells}: the tab that was created and a
+    link straight to it.
+    """
+    payload = []
+    for r in rows:
+        payload.append({
+            'title': str(r.get('title') or ''),
+            'title_type': str(r.get('title_type') or ''),
+            'context': str(r.get('context') or 'Unknown'),
+            'existing': {f: str(r.get('existing', {}).get(f) or '') for f in FIELDS},
+        })
+    return _script_call('push', rows=payload)
+
+
+def sheet_activate(batch):
+    """Convert the batch's formula text into live formulas. The workbook must
+    be open in someone's browser or nothing will compute."""
+    return _script_call('activate', batch=batch)
+
+
+def sheet_status(batch):
+    return _script_call('status', batch=batch).get('status', {})
+
+
+def sheet_pull(batch):
+    """Read a batch back. Returns (status, [{title, title_type, context,
+    existing:{...}, <field>: gemini_value}]) with every Gemini value passed
+    through the same sanitiser the API path uses."""
+    data = _script_call('pull', batch=batch)
+    out = []
+    for row in data.get('results') or []:
+        rec = {
+            'title': row.get('title', ''),
+            'title_type': row.get('title_type', ''),
+            'context': row.get('context', ''),
+            'existing': {f: str((row.get('existing') or {}).get(f) or '')
+                         for f in FIELDS},
+        }
+        for f in FIELDS:
+            rec[f] = sanitize(f, row.get(f, ''))
+        out.append(rec)
+    return data.get('status', {}), out
+
+
+# --------------------------------------------------------------------------
+# backend: Gemini Developer API
+# --------------------------------------------------------------------------
+
+def _resolve_one_api(clean, ctx):
     out = {f: '' for f in FIELDS}
     if MODE == 'per_platform':
         for field, label in PLATFORMS:
@@ -397,6 +594,41 @@ def resolve(name, context=''):
             name=clean, context=ctx)))
         for jkey, field in _JSON_KEYS.items():
             out[field] = sanitize(field, obj.get(jkey, ''))
+    return out
+
+
+# --------------------------------------------------------------------------
+# public API -- identical shape whichever backend is configured
+# --------------------------------------------------------------------------
+
+def resolve(name, context=''):
+    """Resolve one entity to the seven handle fields.
+
+    ``name`` is the title as-is; the ' - DAR' suffix is ignored exactly as the
+    sheet prompt instructs.  Returns ``{field: value}`` with '' for anything
+    unconfirmed, and ``{}`` when the feature is unavailable.
+    """
+    if not available():
+        return {}
+    clean = _clean_name(name)
+    if not clean:
+        return {}
+    ctx = str(context or '').strip() or 'Unknown'
+    key = _cache_key(clean, ctx)
+
+    with _CACHE_LOCK:
+        if key in _CACHE:
+            _bump(cached=1)
+            return dict(_CACHE[key])
+
+    if SOURCE == 'sheet':
+        # nothing to return synchronously: this source needs push/activate/pull
+        return {}
+    if SOURCE == 'appsscript':
+        got = _resolve_batch_script([(clean, ctx)])
+        out = got.get((clean, ctx), {f: '' for f in FIELDS})
+    else:
+        out = _resolve_one_api(clean, ctx)
 
     with _CACHE_LOCK:
         _CACHE[key] = dict(out)
@@ -404,29 +636,30 @@ def resolve(name, context=''):
 
 
 def resolve_many(items, progress=None):
-    """Resolve ``[(name, context), ...]`` concurrently.
+    """Resolve ``[(name, context), ...]``.
 
-    Returns ``{(name, context): {field: value}}``.  Order-independent; one
-    failing entity never affects the others.
+    Returns ``{(name, context): {field: value}}`` keyed by the ORIGINAL pairs
+    the caller passed, so titles keep their ' - DAR' suffix on the way back.
+
+    The API source resolves entities concurrently, one request each. The Apps
+    Script source posts them in batches, because a single execution can fill a
+    whole block of =GEMINI() formulas in one pass -- far fewer round trips and
+    far less waiting than one request per title.
+
+    One failing entity or batch never affects the others.
     """
     items = list(dict.fromkeys(items))
-    if not items or not available():
+    if not items or not available() or SOURCE == 'sheet':
         return {}
+
+    total = len(items)
     results = {}
     lock = threading.Lock()
     state = {'done': 0}
-    total = len(items)
 
-    def _one(pair):
-        name, ctx = pair
-        try:
-            val = resolve(name, ctx)
-        except Exception as e:  # noqa: BLE001
-            log.warning("gemini resolve failed for %r: %s", name, e)
-            val = {}
+    def _tick(n=1):
         with lock:
-            results[pair] = val
-            state['done'] += 1
+            state['done'] += n
             done = state['done']
         if progress:
             try:
@@ -434,11 +667,78 @@ def resolve_many(items, progress=None):
             except Exception:
                 pass
 
-    if WORKERS == 1 or total == 1:
-        for p in items:
-            _one(p)
+    # normalise once, and remember which originals map to each cleaned pair --
+    # 'X' and 'X - DAR' collapse to one lookup and share its answer
+    norm = {}
+    for pair in items:
+        name, ctx = pair
+        clean = _clean_name(name)
+        c = str(ctx or '').strip() or 'Unknown'
+        norm.setdefault((clean, c), []).append(pair)
+
+    todo = []
+    for key_pair, originals in norm.items():
+        ck = _cache_key(*key_pair)
+        with _CACHE_LOCK:
+            hit = _CACHE.get(ck)
+        if hit is not None:
+            _bump(cached=1)
+            for p in originals:
+                results[p] = dict(hit)
+            _tick(len(originals))
+        elif key_pair[0]:
+            todo.append(key_pair)
+        else:
+            for p in originals:
+                results[p] = {}
+            _tick(len(originals))
+
+    def _store(key_pair, vals):
+        with _CACHE_LOCK:
+            _CACHE[_cache_key(*key_pair)] = dict(vals)
+        for p in norm[key_pair]:
+            results[p] = dict(vals)
+        _tick(len(norm[key_pair]))
+
+    if SOURCE == 'appsscript':
+        batches = [todo[i:i + SCRIPT_BATCH]
+                   for i in range(0, len(todo), SCRIPT_BATCH)]
+
+        def _one_batch(batch):
+            try:
+                got = _resolve_batch_script(batch)
+            except Exception as e:  # noqa: BLE001
+                log.warning("gemini batch failed: %s", e)
+                _bump(errors=1)
+                _note_error(e)
+                got = {}
+            for kp in batch:
+                _store(kp, got.get(kp, {f: '' for f in FIELDS}))
+
+        if WORKERS == 1 or len(batches) <= 1:
+            for b in batches:
+                _one_batch(b)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(WORKERS, len(batches))) as ex:
+                list(ex.map(_one_batch, batches))
     else:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=min(WORKERS, total)) as ex:
-            list(ex.map(_one, items))
+        def _one(key_pair):
+            try:
+                vals = _resolve_one_api(*key_pair)
+            except Exception as e:  # noqa: BLE001
+                log.warning("gemini resolve failed for %r: %s", key_pair[0], e)
+                _bump(errors=1)
+                _note_error(e)
+                vals = {f: '' for f in FIELDS}
+            _store(key_pair, vals)
+
+        if WORKERS == 1 or len(todo) <= 1:
+            for kp in todo:
+                _one(kp)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(WORKERS, len(todo))) as ex:
+                list(ex.map(_one, todo))
+
     return results

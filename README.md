@@ -103,7 +103,10 @@ The optional **Gemini comparison columns** feature (see below) reads:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GEMINI_API_KEY` | *(unset)* | Enables the feature. Without it the toggle reports itself unavailable and nothing else changes. |
+| `GEMINI_SOURCE` | `api` | `api` = Gemini Developer API (metered). `sheet` = the comparison-sheet flow below (no API quota). |
+| `GEMINI_API_KEY` | *(unset)* | Enables the `api` source. Without it the toggle reports itself unavailable and nothing else changes. |
+| `GEMINI_SCRIPT_URL` | *(unset)* | `sheet` source: the Apps Script web app `/exec` URL. |
+| `GEMINI_SCRIPT_TOKEN` | *(unset)* | `sheet` source: must match the `TF_TOKEN` script property. |
 | `GEMINI_MODEL` | `gemini-flash-latest` | Pin an explicit model (e.g. `gemini-3.7-flash`) if you want stable behaviour across runs. |
 | `GEMINI_MODE` | `consolidated` | `consolidated` = one grounded request per title for all 7 platforms. `per_platform` = one request per platform, exactly as the Ops sheet did. |
 | `GEMINI_WORKERS` | `4` | Concurrent grounded requests. |
@@ -158,18 +161,32 @@ Rotten Tomatoes / Metacritic) remains the only thing that writes
 - **Gemini Compare** — one row per generated row, with a column triple per
   platform:
 
-  | title | instagram_user | instagram_user_gemini | instagram_user_match |
-  | --- | --- | --- | --- |
-  | Grace Ling - DAR | gracelingofficial | gracelingofficial | match |
-  | Jane Wade - DAR | | janewade_ | gemini only |
+  | title | title_type | instagram_user | instagram_user_gemini | instagram_user_match |
+  | --- | --- | --- | --- | --- |
+  | Grace Ling - DAR | Movies | gracelingofficial | gracelingofficial | match |
+  | Tom Hanks | Talent | | tomhanks | gemini only |
 
   `_match` is one of `match`, `mismatch`, `existing only`, `gemini only`,
-  `both blank`. Comparison is done on canonical forms, so
+  `both blank`, `not in schema`. Comparison is done on canonical forms, so
   `http://www.facebook.com/x` and `https://facebook.com/x/` count as a match,
   as do `MagdaButrym` and `@magdabutrym`.
 
-- **Gemini Summary** — per-field tallies plus `agreement_when_both_filled`,
-  which is the number the exercise exists to produce.
+- **Gemini Summary** — tallies per title type per field, plus
+  `agreement_when_both_filled`, which is the number the exercise exists to
+  produce. A mixed run also gets an `(all types)` block.
+
+### Works for every title type
+
+The toggle applies to all of them — Movies, TV Shows, Talent, Video Games,
+Publishers, Beauty, Beverages, Sports Teams, General — and to mixed runs. The
+comparison lives on its own sheets rather than inside a schema, so it does not
+care which ingest layout a row uses; the `title_type` column says which type
+each row came from, and the summary scores each type separately so you can see
+where Gemini earns its keep.
+
+A field that a given schema does not carry is marked `not in schema` and left
+out of that type's tallies, rather than counted as a Gemini-only find — Beauty
+and Beverages have no `imdb_id` column, for instance.
 
 Covered fields: `facebook_page`, `twitter_handle`, `instagram_user`,
 `youtube_channel_username`, `tiktok_user`, `wikipedia_page`, `imdb_id`.
@@ -326,3 +343,54 @@ Proprietary - Listenfirst Media
 ---
 
 **Made with ❤️ for Listenfirst Media**
+
+
+## Zero-quota alternative: the comparison sheet (`GEMINI_SOURCE=sheet`)
+
+The Ops sheet's `=GEMINI()` formulas are the **native Google Sheets function**,
+covered by the Workspace subscription rather than metered API quota. Past the
+API's free 5,000 grounded requests a month that is a real saving, so this source
+routes the work through a Google Sheet instead of the API.
+
+### The one constraint that shapes the design
+
+`=GEMINI()` only evaluates inside an interactive session. A script can *write*
+the formula, but nothing computes it until a person has the workbook open —
+verified directly: a formula written from a server-side execution sits at
+`#ERROR!` indefinitely, including a trivial `"Reply with the single word OK"`
+control prompt, while the same formula fills in normally once a browser session
+is on the file. That is also why the Ops sheet's own script writes formulas as
+text and has a separate *Activate formulas* step.
+
+So this source is three steps rather than one button:
+
+| Step | What happens | Where |
+| --- | --- | --- |
+| 1 · Send titles | Builds the rows as usual, then writes a new `cmp_<timestamp>` tab holding the existing handles plus the GEMINI formulas **as text** (inert, so nothing errors while no one is looking) | `POST /api/gemini_sheet/push` |
+| 2 · Activate formulas | Converts that text into live formulas. **The workbook must be open in a browser tab** — that session is what evaluates them | `POST /api/gemini_sheet/activate` |
+| 3 · Check progress | Reports filled / still-text / still-computing counts | `GET /api/gemini_sheet/status` |
+| 4 · Download comparison | Reads the values back, scores them with the same match logic the API path uses, and returns the two-sheet workbook | `POST /api/gemini_sheet/pull`, `GET /api/gemini_sheet/download` |
+
+The UI shows these four buttons as a **Comparison sheet** panel, which appears
+only when the server reports `interactive: true`.
+
+### Setting it up
+
+1. Create (or reuse) a Google Sheet to hold the comparison tabs.
+2. Extensions → Apps Script, paste `appsscript/Code.gs`, and set `SHEET_ID` to
+   that workbook's id.
+3. Project Settings → Script Properties → add `TF_TOKEN` = a long random string.
+   With no property set the endpoint authorises nothing — closed by default.
+4. Deploy → New deployment → Web app → *Execute as: Me*, *Who has access:
+   Anyone*. The URL has to be reachable by Render, so the shared token is the
+   only thing protecting it: treat it like a password and rotate it if it leaks.
+5. In Render set `GEMINI_SOURCE=sheet`, `GEMINI_SCRIPT_URL` to the `/exec` URL,
+   and `GEMINI_SCRIPT_TOKEN` to the same string as `TF_TOKEN`.
+
+### Trade-offs, stated plainly
+
+- **Cost:** nothing beyond the Workspace subscription you already pay for.
+- **Speed:** slower than the API, and it cannot run unattended — somebody has to
+  have the sheet open for step 2.
+- **Limits:** Sheets AI functions have their own per-user Workspace limits, so
+  this is *subscription-covered*, not unlimited.
