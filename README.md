@@ -158,18 +158,32 @@ Rotten Tomatoes / Metacritic) remains the only thing that writes
 - **Gemini Compare** — one row per generated row, with a column triple per
   platform:
 
-  | title | instagram_user | instagram_user_gemini | instagram_user_match |
-  | --- | --- | --- | --- |
-  | Grace Ling - DAR | gracelingofficial | gracelingofficial | match |
-  | Jane Wade - DAR | | janewade_ | gemini only |
+  | title | title_type | instagram_user | instagram_user_gemini | instagram_user_match |
+  | --- | --- | --- | --- | --- |
+  | Grace Ling - DAR | Movies | gracelingofficial | gracelingofficial | match |
+  | Tom Hanks | Talent | | tomhanks | gemini only |
 
   `_match` is one of `match`, `mismatch`, `existing only`, `gemini only`,
-  `both blank`. Comparison is done on canonical forms, so
+  `both blank`, `not in schema`. Comparison is done on canonical forms, so
   `http://www.facebook.com/x` and `https://facebook.com/x/` count as a match,
   as do `MagdaButrym` and `@magdabutrym`.
 
-- **Gemini Summary** — per-field tallies plus `agreement_when_both_filled`,
-  which is the number the exercise exists to produce.
+- **Gemini Summary** — tallies per title type per field, plus
+  `agreement_when_both_filled`, which is the number the exercise exists to
+  produce. A mixed run also gets an `(all types)` block.
+
+### Works for every title type
+
+The toggle applies to all of them — Movies, TV Shows, Talent, Video Games,
+Publishers, Beauty, Beverages, Sports Teams, General — and to mixed runs. The
+comparison lives on its own sheets rather than inside a schema, so it does not
+care which ingest layout a row uses; the `title_type` column says which type
+each row came from, and the summary scores each type separately so you can see
+where Gemini earns its keep.
+
+A field that a given schema does not carry is marked `not in schema` and left
+out of that type's tallies, rather than counted as a Gemini-only find — Beauty
+and Beverages have no `imdb_id` column, for instance.
 
 Covered fields: `facebook_page`, `twitter_handle`, `instagram_user`,
 `youtube_channel_username`, `tiktok_user`, `wikipedia_page`, `imdb_id`.

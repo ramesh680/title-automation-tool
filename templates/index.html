@@ -490,14 +490,17 @@
             let h = `<h3 style="margin:22px 0 6px;font-size:14px">Gemini comparison
                      <span style="color:#666;font-weight:400">(preview sample &mdash; the export carries every row)</span></h3>`;
             h += '<div class="preview-section"><table class="preview-table"><thead><tr>'
-               + ['field', 'existing filled', 'gemini filled', 'match', 'mismatch',
-                  'existing only', 'gemini only', 'agreement when both filled']
+               + ['title type', 'field', 'existing filled', 'gemini filled', 'match',
+                  'mismatch', 'existing only', 'gemini only', 'not in schema',
+                  'agreement when both filled']
                    .map(x => `<th>${x}</th>`).join('')
                + '</tr></thead><tbody>';
             (g.summary || []).forEach(s => {
-                h += `<tr><td>${escapeHtml(s.field)}</td><td>${s.existing_filled}</td>`
+                h += `<tr><td>${escapeHtml(s.title_type || '')}</td>`
+                   + `<td>${escapeHtml(s.field)}</td><td>${s.existing_filled}</td>`
                    + `<td>${s.gemini_filled}</td><td>${s.match}</td><td>${s.mismatch}</td>`
                    + `<td>${s.existing_only}</td><td>${s.gemini_only}</td>`
+                   + `<td>${s.not_in_schema || 0}</td>`
                    + `<td>${escapeHtml(s.agreement_when_both_filled || '—')}</td></tr>`;
             });
             h += '</tbody></table></div>';

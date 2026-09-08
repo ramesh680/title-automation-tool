@@ -2089,7 +2089,36 @@ GEMINI_COMPARE_FIELDS = [
 ]
 
 _GEMINI_MATCH_LABELS = ('match', 'mismatch', 'existing only', 'gemini only',
-                        'both blank')
+                        'both blank', 'not in schema')
+
+
+def _gemini_row_type(row):
+    """The title type this row was built as -- the label of its ingest sheet.
+    Lets a mixed run's comparison be read (and scored) per title type."""
+    k = row.get('_tfx_schema')
+    if k:
+        return _TFX_SHEET_LABELS.get(k, str(k).title())
+    if _is_talent_row(row):
+        return 'Talent'
+    if _is_game_row(row):
+        return 'Video Games'
+    if _is_publisher_row(row):
+        return 'Publishers'
+    if _is_tv_row(row):
+        return 'TV Shows'
+    return 'Movies'
+
+
+def _gemini_row_schema_columns(row):
+    """The ingest column set for this row's title type, so a field that type
+    does not carry is reported as 'not in schema' rather than counted as a
+    Gemini-only find (e.g. imdb_id on Beauty and Beverages)."""
+    k = row.get('_tfx_schema')
+    if k and TFX_OK and _TFX_COLUMNS.get(k):
+        return _TFX_COLUMNS[k]
+    return {'Talent': TALENT_COLUMNS, 'Video Games': GAME_COLUMNS,
+            'Publishers': PUBLISHER_COLUMNS, 'TV Shows': TV_COLUMNS,
+            'Movies': COLUMNS}.get(_gemini_row_type(row), COLUMNS)
 
 
 def _gemini_context(row):
@@ -2166,8 +2195,10 @@ def _gemini_compare_records(rows):
     for r in rows:
         if not (isinstance(r, dict) and r.get('_gemini')):
             continue
+        schema_cols = _gemini_row_schema_columns(r)
         rec = {
             'title': r.get('title', ''),
+            'title_type': _gemini_row_type(r),
             'title_category': r.get('title_category', ''),
             'context_sent_to_gemini': _gemini_context(r),
         }
@@ -2176,42 +2207,57 @@ def _gemini_compare_records(rows):
             guess = r.get(f'_gemini_{f}') or ''
             rec[f] = existing
             rec[f'{f}_gemini'] = guess
-            rec[f'{f}_match'] = _gemini_match_label(f, existing, guess)
+            rec[f'{f}_match'] = ('not in schema' if f not in schema_cols
+                                 else _gemini_match_label(f, existing, guess))
         out.append(rec)
     return out
 
 
 def _gemini_compare_columns():
-    cols = ['title', 'title_category', 'context_sent_to_gemini']
+    cols = ['title', 'title_type', 'title_category', 'context_sent_to_gemini']
     for f in GEMINI_COMPARE_FIELDS:
         cols += [f, f'{f}_gemini', f'{f}_match']
     return cols
 
 
 def _gemini_summary_records(records):
-    """Per-field tallies plus an agreement rate over the rows where both
-    sources produced a value -- the number the comparison exists to answer."""
+    """Per-title-type, per-field tallies plus an agreement rate over the rows
+    where both sources produced a value -- the number the comparison exists to
+    answer. A mixed run also gets an '(all types)' block."""
+    def _block(label, rows):
+        block = []
+        for f in GEMINI_COMPARE_FIELDS:
+            counts = {lbl: 0 for lbl in _GEMINI_MATCH_LABELS}
+            for rec in rows:
+                lbl = rec.get(f'{f}_match')
+                if lbl in counts:
+                    counts[lbl] += 1
+            both = counts['match'] + counts['mismatch']
+            block.append({
+                'title_type': label,
+                'field': f,
+                'rows': len(rows),
+                'existing_filled': both + counts['existing only'],
+                'gemini_filled': both + counts['gemini only'],
+                'match': counts['match'],
+                'mismatch': counts['mismatch'],
+                'existing_only': counts['existing only'],
+                'gemini_only': counts['gemini only'],
+                'both_blank': counts['both blank'],
+                'not_in_schema': counts['not in schema'],
+                'agreement_when_both_filled': (f"{counts['match'] / both * 100:.1f}%"
+                                               if both else ''),
+            })
+        return block
+
+    groups = {}
+    for rec in records:
+        groups.setdefault(rec.get('title_type') or 'Movies', []).append(rec)
     out = []
-    for f in GEMINI_COMPARE_FIELDS:
-        counts = {lbl: 0 for lbl in _GEMINI_MATCH_LABELS}
-        for rec in records:
-            lbl = rec.get(f'{f}_match')
-            if lbl in counts:
-                counts[lbl] += 1
-        both = counts['match'] + counts['mismatch']
-        out.append({
-            'field': f,
-            'rows': len(records),
-            'existing_filled': counts['match'] + counts['mismatch'] + counts['existing only'],
-            'gemini_filled': counts['match'] + counts['mismatch'] + counts['gemini only'],
-            'match': counts['match'],
-            'mismatch': counts['mismatch'],
-            'existing_only': counts['existing only'],
-            'gemini_only': counts['gemini only'],
-            'both_blank': counts['both blank'],
-            'agreement_when_both_filled': (f"{counts['match'] / both * 100:.1f}%"
-                                           if both else ''),
-        })
+    for label in sorted(groups):
+        out.extend(_block(label, groups[label]))
+    if len(groups) > 1:
+        out.extend(_block('(all types)', records))
     return out
 
 

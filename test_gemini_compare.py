@@ -4,6 +4,7 @@ workbook shape. No network -- the resolver's single call site is stubbed.
 The sanitiser cases are taken from the real NYFW SS27 sheet run, including the
 prose answer the model gave for Wiederhoeft's IMDb column.
 """
+import io
 import unittest
 from unittest import mock
 
@@ -296,3 +297,87 @@ class StatusEndpoint(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class EveryTitleType(unittest.TestCase):
+    """The comparison must appear for every title type the UI offers, and a
+    field a schema does not carry must not be scored as a Gemini-only find."""
+
+    ANSWER = ('{"facebook":"https://www.facebook.com/x","twitter":"xhandle",'
+              '"instagram":"xinsta","youtube":"@xyt","tiktok":"xtt",'
+              '"wikipedia":"https://en.wikipedia.org/wiki/X","imdb":"nm1234567"}')
+
+    KINDS = {'movie': ('Inception', 'Movies'), 'tv': ('Severance', 'TV Shows'),
+             'talent': ('Tom Hanks', 'Talent'), 'game': ('Elden Ring', 'Video Games'),
+             'publisher': ('Vogue', 'Publishers'), 'beauty': ('Rare Beauty', 'Beauty'),
+             'beverages': ('Celsius', 'Beverages'), 'sports': ('LA Lakers', 'Sports Teams'),
+             'general': ('Peloton', 'General')}
+
+    def _generate(self, titles_type):
+        titles = list(titles_type)
+        payload = {'titles': titles, 'includeDar': False, 'autoFetch': False,
+                   'geminiCompare': True, 'titles_type': titles_type}
+        gr.clear_cache()
+        gr.reset_stats()
+        with mock.patch.object(gr, 'available', return_value=True), \
+             mock.patch.object(gr, '_generate',
+                               lambda p: _FakeResp(self.ANSWER)):
+            resp = app.app.test_client().post('/api/generate', json=payload)
+        self.assertEqual(resp.status_code, 200)
+        return openpyxl.load_workbook(io.BytesIO(resp.data))
+
+    def test_each_title_type_gets_the_comparison_sheets(self):
+        for kind, (title, label) in self.KINDS.items():
+            wb = self._generate({title: kind})
+            self.assertIn('Gemini Compare', wb.sheetnames, kind)
+            self.assertIn('Gemini Summary', wb.sheetnames, kind)
+            ws = wb['Gemini Compare']
+            hdr = [c.value for c in ws[1]]
+            self.assertEqual(ws.max_row - 1, 1, kind)
+            self.assertEqual(ws.cell(row=2, column=hdr.index('title_type') + 1).value,
+                             label, kind)
+
+    def test_mixed_run_labels_each_row_with_its_type(self):
+        wb = self._generate({'Inception': 'movie', 'Tom Hanks': 'talent',
+                             'Elden Ring': 'game'})
+        ws = wb['Gemini Compare']
+        hdr = [c.value for c in ws[1]]
+        col = hdr.index('title_type') + 1
+        types = {ws.cell(row=r, column=col).value for r in range(2, ws.max_row + 1)}
+        self.assertEqual(types, {'Movies', 'Talent', 'Video Games'})
+
+    def test_mixed_run_summary_is_per_type_plus_a_combined_block(self):
+        wb = self._generate({'Inception': 'movie', 'Tom Hanks': 'talent'})
+        ws = wb['Gemini Summary']
+        hdr = [c.value for c in ws[1]]
+        col = hdr.index('title_type') + 1
+        labels = [ws.cell(row=r, column=col).value for r in range(2, ws.max_row + 1)]
+        self.assertEqual(set(labels), {'Movies', 'Talent', '(all types)'})
+        # one row per field per block
+        self.assertEqual(len(labels), 3 * len(app.GEMINI_COMPARE_FIELDS))
+
+    def test_field_absent_from_a_schema_is_not_scored(self):
+        """Beauty and Beverages carry no imdb_id column."""
+        for kind, title in (('beauty', 'Rare Beauty'), ('beverages', 'Celsius')):
+            wb = self._generate({title: kind})
+            ws = wb['Gemini Compare']
+            hdr = [c.value for c in ws[1]]
+            self.assertEqual(
+                ws.cell(row=2, column=hdr.index('imdb_id_match') + 1).value,
+                'not in schema', kind)
+            summary = {(r[hdr2.index('title_type')], r[hdr2.index('field')]): r
+                       for hdr2, r in [([c.value for c in wb['Gemini Summary'][1]],
+                                        [c.value for c in row])
+                                       for row in wb['Gemini Summary'].iter_rows(min_row=2)]}
+            key = [k for k in summary if k[1] == 'imdb_id'][0]
+            row = summary[key]
+            h = [c.value for c in wb['Gemini Summary'][1]]
+            self.assertEqual(row[h.index('gemini_only')], 0, kind)
+            self.assertEqual(row[h.index('not_in_schema')], 1, kind)
+
+    def test_imdb_is_still_scored_where_the_schema_has_it(self):
+        wb = self._generate({'Inception': 'movie'})
+        ws = wb['Gemini Compare']
+        hdr = [c.value for c in ws[1]]
+        self.assertEqual(ws.cell(row=2, column=hdr.index('imdb_id_match') + 1).value,
+                         'gemini only')
