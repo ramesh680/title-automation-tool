@@ -578,15 +578,38 @@
                 return `<span style="color:${c};font-weight:600">${escapeHtml(v || '')}</span>`;
             };
             let h = '';
+            const pick = k => ((g.notes || []).find(n => n.item === k) || {}).value;
             const note = (g.notes || []).find(n => n.item === 'status');
-            const why = (g.notes || []).find(n => n.item === 'what this means');
+            const why = pick('what this means');
+            // The reason the run failed belongs on screen, not only in the
+            // workbook: a status of FAILED with no cause sends you hunting
+            // through the export or the server logs for something we already
+            // know. Google's own message is usually self-explanatory (an
+            // exhausted quota, a rejected key, an unknown model).
+            const err = pick('last error from Google');
             if (note && note.value !== 'OK') {
                 const bad = note.value === 'FAILED';
                 h += `<div style="margin:18px 0 4px;padding:10px 12px;border-radius:6px;`
                    + `border-left:3px solid ${bad ? '#ef4444' : '#f59e0b'};`
                    + `background:rgba(${bad ? '239,68,68' : '245,158,11'},.10)">`
                    + `<b>Gemini run: ${escapeHtml(note.value)}</b><br>`
-                   + `<span style="font-size:12px">${escapeHtml((why || {}).value || '')}</span></div>`;
+                   + `<span style="font-size:12px">${escapeHtml(why || '')}</span>`;
+                if (err) {
+                    h += `<div style="margin-top:8px;font-size:12px">`
+                       + `<b>Reason reported by Google:</b>`
+                       + `<div style="margin-top:3px;padding:6px 8px;border-radius:4px;`
+                       + `background:rgba(0,0,0,.25);font-family:ui-monospace,monospace;`
+                       + `white-space:pre-wrap;word-break:break-word">`
+                       + `${escapeHtml(err)}</div>`;
+                    if (/RESOURCE_EXHAUSTED|quota|429/i.test(err)) {
+                        h += `<div style="margin-top:6px">A grounded Gemini request needs `
+                           + `billing enabled on the key; the free tier refuses them. `
+                           + `You can also skip the API entirely and run the comparison `
+                           + `inside Google Sheets, which the Workspace subscription covers.</div>`;
+                    }
+                    h += `</div>`;
+                }
+                h += `</div>`;
             }
             h += `<h3 style="margin:22px 0 6px;font-size:14px">Gemini comparison
                      <span style="color:#666;font-weight:400">(preview sample &mdash; the export carries every row)</span></h3>`;
