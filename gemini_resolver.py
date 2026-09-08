@@ -316,9 +316,19 @@ def _get_client():
         return _client
 
 
+# Google's 429 body opens with ~400 characters of boilerplate and doc links,
+# and only then reaches the part worth reading: a QuotaFailure naming the
+# metric that was actually exhausted. Truncating at 400 threw that away and
+# left every quota error looking identical.
+_QUOTA_RE = re.compile(r"""quota_?[Mm]etric['"]?\s*[:=]\s*['"]([^'"]+)""")
+
+
 def _note_error(exc):
+    text = str(exc)
+    hit = _QUOTA_RE.search(text)
+    lead = 'Quota exhausted: %s. ' % hit.group(1) if hit else ''
     with _stats_lock:
-        _LAST_ERROR['text'] = str(exc)[:400]
+        _LAST_ERROR['text'] = (lead + text)[:1200]
 
 
 def last_error():
@@ -330,6 +340,11 @@ def stats():
     with _stats_lock:
         s = dict(_STATS)
         s['last_error'] = _LAST_ERROR['text']
+    # The run notes report source/model/mode, and without these they silently
+    # fell back to their defaults -- so a sheet-source run still claimed 'api'.
+    s['source'] = SOURCE
+    s['model'] = MODEL
+    s['mode'] = MODE
     # 5,000 grounded search requests/month are free across Gemini 3.x, then
     # $14 per 1,000 -- so the request count *is* the cost.
     s['est_search_cost_usd'] = round(s['grounded'] * 0.014, 4)
@@ -377,6 +392,61 @@ def _generate(prompt):
         log.warning("gemini call failed: %s", e)
         _note_error(e)
         return None
+
+
+def probe():
+    """Two minimal calls that separate 'the key cannot call Gemini at all'
+    from 'the key can call Gemini but not with Google Search grounding'.
+
+    A 429 on this project looks the same in a run either way, but the fix is
+    completely different: an exhausted free-tier request cap resets, whereas
+    grounding is simply not free and needs billing enabled. Guessing between
+    them wastes a day, so ask Google directly with the cheapest possible
+    prompt -- two requests, a handful of tokens.
+
+    Deliberately bypasses _ask: this must not consume the run budget and its
+    failures are the answer, not a run error.
+    """
+    if not (SDK_OK and API_KEY):
+        return {'ok': False, 'reason': 'no API key configured on the server'}
+
+    def attempt(grounded):
+        try:
+            kw = {'temperature': 0.0}
+            if grounded:
+                kw['tools'] = [_gtypes.Tool(google_search=_gtypes.GoogleSearch())]
+            resp = _get_client().models.generate_content(
+                model=MODEL,
+                contents='Reply with the single word OK.',
+                config=_gtypes.GenerateContentConfig(**kw))
+            return {'ok': True, 'reply': (getattr(resp, 'text', '') or '').strip()[:40]}
+        except Exception as e:  # noqa: BLE001 -- the failure IS the result
+            text = str(e)
+            hit = _QUOTA_RE.search(text)
+            return {'ok': False,
+                    'quota': hit.group(1) if hit else None,
+                    'error': text[:600]}
+
+    plain = attempt(False)
+    grounded = attempt(True)
+
+    if plain['ok'] and grounded['ok']:
+        verdict = ('Both work. The key is fine and grounded search is allowed, '
+                   'so a failing run is something other than quota.')
+    elif plain['ok'] and not grounded['ok']:
+        verdict = ('The key works, but NOT with Google Search grounding. '
+                   'Grounded requests are not free -- enable billing on the '
+                   'key, or run the comparison in Sheets instead.')
+    elif not plain['ok'] and not grounded['ok']:
+        verdict = ('The key cannot call this model at all, grounding aside. '
+                   'Either the free-tier request cap is exhausted (it resets, '
+                   'so try again later) or this model has no free tier. '
+                   'Check the quota name below.')
+    else:
+        verdict = 'Grounded works but plain does not, which is unexpected.'
+
+    return {'ok': plain['ok'] or grounded['ok'], 'model': MODEL,
+            'plain': plain, 'grounded': grounded, 'verdict': verdict}
 
 
 def _ask(prompt):

@@ -2640,6 +2640,18 @@ def gemini_status():
     return jsonify(st)
 
 
+@app.route('/api/gemini_probe')
+def gemini_probe():
+    """Ask Google what this key is actually allowed to do. Two tiny requests."""
+    if not GEMINI_OK:
+        return jsonify({'ok': False, 'reason': 'gemini resolver not available'}), 200
+    try:
+        return jsonify(GEMINI.probe())
+    except Exception as e:  # noqa: BLE001
+        logging.error('gemini probe failed: %s', e)
+        return jsonify({'ok': False, 'reason': str(e)[:400]}), 200
+
+
 @app.route('/api/gemini_sheet/push', methods=['POST'])
 def gemini_sheet_push():
     """Step 1: build the rows as usual, then write them to a new tab in the

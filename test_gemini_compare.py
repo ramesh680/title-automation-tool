@@ -6,6 +6,7 @@ prose answer the model gave for Wiederhoeft's IMDb column.
 """
 import io
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import openpyxl
@@ -834,3 +835,98 @@ class RunNotes(unittest.TestCase):
         wb = openpyxl.load_workbook(io.BytesIO(resp.data))
         self.assertEqual(wb.sheetnames,
                          ['Gemini Compare', 'Gemini Summary', 'Gemini Run Notes'])
+
+
+class ProbeAndReporting(unittest.TestCase):
+    """The probe exists to tell two indistinguishable 429s apart, and the run
+    notes exist to explain an empty column. Both are diagnostics, so a wrong
+    answer here is worse than no answer."""
+
+    def setUp(self):
+        self._sdk, self._key = gr.SDK_OK, gr.API_KEY
+        gr.SDK_OK, gr.API_KEY = True, 'test-key'
+        gr.reset_stats()
+
+    def tearDown(self):
+        gr.SDK_OK, gr.API_KEY = self._sdk, self._key
+        gr.reset_stats()
+
+    @staticmethod
+    def _client(behaviour):
+        """behaviour(grounded) -> reply text, or raises."""
+        class Models:
+            def generate_content(self, model, contents, config):
+                grounded = bool(getattr(config, 'tools', None))
+                text = behaviour(grounded)
+                return SimpleNamespace(text=text)
+        return SimpleNamespace(models=Models())
+
+    def test_no_key_reports_plainly(self):
+        gr.API_KEY = ''
+        r = gr.probe()
+        self.assertFalse(r['ok'])
+        self.assertIn('no API key', r['reason'])
+
+    def test_both_work(self):
+        with mock.patch.object(gr, '_get_client',
+                               return_value=self._client(lambda g: 'OK')):
+            r = gr.probe()
+        self.assertTrue(r['ok'])
+        self.assertTrue(r['plain']['ok'])
+        self.assertTrue(r['grounded']['ok'])
+        self.assertIn('Both work', r['verdict'])
+
+    def test_grounding_is_the_blocker(self):
+        def behaviour(grounded):
+            if grounded:
+                raise RuntimeError("429 RESOURCE_EXHAUSTED {'quotaMetric': "
+                                   "'generativelanguage.googleapis.com/grounded_search'}")
+            return 'OK'
+        with mock.patch.object(gr, '_get_client',
+                               return_value=self._client(behaviour)):
+            r = gr.probe()
+        self.assertTrue(r['plain']['ok'])
+        self.assertFalse(r['grounded']['ok'])
+        self.assertEqual(r['grounded']['quota'],
+                         'generativelanguage.googleapis.com/grounded_search')
+        self.assertIn('NOT with Google Search grounding', r['verdict'])
+
+    def test_key_cannot_call_at_all(self):
+        def behaviour(grounded):
+            raise RuntimeError("429 RESOURCE_EXHAUSTED {'quotaMetric': "
+                               "'generativelanguage.googleapis.com/"
+                               "generate_content_free_tier_requests'}")
+        with mock.patch.object(gr, '_get_client',
+                               return_value=self._client(behaviour)):
+            r = gr.probe()
+        self.assertFalse(r['ok'])
+        self.assertIn('cannot call this model at all', r['verdict'])
+        self.assertIn('free_tier_requests', r['plain']['quota'])
+
+    def test_probe_does_not_spend_the_run_budget(self):
+        with mock.patch.object(gr, '_get_client',
+                               return_value=self._client(lambda g: 'OK')):
+            gr.probe()
+        st = gr.stats()
+        self.assertEqual(st['requests'], 0, 'probe must not count as run requests')
+        self.assertEqual(st['errors'], 0)
+
+    def test_stats_report_the_real_config_not_defaults(self):
+        st = gr.stats()
+        self.assertEqual(st['source'], gr.SOURCE)
+        self.assertEqual(st['model'], gr.MODEL)
+        self.assertEqual(st['mode'], gr.MODE)
+
+    def test_quota_name_is_lifted_to_the_front_of_the_error(self):
+        gr._note_error(RuntimeError(
+            "429 RESOURCE_EXHAUSTED. " + ("boilerplate " * 40)
+            + "{'quotaMetric': 'generativelanguage.googleapis.com/"
+              "generate_content_free_tier_requests'}"))
+        err = gr.stats()['last_error']
+        self.assertTrue(err.startswith('Quota exhausted: '), err[:60])
+        self.assertIn('free_tier_requests', err[:120],
+                      'the quota name must survive truncation')
+
+    def test_non_quota_error_gets_no_quota_prefix(self):
+        gr._note_error(RuntimeError('404 NOT_FOUND: unknown model'))
+        self.assertEqual(gr.stats()['last_error'], '404 NOT_FOUND: unknown model')
