@@ -296,6 +296,9 @@ _client_lock = threading.Lock()
 _stats_lock = threading.Lock()
 _STATS = {'requests': 0, 'grounded': 0, 'errors': 0, 'cached': 0,
           'input_tokens': 0, 'output_tokens': 0, 'capped': 0}
+# the most recent failure, so an empty run can say WHY it is empty instead of
+# looking identical to "the model found nothing"
+_LAST_ERROR = {'text': ''}
 # entity-level cache: the sheet gave the same entity different answers on its
 # DAR and non-DAR rows (Wiederhoeft: twitter 'wiederhoeft_' vs 'wiederhoeft').
 # Resolving once per normalised name removes that inconsistency and halves the
@@ -313,9 +316,20 @@ def _get_client():
         return _client
 
 
+def _note_error(exc):
+    with _stats_lock:
+        _LAST_ERROR['text'] = str(exc)[:400]
+
+
+def last_error():
+    with _stats_lock:
+        return _LAST_ERROR['text']
+
+
 def stats():
     with _stats_lock:
         s = dict(_STATS)
+        s['last_error'] = _LAST_ERROR['text']
     # 5,000 grounded search requests/month are free across Gemini 3.x, then
     # $14 per 1,000 -- so the request count *is* the cost.
     s['est_search_cost_usd'] = round(s['grounded'] * 0.014, 4)
@@ -326,6 +340,7 @@ def reset_stats():
     with _stats_lock:
         for k in _STATS:
             _STATS[k] = 0
+        _LAST_ERROR['text'] = ''
 
 
 def clear_cache():
@@ -360,6 +375,7 @@ def _generate(prompt):
             model=MODEL, contents=prompt, config=cfg)
     except Exception as e:  # noqa: BLE001 -- fail soft per entity
         log.warning("gemini call failed: %s", e)
+        _note_error(e)
         return None
 
 
@@ -502,6 +518,7 @@ def _script_call(action, **body):
         data = resp.json()
     except Exception as e:  # noqa: BLE001
         _bump(errors=1)
+        _note_error(e)
         raise ScriptError('could not reach the comparison sheet: %s' % e)
     if isinstance(data, dict) and data.get('error'):
         _bump(errors=1)
@@ -692,6 +709,8 @@ def resolve_many(items, progress=None):
                 got = _resolve_batch_script(batch)
             except Exception as e:  # noqa: BLE001
                 log.warning("gemini batch failed: %s", e)
+                _bump(errors=1)
+                _note_error(e)
                 got = {}
             for kp in batch:
                 _store(kp, got.get(kp, {f: '' for f in FIELDS}))
@@ -709,6 +728,8 @@ def resolve_many(items, progress=None):
                 vals = _resolve_one_api(*key_pair)
             except Exception as e:  # noqa: BLE001
                 log.warning("gemini resolve failed for %r: %s", key_pair[0], e)
+                _bump(errors=1)
+                _note_error(e)
                 vals = {f: '' for f in FIELDS}
             _store(key_pair, vals)
 

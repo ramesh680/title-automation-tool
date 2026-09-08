@@ -577,7 +577,18 @@
                             'both blank': '#6b7280' }[v] || '#6b7280';
                 return `<span style="color:${c};font-weight:600">${escapeHtml(v || '')}</span>`;
             };
-            let h = `<h3 style="margin:22px 0 6px;font-size:14px">Gemini comparison
+            let h = '';
+            const note = (g.notes || []).find(n => n.item === 'status');
+            const why = (g.notes || []).find(n => n.item === 'what this means');
+            if (note && note.value !== 'OK') {
+                const bad = note.value === 'FAILED';
+                h += `<div style="margin:18px 0 4px;padding:10px 12px;border-radius:6px;`
+                   + `border-left:3px solid ${bad ? '#ef4444' : '#f59e0b'};`
+                   + `background:rgba(${bad ? '239,68,68' : '245,158,11'},.10)">`
+                   + `<b>Gemini run: ${escapeHtml(note.value)}</b><br>`
+                   + `<span style="font-size:12px">${escapeHtml((why || {}).value || '')}</span></div>`;
+            }
+            h += `<h3 style="margin:22px 0 6px;font-size:14px">Gemini comparison
                      <span style="color:#666;font-weight:400">(preview sample &mdash; the export carries every row)</span></h3>`;
             h += '<div class="preview-section"><table class="preview-table"><thead><tr>'
                + ['title type', 'field', 'existing filled', 'gemini filled', 'match',

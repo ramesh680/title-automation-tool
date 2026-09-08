@@ -718,7 +718,7 @@ class SheetSource(unittest.TestCase):
         self.assertIn('title_type', body['columns'])
         self.assertTrue(body['summary'])
 
-    def test_download_endpoint_builds_the_two_sheets(self):
+    def test_download_endpoint_builds_the_comparison_sheets(self):
         fake = _FakeHTTP({'status': {}, 'results': [{
             'title': 'Tom Hanks', 'title_type': 'Talent', 'context': 'Talent',
             'existing': {'instagram_user': 'tomhanks'},
@@ -727,7 +727,8 @@ class SheetSource(unittest.TestCase):
             '/api/gemini_sheet/download?batch=cmp_1'))
         self.assertEqual(resp.status_code, 200)
         wb = openpyxl.load_workbook(io.BytesIO(resp.data))
-        self.assertEqual(wb.sheetnames, ['Gemini Compare', 'Gemini Summary'])
+        self.assertEqual(wb.sheetnames,
+                         ['Gemini Compare', 'Gemini Summary', 'Gemini Run Notes'])
 
     def test_endpoints_require_a_batch(self):
         c = app.app.test_client()
@@ -742,3 +743,94 @@ class SheetSource(unittest.TestCase):
             r = app.app.test_client().post('/api/gemini_sheet/push',
                                            json={'titles': ['Inception']})
         self.assertEqual(r.status_code, 400)
+
+
+class RunNotes(unittest.TestCase):
+    """A run where every call failed must not look like a run that found
+    nothing. Reproduces the 429 RESOURCE_EXHAUSTED case seen in production,
+    where a free-tier key returned quota errors for every request and the
+    export came back full of 'existing only' with no indication why."""
+
+    QUOTA = ("429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': "
+             "'You exceeded your current quota, please check your plan and "
+             "billing details.'}}")
+
+    def setUp(self):
+        gr.clear_cache()
+        gr.reset_stats()
+
+    def _notes(self, patch):
+        with mock.patch.object(gr, 'available', return_value=True), patch:
+            resp = app.app.test_client().post('/api/generate', json={
+                'titles': ['Mitchell Starc'], 'includeDar': False,
+                'autoFetch': False, 'geminiCompare': True,
+                'titles_type': {'Mitchell Starc': 'talent'}})
+        self.assertEqual(resp.status_code, 200)
+        wb = openpyxl.load_workbook(io.BytesIO(resp.data))
+        self.assertIn('Gemini Run Notes', wb.sheetnames)
+        return wb, {r[0]: r[1] for r in
+                    wb['Gemini Run Notes'].iter_rows(min_row=2, values_only=True)}
+
+    def _quota_client(self):
+        def boom(*a, **k):
+            raise RuntimeError(self.QUOTA)
+        return mock.patch.object(gr, '_get_client', boom)
+
+    def test_total_failure_is_reported_as_failed(self):
+        _wb, d = self._notes(self._quota_client())
+        self.assertEqual(d['status'], 'FAILED')
+        self.assertIn('NOT a "nothing found" result', d['what this means'])
+        self.assertEqual(d['requests failed'], 1)
+        self.assertEqual(d['gemini values returned'], 0)
+
+    def test_the_google_error_text_is_carried_into_the_workbook(self):
+        _wb, d = self._notes(self._quota_client())
+        self.assertIn('RESOURCE_EXHAUSTED', d['last error from Google'])
+
+    def test_a_genuine_empty_result_is_not_called_a_failure(self):
+        patch = mock.patch.object(gr, '_generate',
+                                  lambda p: _FakeResp('{"instagram":""}'))
+        _wb, d = self._notes(patch)
+        self.assertEqual(d['status'], 'EMPTY')
+        self.assertEqual(d['requests failed'], 0)
+        self.assertIn('real "nothing found"', d['what this means'])
+
+    def test_a_good_run_is_reported_ok(self):
+        patch = mock.patch.object(
+            gr, '_generate',
+            lambda p: _FakeResp('{"instagram":"mstarc56","imdb":"nm10052216"}'))
+        _wb, d = self._notes(patch)
+        self.assertEqual(d['status'], 'OK')
+        self.assertEqual(d['gemini values returned'], 2)
+
+    def test_errors_are_counted_even_when_raised_outside_the_sdk_call(self):
+        """The outer per-entity handler used to swallow exceptions without
+        counting them, which is how a failed run reported errors: 0."""
+        with mock.patch.object(gr, 'available', return_value=True), \
+             mock.patch.object(gr, '_resolve_one_api',
+                               mock.Mock(side_effect=RuntimeError('boom'))):
+            gr.resolve_many([('X', 'Talent')])
+        self.assertEqual(gr.stats()['errors'], 1)
+        self.assertIn('boom', gr.stats()['last_error'])
+
+    def test_notes_appear_on_the_sheet_source_download_too(self):
+        fake = _FakeHTTP({'status': {}, 'results': [{
+            'title': 'Tom Hanks', 'title_type': 'Talent', 'context': 'Talent',
+            'existing': {'instagram_user': 'tomhanks'},
+            'instagram_user': 'tomhanks'}]})
+        stack = [mock.patch.object(gr, k, v) for k, v in
+                 (('SOURCE', 'sheet'),
+                  ('SCRIPT_URL', 'https://script.google.com/macros/s/E/exec'),
+                  ('SCRIPT_TOKEN', 't'))]
+        for p in stack:
+            p.start()
+        try:
+            with mock.patch('requests.post', fake):
+                resp = app.app.test_client().get(
+                    '/api/gemini_sheet/download?batch=cmp_1')
+        finally:
+            for p in reversed(stack):
+                p.stop()
+        wb = openpyxl.load_workbook(io.BytesIO(resp.data))
+        self.assertEqual(wb.sheetnames,
+                         ['Gemini Compare', 'Gemini Summary', 'Gemini Run Notes'])

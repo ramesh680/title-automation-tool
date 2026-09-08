@@ -2325,6 +2325,61 @@ def gemini_records_from_pull(pulled):
     return out
 
 
+def gemini_run_notes(records):
+    """Key/value rows explaining how the Gemini run actually went.
+
+    Without this, a run in which EVERY request failed produces a comparison
+    sheet full of 'existing only' and 'both blank' -- visually identical to a
+    run where Gemini genuinely found nothing. That is the worst kind of quiet
+    failure, so the workbook now states outright when the answers are missing
+    because the calls did not succeed.
+    """
+    st = GEMINI.stats() if GEMINI_OK else {}
+    filled = sum(1 for rec in records for f in GEMINI_COMPARE_FIELDS
+                 if str(rec.get(f'{f}_gemini') or '').strip())
+    scored = sum(1 for rec in records for f in GEMINI_COMPARE_FIELDS
+                 if rec.get(f'{f}_match') not in (None, '', 'not in schema'))
+    errors = int(st.get('errors') or 0)
+    requests = int(st.get('requests') or 0)
+
+    if requests and errors >= requests and not filled:
+        verdict = 'FAILED'
+        detail = ('Every Gemini request failed, so all *_gemini columns are '
+                  'empty. This is NOT a "nothing found" result -- no answer '
+                  'was ever received. Do not read the match columns as '
+                  'findings.')
+    elif errors:
+        verdict = 'PARTIAL'
+        detail = ('%d of %d requests failed. Rows for those titles have empty '
+                  '*_gemini columns that mean "not attempted", not '
+                  '"not found".' % (errors, requests))
+    elif not filled and records:
+        verdict = 'EMPTY'
+        detail = ('Requests succeeded but returned no confirmable handles for '
+                  'any title. This is a real "nothing found" result.')
+    else:
+        verdict = 'OK'
+        detail = 'Requests succeeded. The match columns are meaningful.'
+
+    rows = [
+        ('status', verdict),
+        ('what this means', detail),
+        ('source', st.get('source', 'api')),
+        ('model', st.get('model', '')),
+        ('mode', st.get('mode', '')),
+        ('rows compared', len(records)),
+        ('gemini values returned', filled),
+        ('cells scored', scored),
+        ('requests made', requests),
+        ('requests failed', errors),
+        ('served from cache', int(st.get('cached') or 0)),
+        ('capped (over per-run limit)', int(st.get('capped') or 0)),
+    ]
+    if st.get('last_error'):
+        rows.append(('last error from Google', st['last_error']))
+    return [{'item': k, 'value': v} for k, v in rows]
+
+
 def gemini_sheet_workbook(records):
     """Just the two comparison sheets, for the pulled-batch download."""
     out = BytesIO()
@@ -2333,6 +2388,8 @@ def gemini_sheet_workbook(records):
         df.where(pd.notnull(df), '').to_excel(xw, sheet_name='Gemini Compare', index=False)
         pd.DataFrame(_gemini_summary_records(records)).to_excel(
             xw, sheet_name='Gemini Summary', index=False)
+        pd.DataFrame(gemini_run_notes(records)).to_excel(
+            xw, sheet_name='Gemini Run Notes', index=False)
     out.seek(0)
     return out
 
@@ -2409,6 +2466,8 @@ def _rows_to_workbook(rows):
             gdf.to_excel(xw, sheet_name='Gemini Compare', index=False)
             sdf = pd.DataFrame(_gemini_summary_records(gem))
             sdf.to_excel(xw, sheet_name='Gemini Summary', index=False)
+            ndf = pd.DataFrame(gemini_run_notes(gem))
+            ndf.to_excel(xw, sheet_name='Gemini Run Notes', index=False)
     out.seek(0)
     return out
 
@@ -2521,6 +2580,7 @@ def _preview_payload(rows, preview_limited):
         'gemini': ({'columns': _gemini_compare_columns(),
                     'rows': _gemini_compare_records(rows),
                     'summary': _gemini_summary_records(_gemini_compare_records(rows)),
+                    'notes': gemini_run_notes(_gemini_compare_records(rows)),
                     'stats': GEMINI.stats() if GEMINI_OK else {}}
                    if _has_gemini(rows) else None),
     }
