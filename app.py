@@ -71,6 +71,18 @@ except Exception as _e:  # pragma: no cover
     _TFX_SCHEMAS = {}
 
 
+# Gemini-grounded handle resolution, used only for the side-by-side comparison
+# columns. Optional in every sense: no SDK / no GEMINI_API_KEY simply means the
+# comparison is unavailable and generation behaves exactly as before.
+try:
+    import gemini_resolver as GEMINI
+    GEMINI_OK = True
+except Exception as _e:  # pragma: no cover - import guard
+    GEMINI = None
+    GEMINI_OK = False
+    logging.warning(f"gemini resolver unavailable: {_e}")
+
+
 def _tref():
     return TREF if (TREF is not None and getattr(TREF, "LOADED", False)) else None
 
@@ -2060,6 +2072,149 @@ def _is_publisher_row(r):
     return str(r.get('title_category', '')).lower() == 'publishers'
 
 
+# ---------------------------------------------------------------------------
+# Gemini side-by-side comparison
+#
+# The existing resolver (Wikidata / IMDb / RT / Metacritic) stays the single
+# source of truth for the ingest sheets. When the comparison is switched on we
+# additionally ask Gemini the *same question the Ops sheet asked* and write the
+# answers to a separate "Gemini Compare" sheet as paired columns
+# (instagram_user | instagram_user_gemini | instagram_user_match), so agreement
+# is readable without a pivot. No ingest column is touched.
+# ---------------------------------------------------------------------------
+
+GEMINI_COMPARE_FIELDS = [
+    'facebook_page', 'twitter_handle', 'instagram_user',
+    'youtube_channel_username', 'tiktok_user', 'wikipedia_page', 'imdb_id',
+]
+
+_GEMINI_MATCH_LABELS = ('match', 'mismatch', 'existing only', 'gemini only',
+                        'both blank')
+
+
+def _gemini_context(row):
+    """The 'Category/Context:' value the sheet prompt carried (column D)."""
+    cat = str(row.get('title_category') or '').strip()
+    sub = str(_first_line(row.get('title_sub_category') or '')).strip()
+    if cat and sub and sub.lower() not in ('unknown', cat.lower()):
+        return f"{cat} / {sub}"
+    return cat or 'Unknown'
+
+
+def _gemini_cmp_keys(field, value):
+    """Canonical comparable forms of one cell (cells may hold several values,
+    newline- or pipe-separated, e.g. multi-channel youtube_channel_username)."""
+    keys = set()
+    for part in re.split(r'[\n|]+', str(value or '')):
+        part = part.strip()
+        if not part:
+            continue
+        norm = GEMINI.sanitize(field, part) if GEMINI_OK else part
+        if norm:
+            keys.add(norm.casefold())
+    return keys
+
+
+def _gemini_match_label(field, existing, guess):
+    have_e, have_g = bool(str(existing or '').strip()), bool(str(guess or '').strip())
+    if not have_e and not have_g:
+        return 'both blank'
+    if have_e and not have_g:
+        return 'existing only'
+    if have_g and not have_e:
+        return 'gemini only'
+    ek, gk = _gemini_cmp_keys(field, existing), _gemini_cmp_keys(field, guess)
+    return 'match' if (ek & gk) else 'mismatch'
+
+
+def attach_gemini_comparison(rows, progress=None):
+    """Resolve every distinct entity once and stash the answers on each row
+    under '_gemini_<field>' keys. Underscore-prefixed keys are dropped by the
+    ingest sheets' reindex, so this can never leak into an ingest column."""
+    if not (GEMINI_OK and GEMINI.available()) or not rows:
+        return rows
+    wanted = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        title = str(r.get('title') or '').strip()
+        if title:
+            wanted.append((_strip_dar_suffix(title), _gemini_context(r)))
+    resolved = GEMINI.resolve_many(wanted, progress=progress)
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        title = str(r.get('title') or '').strip()
+        if not title:
+            continue
+        got = resolved.get((_strip_dar_suffix(title), _gemini_context(r))) or {}
+        if not got:
+            continue
+        r['_gemini'] = True
+        for f in GEMINI_COMPARE_FIELDS:
+            r[f'_gemini_{f}'] = got.get(f, '')
+    return rows
+
+
+def _has_gemini(rows):
+    return any(isinstance(r, dict) and r.get('_gemini') for r in rows)
+
+
+def _gemini_compare_records(rows):
+    """One record per row: title, context, then existing/gemini/match triples."""
+    out = []
+    for r in rows:
+        if not (isinstance(r, dict) and r.get('_gemini')):
+            continue
+        rec = {
+            'title': r.get('title', ''),
+            'title_category': r.get('title_category', ''),
+            'context_sent_to_gemini': _gemini_context(r),
+        }
+        for f in GEMINI_COMPARE_FIELDS:
+            existing = r.get(f) or ''
+            guess = r.get(f'_gemini_{f}') or ''
+            rec[f] = existing
+            rec[f'{f}_gemini'] = guess
+            rec[f'{f}_match'] = _gemini_match_label(f, existing, guess)
+        out.append(rec)
+    return out
+
+
+def _gemini_compare_columns():
+    cols = ['title', 'title_category', 'context_sent_to_gemini']
+    for f in GEMINI_COMPARE_FIELDS:
+        cols += [f, f'{f}_gemini', f'{f}_match']
+    return cols
+
+
+def _gemini_summary_records(records):
+    """Per-field tallies plus an agreement rate over the rows where both
+    sources produced a value -- the number the comparison exists to answer."""
+    out = []
+    for f in GEMINI_COMPARE_FIELDS:
+        counts = {lbl: 0 for lbl in _GEMINI_MATCH_LABELS}
+        for rec in records:
+            lbl = rec.get(f'{f}_match')
+            if lbl in counts:
+                counts[lbl] += 1
+        both = counts['match'] + counts['mismatch']
+        out.append({
+            'field': f,
+            'rows': len(records),
+            'existing_filled': counts['match'] + counts['mismatch'] + counts['existing only'],
+            'gemini_filled': counts['match'] + counts['mismatch'] + counts['gemini only'],
+            'match': counts['match'],
+            'mismatch': counts['mismatch'],
+            'existing_only': counts['existing only'],
+            'gemini_only': counts['gemini only'],
+            'both_blank': counts['both blank'],
+            'agreement_when_both_filled': (f"{counts['match'] / both * 100:.1f}%"
+                                           if both else ''),
+        })
+    return out
+
+
 def _rows_to_workbook(rows):
     """Write rows to an xlsx BytesIO. Movies use the 42-col schema, TV the
     39-col BrandIngest, Talent the 38-col BrandDef, Video Games the 39-col
@@ -2123,6 +2278,15 @@ def _rows_to_workbook(rows):
                 'why_flagged': r.get('_review_reason', ''),
             } for r in review])
             rdf.to_excel(xw, sheet_name='Needs Review', index=False)
+        # Side-by-side Gemini comparison. Its own sheets, so the ingest sheets
+        # keep their exact column sets.
+        gem = _gemini_compare_records(rows)
+        if gem:
+            gdf = pd.DataFrame(gem).reindex(columns=_gemini_compare_columns())
+            gdf = gdf.where(pd.notnull(gdf), '')
+            gdf.to_excel(xw, sheet_name='Gemini Compare', index=False)
+            sdf = pd.DataFrame(_gemini_summary_records(gem))
+            sdf.to_excel(xw, sheet_name='Gemini Summary', index=False)
     out.seek(0)
     return out
 
@@ -2142,13 +2306,17 @@ def collect_rows(preview=False):
         include_dar = request.form.get('includeDar', 'true').lower() != 'false'
         auto_fetch = request.form.get('autoFetch', 'false').lower() == 'true'
         default_kind = _norm_kind(request.form.get('titleType'))
+        gemini = request.form.get('geminiCompare', 'false').lower() == 'true'
         rows = build_rows_from_upload(request.files['file'], include_dar, auto_fetch,
                                       max_titles=max_titles,
                                       default_kind=default_kind,
                                       default_profession=request.form.get('talentProfession', ''))
     else:
         data = request.get_json(silent=True) or {}
+        gemini = bool(data.get('geminiCompare'))
         rows = build_rows_from_titles(data, max_titles=max_titles)
+    if gemini:
+        rows = attach_gemini_comparison(rows)
     return rows
 
 
@@ -2227,6 +2395,12 @@ def _preview_payload(rows, preview_limited):
                           'reason': r.get('_review_reason', '')}
                          for r in rows
                          if isinstance(r, dict) and r.get('_needs_review')],
+        # side-by-side Gemini comparison, when it was requested
+        'gemini': ({'columns': _gemini_compare_columns(),
+                    'rows': _gemini_compare_records(rows),
+                    'summary': _gemini_summary_records(_gemini_compare_records(rows)),
+                    'stats': GEMINI.stats() if GEMINI_OK else {}}
+                   if _has_gemini(rows) else None),
     }
 
 
@@ -2267,6 +2441,21 @@ def generate_excel():
     except Exception as e:
         logging.error(f"Error generating Excel: {str(e)}")
         return jsonify({'error': f"Error: {str(e)}"}), 500
+
+
+@app.route('/api/gemini_status')
+def gemini_status():
+    """Whether the Gemini comparison can run, so the UI can disable the
+    toggle with a reason instead of failing silently mid-run."""
+    if not GEMINI_OK:
+        return jsonify({'available': False, 'sdk_installed': False,
+                        'api_key_set': False,
+                        'reason': 'gemini_resolver module not importable'})
+    st = GEMINI.status()
+    if not st['available']:
+        st['reason'] = ('google-genai not installed' if not st['sdk_installed']
+                        else 'GEMINI_API_KEY not set on the server')
+    return jsonify(st)
 
 
 @app.route('/validator')
@@ -3572,6 +3761,11 @@ def _run_generation(jid, kind, payload):
         if not rows:
             _job_set(jid, status='error', error='No titles provided')
             return
+        if payload.get('gemini'):
+            # second pass: same titles, asked the way the Ops sheet asked
+            _job_set(jid, stage='gemini', done=0, total=len(rows))
+            rows = attach_gemini_comparison(rows, progress=prog)
+            _job_set(jid, gemini_stats=GEMINI.stats() if GEMINI_OK else None)
         if payload.get('preview'):
             _job_set(jid, status='done',
                      preview=_preview_payload(rows, payload.get('preview_limited', False)),
@@ -3605,10 +3799,12 @@ def generate_async():
             'auto_fetch': request.form.get('autoFetch', 'false').lower() == 'true',
             'title_type': _norm_kind(request.form.get('titleType')),
             'talent_profession': request.form.get('talentProfession', ''),
+            'gemini': request.form.get('geminiCompare', 'false').lower() == 'true',
         }
         kind = 'file'
     else:
-        payload = {'data': request.get_json(silent=True) or {}}
+        _d = request.get_json(silent=True) or {}
+        payload = {'data': _d, 'gemini': bool(_d.get('geminiCompare'))}
         kind = 'titles'
     with _JOBS_LOCK:
         _JOBS[jid] = {'status': 'running', 'done': 0, 'total': 0, 'error': None,
@@ -3635,13 +3831,15 @@ def preview_async():
             'title_type': _norm_kind(request.form.get('titleType')),
             'talent_profession': request.form.get('talentProfession', ''),
             'preview': True, 'preview_limited': True,
+            'gemini': request.form.get('geminiCompare', 'false').lower() == 'true',
         }
         kind = 'file'
     else:
         data = request.get_json(silent=True) or {}
         n_src = len([t for t in data.get('titles', []) if t and t.strip()])
         payload = {'data': data, 'preview': True,
-                   'preview_limited': n_src > PREVIEW_MAX_TITLES}
+                   'preview_limited': n_src > PREVIEW_MAX_TITLES,
+                   'gemini': bool(data.get('geminiCompare'))}
         kind = 'titles'
     with _JOBS_LOCK:
         _JOBS[jid] = {'status': 'running', 'done': 0, 'total': 0, 'error': None,
