@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request, jsonify, send_file
 import pandas as pd
-from io import BytesIO
+import csv
+from io import BytesIO, StringIO
 from datetime import datetime
 import re
 import time
@@ -2640,6 +2641,161 @@ def gemini_status():
     return jsonify(st)
 
 
+# ---------------------------------------------------------------------------
+# Gemini comparison, the file round-trip (no API key, no quota, no deploy)
+# ---------------------------------------------------------------------------
+# Verified against a live Workspace: a CSV whose *_gemini cells hold
+# =GEMINI(...) text, uploaded to Drive and opened as a Sheet, arrives as live
+# AI cells. Selecting them and clicking "Generate and fill" computes them --
+# no Apps Script involved. That is the whole mechanism this pair of endpoints
+# wraps: export the questions, let a person press the one button no script can
+# press, then read the answers back and score them.
+
+GEMINI_SHEET_HEADERS = (['title', 'title_type', 'title_category',
+                         'title_sub_category', 'context_sent_to_gemini']
+                        + [c for f in GEMINI_COMPARE_FIELDS
+                           for c in (f, f + '_gemini')])
+
+
+def gemini_sheet_export_rows(rows):
+    """Rows for the export: existing values, plus a formula per empty answer.
+
+    A field outside the row's own schema gets no formula -- asking Gemini for
+    a talent's video-game publisher wastes an AI cell and pollutes the score
+    with a value that cannot be compared to anything.
+    """
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        schema = _gemini_row_schema_columns(r)
+        ctx = _gemini_context(r)
+        rec = {
+            'title': r.get('title', ''),
+            'title_type': _gemini_row_type(r),
+            'title_category': r.get('title_category', ''),
+            'title_sub_category': str(r.get('title_sub_category', '') or '').split('\n')[0],
+            'context_sent_to_gemini': ctx,
+        }
+        for f in GEMINI_COMPARE_FIELDS:
+            rec[f] = r.get(f) or ''
+            rec[f + '_gemini'] = (GEMINI.sheet_formula(f, rec['title'], ctx)
+                                  if (GEMINI_OK and f in schema) else '')
+        out.append(rec)
+    return out
+
+
+def gemini_sheet_export_csv(rows):
+    """The export as CSV bytes.
+
+    CSV rather than xlsx on purpose: it is the format the formula round-trip
+    was actually verified with, and it carries no cell types or cached values
+    that could disagree with the formula text.
+    """
+    recs = gemini_sheet_export_rows(rows)
+    buf = StringIO()
+    w = csv.DictWriter(buf, fieldnames=GEMINI_SHEET_HEADERS,
+                       extrasaction='ignore', lineterminator='\n')
+    w.writeheader()
+    for rec in recs:
+        w.writerow(rec)
+    return buf.getvalue().encode('utf-8-sig'), len(recs)
+
+
+def _gemini_read_uploaded(fs):
+    """Read a completed comparison sheet (csv or xlsx) into dict rows."""
+    name = (getattr(fs, 'filename', '') or '').lower()
+    if name.endswith(('.xlsx', '.xlsm')):
+        df = pd.read_excel(fs, dtype=str)
+    else:
+        raw = fs.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8-sig', errors='replace')
+        df = pd.read_csv(StringIO(raw), dtype=str)
+    df = df.where(pd.notnull(df), '')
+    df.columns = [str(c).strip() for c in df.columns]
+    return df.to_dict('records')
+
+
+def gemini_score_uploaded(raw_rows):
+    """Score a completed sheet: existing vs *_gemini, per field.
+
+    Anything still holding a formula counts as NOT generated rather than as
+    'Gemini found nothing' -- those are opposite conclusions, and conflating
+    them is exactly the quiet failure the run notes exist to prevent.
+    """
+    cols_by_type = _type_columns()
+    records, pending = [], 0
+    for row in raw_rows:
+        ttype = str(row.get('title_type') or '').strip() or 'Movies'
+        schema = cols_by_type.get(ttype, COLUMNS)
+        rec = {
+            'title': str(row.get('title', '') or '').strip(),
+            'title_type': ttype,
+            'title_category': str(row.get('title_category', '') or '').strip(),
+            'context_sent_to_gemini': str(row.get('context_sent_to_gemini', '') or '').strip(),
+        }
+        for f in GEMINI_COMPARE_FIELDS:
+            have = str(row.get(f, '') or '').strip()
+            guess = str(row.get(f + '_gemini', '') or '').strip()
+            if guess.startswith('=GEMINI(') or guess.startswith('#'):
+                pending += 1
+                guess = ''
+                label = 'not generated'
+            elif f not in schema:
+                label = 'not in schema'
+            else:
+                label = _gemini_match_label(f, have, guess)
+            rec[f] = have
+            rec[f + '_gemini'] = guess
+            rec[f + '_match'] = label
+        records.append(rec)
+    return records, pending
+
+
+def gemini_upload_notes(records, pending):
+    """What this scored file actually tells you, stated plainly."""
+    filled = sum(1 for r in records for f in GEMINI_COMPARE_FIELDS
+                 if str(r.get(f + '_gemini') or '').strip())
+    if pending and not filled:
+        verdict, detail = 'NOT GENERATED', (
+            'Every Gemini cell still held a formula, so nothing was answered. '
+            'Select the *_gemini columns in Sheets and click "Generate and '
+            'fill", wait for them to fill, then export and upload again.')
+    elif pending:
+        verdict, detail = 'PARTIAL', (
+            '%d cell(s) still held a formula and were scored "not generated". '
+            'Those are not "nothing found" -- they were never answered.' % pending)
+    elif not filled and records:
+        verdict, detail = 'EMPTY', (
+            'Every cell was generated and every answer came back empty. This '
+            'is a real "nothing found" result.')
+    else:
+        verdict, detail = 'OK', 'Generated and scored. The match columns are meaningful.'
+    return [
+        {'item': 'status', 'value': verdict},
+        {'item': 'what this means', 'value': detail},
+        {'item': 'source', 'value': 'google sheets =GEMINI() (no API key)'},
+        {'item': 'rows scored', 'value': len(records)},
+        {'item': 'gemini values returned', 'value': filled},
+        {'item': 'cells not generated', 'value': pending},
+    ]
+
+
+def gemini_scored_workbook(records, pending):
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine='openpyxl') as xw:
+        df = pd.DataFrame(records).reindex(columns=_gemini_compare_columns())
+        df.where(pd.notnull(df), '').to_excel(
+            xw, sheet_name='Gemini Compare', index=False)
+        pd.DataFrame(_gemini_summary_records(records)).to_excel(
+            xw, sheet_name='Gemini Summary', index=False)
+        pd.DataFrame(gemini_upload_notes(records, pending)).to_excel(
+            xw, sheet_name='Gemini Run Notes', index=False)
+    out.seek(0)
+    return out
+
+
 @app.route('/api/gemini_probe')
 def gemini_probe():
     """Ask Google what this key is actually allowed to do. Two tiny requests."""
@@ -2650,6 +2806,60 @@ def gemini_probe():
     except Exception as e:  # noqa: BLE001
         logging.error('gemini probe failed: %s', e)
         return jsonify({'ok': False, 'reason': str(e)[:400]}), 200
+
+
+@app.route('/api/gemini_sheet/export', methods=['POST'])
+def gemini_sheet_export():
+    """Step 1 of the round-trip: the questions, as a CSV of =GEMINI formulas.
+
+    Needs no API key and makes no Gemini call, so it works on a deployment
+    where the metered path is refused -- which is the entire reason it exists.
+    """
+    try:
+        rows = collect_rows()
+        if not rows:
+            return jsonify({'error': 'No titles provided'}), 400
+        data, n = gemini_sheet_export_csv(rows)
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        resp = send_file(BytesIO(data), mimetype='text/csv', as_attachment=True,
+                         download_name='Gemini_Compare_%s.csv' % stamp)
+        resp.headers['X-Gemini-Rows'] = str(n)
+        return resp
+    except Exception as e:  # noqa: BLE001
+        logging.error('gemini sheet export failed: %s', e)
+        return jsonify({'error': 'Error: %s' % e}), 500
+
+
+@app.route('/api/gemini_sheet/score', methods=['POST'])
+def gemini_sheet_score():
+    """Step 2: score a sheet that has been through "Generate and fill"."""
+    fs = request.files.get('file')
+    if not fs:
+        return jsonify({'error': 'Upload the completed comparison sheet '
+                                 '(csv or xlsx) as "file".'}), 400
+    try:
+        raw = _gemini_read_uploaded(fs)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({'error': 'Could not read that file: %s' % e}), 400
+    if not raw:
+        return jsonify({'error': 'That file has no data rows.'}), 400
+    missing = [f + '_gemini' for f in GEMINI_COMPARE_FIELDS
+               if f + '_gemini' not in raw[0]]
+    if len(missing) == len(GEMINI_COMPARE_FIELDS):
+        return jsonify({'error': 'No *_gemini columns in that file. Upload the '
+                                 'sheet produced by "Download comparison '
+                                 'sheet", after generating it.'}), 400
+    records, pending = gemini_score_uploaded(raw)
+    if request.form.get('format') == 'json':
+        return jsonify({'rows': records, 'pending': pending,
+                        'summary': _gemini_summary_records(records),
+                        'notes': gemini_upload_notes(records, pending)})
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return send_file(gemini_scored_workbook(records, pending),
+                     mimetype='application/vnd.openxmlformats-officedocument'
+                              '.spreadsheetml.sheet',
+                     as_attachment=True,
+                     download_name='Gemini_Scored_%s.xlsx' % stamp)
 
 
 @app.route('/api/gemini_sheet/push', methods=['POST'])

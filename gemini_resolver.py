@@ -652,6 +652,28 @@ def sheet_pull(batch):
 # backend: Gemini Developer API
 # --------------------------------------------------------------------------
 
+def sheet_formula(field, name, context=''):
+    """The =GEMINI(...) formula text for one field, ready to put in a cell.
+
+    Pure string building: no key, no network, no quota. That is the point --
+    the sheet route has to work on a deployment where the API path cannot,
+    so this must never depend on the SDK or on ``available()``.
+
+    Uses the same per-platform prompt the API path uses, so a handle found in
+    the sheet and one found through the API are answering the same question.
+    Inner quotes are doubled, which is how a Sheets formula escapes them.
+    """
+    if field not in _LABEL:
+        return ''
+    clean = _clean_name(name)
+    if not clean:
+        return ''
+    prompt = _PER_PLATFORM_PROMPT.format(
+        platform=_LABEL[field], name=clean,
+        context=str(context or '').strip() or 'Unknown')
+    return '=GEMINI("%s")' % prompt.replace('"', '""')
+
+
 def _resolve_one_api(clean, ctx):
     out = {f: '' for f in FIELDS}
     if MODE == 'per_platform':

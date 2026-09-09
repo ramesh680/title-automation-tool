@@ -4,6 +4,7 @@ workbook shape. No network -- the resolver's single call site is stubbed.
 The sanitiser cases are taken from the real NYFW SS27 sheet run, including the
 prose answer the model gave for Wiederhoeft's IMDb column.
 """
+import csv
 import io
 import unittest
 from types import SimpleNamespace
@@ -930,3 +931,169 @@ class ProbeAndReporting(unittest.TestCase):
     def test_non_quota_error_gets_no_quota_prefix(self):
         gr._note_error(RuntimeError('404 NOT_FOUND: unknown model'))
         self.assertEqual(gr.stats()['last_error'], '404 NOT_FOUND: unknown model')
+
+
+class SheetFileRoundTrip(unittest.TestCase):
+    """The no-key route: export questions as formulas, score answers back.
+
+    This path must work on a deployment where the metered API is refused, so
+    every test here runs with the resolver deliberately unavailable.
+    """
+
+    def setUp(self):
+        self._key, self._sdk = gr.API_KEY, gr.SDK_OK
+        gr.API_KEY, gr.SDK_OK = '', False          # no key: the whole point
+        self.client = app.app.test_client()
+
+    def tearDown(self):
+        gr.API_KEY, gr.SDK_OK = self._key, self._sdk
+
+    # -- export -------------------------------------------------------------
+
+    def test_export_works_with_no_api_key(self):
+        self.assertFalse(gr.available(), 'precondition: resolver unavailable')
+        r = self.client.post('/api/gemini_sheet/export', json={
+            'titles': ['Tom Hanks'], 'titles_type': {'Tom Hanks': 'talent'},
+            'includeDar': False})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('text/csv', r.headers['Content-Type'])
+        body = r.data.decode('utf-8-sig')
+        self.assertIn('instagram_user_gemini', body)
+        # the raw body is CSV-quoted, so the formula's own quotes are doubled
+        self.assertIn('=GEMINI(""Using Google Search', body)
+        parsed = list(csv.DictReader(io.StringIO(body)))
+        self.assertTrue(parsed[0]['instagram_user_gemini'].startswith('=GEMINI("'))
+
+    def test_export_asks_only_for_fields_in_the_row_schema(self):
+        rows = [{'title': 'X', 'title_category': 'Talent', '_tfx_schema': 'talent'}]
+        recs = app.gemini_sheet_export_rows(rows)
+        schema = app._gemini_row_schema_columns(rows[0])
+        for f in app.GEMINI_COMPARE_FIELDS:
+            has_formula = recs[0][f + '_gemini'].startswith('=GEMINI(')
+            self.assertEqual(has_formula, f in schema,
+                             '%s: formula=%s in-schema=%s' % (f, has_formula, f in schema))
+
+    def test_export_csv_is_parseable_and_keeps_formulas_intact(self):
+        rows = [{'title': 'Dwayne "The Rock" Johnson', 'title_category': 'Talent',
+                 '_tfx_schema': 'talent'}]
+        data, n = app.gemini_sheet_export_csv(rows)
+        self.assertEqual(n, 1)
+        back = list(csv.DictReader(io.StringIO(data.decode('utf-8-sig'))))
+        self.assertEqual(len(back), 1)
+        f = back[0]['instagram_user_gemini']
+        self.assertTrue(f.startswith('=GEMINI("'), f[:40])
+        self.assertTrue(f.endswith('")'), f[-20:])
+        self.assertIn('""The Rock""', f, 'inner quotes must stay doubled')
+
+    # -- score --------------------------------------------------------------
+
+    @staticmethod
+    def _csv(rows, headers):
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=headers, lineterminator='\n')
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+        return (io.BytesIO(buf.getvalue().encode()), 'done.csv')
+
+    HDR = ['title', 'title_type', 'title_category', 'context_sent_to_gemini',
+           'instagram_user', 'instagram_user_gemini']
+
+    def _score(self, rows, fmt='json'):
+        r = self.client.post('/api/gemini_sheet/score', data={
+            'file': self._csv(rows, self.HDR), 'format': fmt},
+            content_type='multipart/form-data')
+        return r
+
+    def test_scores_a_generated_sheet(self):
+        r = self._score([
+            {'title': 'A', 'title_type': 'Talent', 'instagram_user': 'a',
+             'instagram_user_gemini': 'a'},
+            {'title': 'B', 'title_type': 'Talent', 'instagram_user': 'b',
+             'instagram_user_gemini': 'other'},
+            {'title': 'C', 'title_type': 'Talent', 'instagram_user': '',
+             'instagram_user_gemini': 'c'},
+        ])
+        self.assertEqual(r.status_code, 200)
+        got = [x['instagram_user_match'] for x in r.get_json()['rows']]
+        self.assertEqual(got, ['match', 'mismatch', 'gemini only'])
+        self.assertEqual(r.get_json()['notes'][0]['value'], 'OK')
+
+    def test_ungenerated_formula_is_not_scored_as_nothing_found(self):
+        r = self._score([
+            {'title': 'A', 'title_type': 'Talent', 'instagram_user': 'a',
+             'instagram_user_gemini': '=GEMINI("Using Google Search, ...")'},
+        ])
+        j = r.get_json()
+        self.assertEqual(j['rows'][0]['instagram_user_match'], 'not generated')
+        self.assertEqual(j['rows'][0]['instagram_user_gemini'], '')
+        self.assertEqual(j['pending'], 1)
+        self.assertEqual(j['notes'][0]['value'], 'NOT GENERATED')
+        self.assertIn('Generate and fill', j['notes'][1]['value'])
+
+    def test_error_cell_is_also_treated_as_not_generated(self):
+        r = self._score([{'title': 'A', 'title_type': 'Talent',
+                          'instagram_user': 'a', 'instagram_user_gemini': '#ERROR!'}])
+        self.assertEqual(r.get_json()['rows'][0]['instagram_user_match'],
+                         'not generated')
+
+    def test_partial_generation_is_called_partial(self):
+        r = self._score([
+            {'title': 'A', 'title_type': 'Talent', 'instagram_user': 'a',
+             'instagram_user_gemini': 'a'},
+            {'title': 'B', 'title_type': 'Talent', 'instagram_user': 'b',
+             'instagram_user_gemini': '=GEMINI("x")'},
+        ])
+        j = r.get_json()
+        self.assertEqual(j['notes'][0]['value'], 'PARTIAL')
+        self.assertEqual(j['pending'], 1)
+
+    def test_all_generated_all_empty_is_a_real_nothing_found(self):
+        r = self._score([{'title': 'A', 'title_type': 'Talent',
+                          'instagram_user': 'a', 'instagram_user_gemini': ''}])
+        j = r.get_json()
+        self.assertEqual(j['notes'][0]['value'], 'EMPTY')
+        self.assertEqual(j['rows'][0]['instagram_user_match'], 'existing only')
+
+    def test_rejects_a_file_with_no_gemini_columns(self):
+        r = self.client.post('/api/gemini_sheet/score', data={
+            'file': self._csv([{'title': 'A'}], ['title'])},
+            content_type='multipart/form-data')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('_gemini', r.get_json()['error'])
+
+    def test_rejects_a_missing_file(self):
+        r = self.client.post('/api/gemini_sheet/score', data={},
+                             content_type='multipart/form-data')
+        self.assertEqual(r.status_code, 400)
+
+    def test_scored_download_is_a_three_sheet_workbook(self):
+        r = self._score([{'title': 'A', 'title_type': 'Talent',
+                          'instagram_user': 'a', 'instagram_user_gemini': 'a'}],
+                        fmt='xlsx')
+        self.assertEqual(r.status_code, 200)
+        wb = openpyxl.load_workbook(io.BytesIO(r.data))
+        self.assertEqual(wb.sheetnames,
+                         ['Gemini Compare', 'Gemini Summary', 'Gemini Run Notes'])
+
+    # -- the whole loop -----------------------------------------------------
+
+    def test_export_then_generate_then_score(self):
+        """Export, simulate a person pressing Generate and fill, score it."""
+        rows = [{'title': 'Tom Hanks - DAR', 'title_category': 'Talent',
+                 '_tfx_schema': 'talent', 'instagram_user': ''}]
+        data, _ = app.gemini_sheet_export_csv(rows)
+        parsed = list(csv.DictReader(io.StringIO(data.decode('utf-8-sig'))))
+        self.assertTrue(parsed[0]['instagram_user_gemini'].startswith('=GEMINI('))
+
+        # what Sheets does when the button is pressed: EVERY formula in the
+        # selection resolves, most of them to nothing for this entity
+        for f in app.GEMINI_COMPARE_FIELDS:
+            if parsed[0][f + '_gemini'].startswith('=GEMINI('):
+                parsed[0][f + '_gemini'] = 'tomhanks' if f == 'instagram_user' else ''
+
+        records, pending = app.gemini_score_uploaded(parsed)
+        self.assertEqual(pending, 0)
+        self.assertEqual(records[0]['instagram_user_match'], 'gemini only')
+        self.assertEqual(records[0]['title'], 'Tom Hanks - DAR',
+                         'the DAR suffix belongs in the sheet, only the prompt drops it')

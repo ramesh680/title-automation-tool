@@ -232,18 +232,33 @@
                     </label>
                 </div>
 
-                <div class="form-group" id="geminiSheetPanel" style="display:none">
+                <div class="form-group" id="geminiSheetPanel">
                     <div style="border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:14px">
-                        <div style="font-weight:600;margin-bottom:4px">Comparison sheet</div>
+                        <div style="font-weight:600;margin-bottom:4px">
+                            Gemini comparison via Google Sheets
+                            <span style="font-weight:400;opacity:.75;font-size:12px">— no API key, no quota</span>
+                        </div>
                         <div class="hint" style="margin-bottom:10px">
-                            <code>=GEMINI()</code> only calculates while the workbook is
-                            open in a browser, so this runs in three steps.
+                            Google Sheets treats <code>=GEMINI()</code> as an <b>AI cell</b>: it sits
+                            unevaluated until a person selects the cells and clicks
+                            <b>Generate and fill</b>. No server can press that button, so this route
+                            hands you the questions and takes back the answers. The answers come from
+                            your Workspace subscription, so nothing here is metered.
                         </div>
                         <div class="button-group" style="flex-wrap:wrap;gap:8px">
-                            <button class="btn-secondary" onclick="gsPush()">1 · Send titles</button>
-                            <button class="btn-secondary" onclick="gsActivate()">2 · Activate formulas</button>
-                            <button class="btn-secondary" onclick="gsStatus()">3 · Check progress</button>
-                            <button class="btn-download" onclick="gsDownload()">4 · Download comparison</button>
+                            <button class="btn-secondary" onclick="gsExport()">1 · Download comparison sheet</button>
+                        </div>
+                        <ol style="margin:10px 0 10px 18px;padding:0;font-size:13px;line-height:1.65;opacity:.85">
+                            <li>Upload that CSV to Google Drive and open it with Google Sheets.</li>
+                            <li>Select the <code>*_gemini</code> columns — click the first cell, shift-click the last.</li>
+                            <li>Click <b>Generate and fill</b> on the chip under the selection, and wait.</li>
+                            <li>File → Download → CSV (or .xlsx), then bring it back here.</li>
+                        </ol>
+                        <div class="button-group" style="flex-wrap:wrap;gap:8px;align-items:center">
+                            <input type="file" id="gsScoreFile" accept=".csv,.xlsx,.xlsm"
+                                   style="font-size:13px">
+                            <button class="btn-secondary" onclick="gsScore()">2 · Score completed sheet</button>
+                            <button class="btn-download" onclick="gsScore(true)">Download scored workbook</button>
                         </div>
                         <div id="gsMessage" class="message"></div>
                         <div id="gsSummary"></div>
@@ -507,6 +522,76 @@
             el.style.display = 'block';
         }
 
+        // --- the no-key route: export the questions, score the answers ------
+
+        function gsSaveBlob(blob, name) {
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = name;
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+        }
+
+        async function gsExport() {
+            const init = buildRequestInit();
+            if (!init) return;
+            showMessage('gsMessage', 'Building the comparison sheet\u2026', 'info');
+            try {
+                const r = await fetch('/api/gemini_sheet/export', init);
+                if (!r.ok) {
+                    let msg = 'Export failed (' + r.status + ')';
+                    try { msg = (await r.json()).error || msg; } catch (e) {}
+                    showMessage('gsMessage', msg, 'error');
+                    return;
+                }
+                const rows = r.headers.get('X-Gemini-Rows') || '?';
+                gsSaveBlob(await r.blob(), 'Gemini_Compare.csv');
+                showMessage('gsMessage',
+                    'Downloaded ' + rows + ' row(s). Open it in Google Sheets, select the '
+                    + '*_gemini columns and click "Generate and fill" \u2014 the cells will show '
+                    + 'the formula until you do. Then bring the file back for step 2.', 'success');
+            } catch (e) {
+                showMessage('gsMessage', 'Export failed: ' + e.message, 'error');
+            }
+        }
+
+        async function gsScore(download) {
+            const input = document.getElementById('gsScoreFile');
+            const file = input && input.files && input.files[0];
+            if (!file) {
+                showMessage('gsMessage', 'Choose the completed sheet you downloaded from Google Sheets.', 'error');
+                return;
+            }
+            const fd = new FormData();
+            fd.append('file', file);
+            if (!download) fd.append('format', 'json');
+            showMessage('gsMessage', 'Scoring\u2026', 'info');
+            try {
+                const r = await fetch('/api/gemini_sheet/score', { method: 'POST', body: fd });
+                if (!r.ok) {
+                    let msg = 'Scoring failed (' + r.status + ')';
+                    try { msg = (await r.json()).error || msg; } catch (e) {}
+                    showMessage('gsMessage', msg, 'error');
+                    return;
+                }
+                if (download) {
+                    gsSaveBlob(await r.blob(), 'Gemini_Scored.xlsx');
+                    showMessage('gsMessage', 'Scored workbook downloaded.', 'success');
+                    return;
+                }
+                const j = await r.json();
+                document.getElementById('gsSummary').innerHTML =
+                    renderGeminiCompare({ rows: j.rows, summary: j.summary, notes: j.notes });
+                const status = (j.notes.find(function (n) { return n.item === 'status'; }) || {}).value;
+                showMessage('gsMessage',
+                    'Scored ' + j.rows.length + ' row(s) \u2014 status ' + status
+                    + (j.pending ? '. ' + j.pending + ' cell(s) were never generated.' : '.'),
+                    j.pending ? 'error' : 'success');
+            } catch (e) {
+                showMessage('gsMessage', 'Scoring failed: ' + e.message, 'error');
+            }
+        }
+
         function gsPush() {
             const init = buildRequestInit();
             if (!init) return;
@@ -663,16 +748,6 @@
             if (!box) return;
             fetch('/api/gemini_status').then(r => r.json()).then(s => {
                 if (s && s.available) {
-                    if (s.interactive) {
-                        const panel = document.getElementById('geminiSheetPanel');
-                        if (panel) panel.style.display = 'block';
-                        const hint = document.getElementById('geminiHint');
-                        if (hint) hint.innerHTML = 'Answers come from <b>=GEMINI() in Google '
-                            + 'Sheets</b> &mdash; covered by the Workspace subscription, no API '
-                            + 'quota. Use the <b>Comparison sheet</b> steps below; this toggle '
-                            + 'is not needed for that flow.';
-                        return;
-                    }
                     const hint = document.getElementById('geminiHint');
                     if (hint) {
                         hint.innerHTML += s.source === 'appsscript'
@@ -686,7 +761,11 @@
                 box.checked = false;
                 box.disabled = true;
                 const hint = document.getElementById('geminiHint');
-                if (hint) hint.innerHTML = 'Unavailable: ' + escapeHtml((s && s.reason) || 'not configured')
+                if (hint) hint.innerHTML = 'This toggle needs a billed Gemini API key '
+                    + '(grounded search is not available on the free tier). You do not need it: '
+                    + 'use <b>Gemini comparison via Google Sheets</b> below, which is covered by '
+                    + 'your Workspace subscription. Reason given: '
+                    + escapeHtml((s && s.reason) || 'not configured')
                                          + '. Set <code>GEMINI_API_KEY</code> on the server to enable.';
             }).catch(() => {});
         });
