@@ -1097,3 +1097,76 @@ class SheetFileRoundTrip(unittest.TestCase):
         self.assertEqual(records[0]['instagram_user_match'], 'gemini only')
         self.assertEqual(records[0]['title'], 'Tom Hanks - DAR',
                          'the DAR suffix belongs in the sheet, only the prompt drops it')
+
+
+class PerRunBudget(unittest.TestCase):
+    """GEMINI_MAX_REQUESTS has to mean "this run", because that is what it is
+    called and what the run notes claim. Before this, the counter accumulated
+    for the life of the process: past the limit every further title came back
+    blank and was reported as capped rather than as an error, which on a
+    metered key is a silent data-quality failure rather than a billing one."""
+
+    def setUp(self):
+        self._key, self._sdk, self._cap = gr.API_KEY, gr.SDK_OK, gr.MAX_REQUESTS
+        gr.API_KEY, gr.SDK_OK = 'k', True
+        gr.reset_stats()
+        gr.clear_cache()
+
+    def tearDown(self):
+        gr.API_KEY, gr.SDK_OK, gr.MAX_REQUESTS = self._key, self._sdk, self._cap
+        gr.reset_stats()
+        gr.clear_cache()
+
+    @staticmethod
+    def _rows(names):
+        return [{'title': n, 'title_category': 'Talent', '_tfx_schema': 'talent'}
+                for n in names]
+
+    def test_a_second_run_gets_its_own_budget(self):
+        gr.MAX_REQUESTS = 2
+        with mock.patch.object(gr, '_generate',
+                               return_value=SimpleNamespace(text='{}', candidates=[])):
+            app.attach_gemini_comparison(self._rows(['A', 'B']))
+            first = gr.stats()
+            app.attach_gemini_comparison(self._rows(['C', 'D']))
+            second = gr.stats()
+        self.assertEqual(first['requests'], 2)
+        self.assertEqual(first['capped'], 0, 'the first run must fit in its budget')
+        self.assertEqual(second['requests'], 2, 'counters must restart per run')
+        self.assertEqual(second['capped'], 0,
+                         'a fresh run must not inherit the previous run\'s spend')
+
+    def test_the_cap_still_bites_within_one_run(self):
+        gr.MAX_REQUESTS = 2
+        with mock.patch.object(gr, '_generate',
+                               return_value=SimpleNamespace(text='{}', candidates=[])):
+            app.attach_gemini_comparison(self._rows(['A', 'B', 'C', 'D']))
+        st = gr.stats()
+        self.assertEqual(st['requests'], 2)
+        self.assertEqual(st['capped'], 2, 'titles over the cap must be counted')
+
+    def test_run_notes_report_this_run_not_the_process(self):
+        gr.MAX_REQUESTS = 0  # unlimited
+        with mock.patch.object(gr, '_generate',
+                               return_value=SimpleNamespace(text='{}', candidates=[])):
+            app.attach_gemini_comparison(self._rows(['A', 'B', 'C']))
+            app.attach_gemini_comparison(self._rows(['D']))
+        notes = {n['item']: n['value'] for n in app.gemini_run_notes([])}
+        self.assertEqual(notes['requests made'], 1,
+                         'the notes must describe the run they are printed beside')
+
+    def test_cost_is_named_as_list_price_for_this_run(self):
+        st = gr.stats()
+        self.assertIn('run_search_cost_usd_at_list_price', st)
+        self.assertEqual(st['est_search_cost_usd'],
+                         st['run_search_cost_usd_at_list_price'])
+
+    def test_the_entity_cache_survives_a_reset(self):
+        """Resetting counters must not throw away paid-for answers."""
+        with mock.patch.object(gr, '_generate',
+                               return_value=SimpleNamespace(text='{}', candidates=[])):
+            app.attach_gemini_comparison(self._rows(['Repeated Title']))
+            app.attach_gemini_comparison(self._rows(['Repeated Title']))
+            st = gr.stats()
+        self.assertEqual(st['requests'], 0, 'the second run must not re-ask')
+        self.assertEqual(st['cached'], 1, 'it must come from the cache instead')

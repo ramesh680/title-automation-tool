@@ -345,9 +345,12 @@ def stats():
     s['source'] = SOURCE
     s['model'] = MODEL
     s['mode'] = MODE
-    # 5,000 grounded search requests/month are free across Gemini 3.x, then
-    # $14 per 1,000 -- so the request count *is* the cost.
-    s['est_search_cost_usd'] = round(s['grounded'] * 0.014, 4)
+    # $14 per 1,000 grounded search requests. A paid project also gets 5,000
+    # of them free per month, and nothing here tracks a monthly total, so this
+    # is the list-price cost of THIS run and overstates the bill until that
+    # monthly allowance is used up. Named accordingly.
+    s['run_search_cost_usd_at_list_price'] = round(s['grounded'] * 0.014, 4)
+    s['est_search_cost_usd'] = s['run_search_cost_usd_at_list_price']
     return s
 
 

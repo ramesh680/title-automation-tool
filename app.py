@@ -2163,6 +2163,15 @@ def attach_gemini_comparison(rows, progress=None):
     ingest sheets' reindex, so this can never leak into an ingest column."""
     if not (GEMINI_OK and GEMINI.available()) or not rows:
         return rows
+    # Start the counters at zero for this run. Without this they accumulate
+    # for the life of the process, which makes GEMINI_MAX_REQUESTS a cap on
+    # everything since the last restart rather than on this run: past the
+    # limit, every further title is silently "capped" and comes back blank.
+    # It also made every figure in the run notes -- requests, errors, cost --
+    # describe the process instead of the run it is printed next to.
+    # Deliberately does NOT clear the entity cache: that carries between runs
+    # on purpose, and on a metered key it is the thing saving money.
+    GEMINI.reset_stats()
     wanted = []
     for r in rows:
         if not isinstance(r, dict):
@@ -2374,7 +2383,7 @@ def gemini_run_notes(records):
         ('requests made', requests),
         ('requests failed', errors),
         ('served from cache', int(st.get('cached') or 0)),
-        ('capped (over per-run limit)', int(st.get('capped') or 0)),
+        ('capped (hit GEMINI_MAX_REQUESTS for this run)', int(st.get('capped') or 0)),
     ]
     if st.get('last_error'):
         rows.append(('last error from Google', st['last_error']))
