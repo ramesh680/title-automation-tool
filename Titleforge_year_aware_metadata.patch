@@ -1,0 +1,1299 @@
+From 903a24bcca8be6d36af047d86d965b8539ae5e6b Mon Sep 17 00:00:00 2001
+From: Claude Opus 5 <noreply@anthropic.com>
+Date: Mon, 14 Sep 2026 03:13:55 +0000
+Subject: [PATCH] Make the release-date column steer Wikipedia, socials and the
+ game path
+
+The year in the release-date column already decided which IMDb, Metacritic
+and Rotten Tomatoes page a title got. It did not touch Wikipedia or the
+Wikidata item -- and the Wikidata item is where the row's social handles
+come from -- so a remake could ship the original's article and the
+original's Instagram/X/Facebook. Video games ignored the date entirely.
+
+Movies & TV:
+* wiki_lookup ranks same-named articles by year (disambiguator first, then
+  the item's own P577/P580) and reports whether the year could be confirmed.
+* wikidata_meta prefers the item dated to the release year, and replaces a
+  supplied qid that is the right kind but the wrong year.
+* _enrich_by_tt takes the sheet's year rather than deriving it from
+  released_on, which is blank for upcoming titles and often a festival date.
+* The no-IMDb-id path now resolves a Wikipedia article at all.
+* A curated Metacritic/RT URL carrying a different year no longer
+  short-circuits the year-suffixed lookup.
+
+Video games:
+* fetch_game takes year_hint, so reboots resolve to the right item.
+* A search hit whose name does not match is never used as the fallback.
+* Wikipedia and IMDb fall back to a year-aware search when Wikidata has no
+  sitelink and no P345 -- the common case for games.
+* verify_socials is called with the title, and the band/VEVO guard no longer
+  trips on publisher handles like bandainamco.
+
+When the year cannot be confirmed the value is kept and flagged as a review
+finding against its column; nothing is silently blanked.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0147rrNL1kXKNxyfRuiRYFSc
+---
+ URL_VALIDATION_NOTES.md     |  47 ++++
+ app.py                      |  54 +++-
+ metadata_fetcher.py         | 506 +++++++++++++++++++++++++++++++-----
+ test_metacritic_game.py     |   6 +-
+ test_year_aware_metadata.py | 302 +++++++++++++++++++++
+ 5 files changed, 849 insertions(+), 66 deletions(-)
+ create mode 100644 test_year_aware_metadata.py
+
+diff --git a/URL_VALIDATION_NOTES.md b/URL_VALIDATION_NOTES.md
+index a5a1e07..cb497a0 100644
+--- a/URL_VALIDATION_NOTES.md
++++ b/URL_VALIDATION_NOTES.md
+@@ -47,3 +47,50 @@ Applied to titles, talent (`fetch_person`) and games.
+ ## Verification
+ 
+ 23 unit tests (mocked HTTP) cover: slug building (punctuation, `&`, accents), guess-404 dropped, verified fallback found, curated kept/dropped correctly, Wikidata end-time/deprecated/preferred filtering, dead-account removal, fail-open behavior, and the `VALIDATE_URLS=0` kill switch. All pass; the module compiles clean.
++
++---
++
++## Release-date-first, extended (Sep 2026)
++
++Previously the year in the release-date column steered only **IMDb**,
++**Metacritic** and **Rotten Tomatoes**. Wikipedia and the Wikidata item — the
++item that supplies the row's **social handles** — were picked with no year check
++at all, so a remake could take the original's article and the original's
++Instagram/X/Facebook. Video games ignored the release date entirely.
++
++### Movies & TV
++
++* `wiki_lookup()` now ranks same-named articles by year: the disambiguator
++  (`Superman (2025 film)`) first, then the item's own P577/P580 dates. It also
++  runs a year-qualified search query, and returns a `year_ok` flag.
++* `wikidata_meta(year=...)` prefers the item dated to the release year. A
++  supplied qid that is the right *kind* but the wrong *year* is replaced when a
++  better item exists.
++* `_enrich_by_tt()` takes the sheet's year and uses it for Wikipedia, Wikidata,
++  Metacritic and Rotten Tomatoes — instead of deriving it from `released_on`,
++  which is blank for upcoming titles and is sometimes a festival date.
++* The no-IMDb-id path of `fetch_metadata()` now resolves a Wikipedia article
++  too (it previously shipped a blank cell) and passes the year to Wikidata.
++* A curated Metacritic/RT URL whose slug carries a *different* year no longer
++  short-circuits the lookup: the year-suffixed slug is tried first.
++
++### Video games
++
++* `fetch_game(year_hint=...)` — reboots (`Doom` 1993 vs 2016) resolve to the
++  right item.
++* The fallback is tightened: a search hit whose name does not match is never
++  used, so another game's developer/publisher/handles cannot reach the row.
++* Wikipedia falls back to `wiki_lookup_game()` and IMDb to
++  `imdb_suggest_game()` when Wikidata has no sitelink / no P345 — which is the
++  common case for games.
++* `verify_socials()` is finally called **with the title**, so wrong-owner
++  handles are rejected as they are for films. `_handle_foreign_to_title()` was
++  hardened so publisher handles containing "band" (`bandainamco`) are kept.
++
++### When the year cannot be confirmed
++
++The value is **kept** (it is the best match available) and a note is attached,
++surfaced in the Manual File Review as a `Mismatch` finding against the relevant
++column. Nothing is silently blanked.
++
++Tests: `test_year_aware_metadata.py`.
+diff --git a/app.py b/app.py
+index 28839a7..5505234 100644
+--- a/app.py
++++ b/app.py
+@@ -24,7 +24,7 @@ except Exception:  # keep the app running even if the module is missing
+     def fetch_person(name, qid=None, profession=""):
+         return {}
+ 
+-    def fetch_game(name):
++    def fetch_game(name, qid=None, year_hint=""):
+         return {}
+ 
+     def fetch_brand(name):
+@@ -1678,6 +1678,37 @@ def _read_upload(src):
+     return df
+ 
+ 
++def _release_hint(src, lower_cols=None):
++    """The release date on a row / metadata dict, as a year hint for discovery.
++    Video games are as reboot-heavy as films ('Doom' 1993 vs 2016), so the same
++    release-date-first rule the movie/TV path uses applies to them."""
++    if not src:
++        return ''
++    for key in ('released_on', 'street_date'):
++        col = (lower_cols or {}).get(key, key)
++        v = str((src.get(col) if hasattr(src, 'get') else '') or '').strip()
++        if v and v.lower() != 'nan':
++            return v[:10]
++    return ''
++
++
++_YEAR_NOTE_COLUMNS = (
++    ('Wikipedia', 'wikipedia_page'),
++    ('Metacritic', 'metacritic'),
++    ('Rotten Tomatoes', 'rottentomatoes'),
++    ('IMDb', 'imdb_id'),
++    ('Social handles', 'instagram_user'),
++)
++
++
++def _YEAR_NOTE_COLUMN(note):
++    """Which column a release-year warning belongs against."""
++    for prefix, col in _YEAR_NOTE_COLUMNS:
++        if str(note or '').startswith(prefix):
++            return col
++    return 'released_on'
++
++
+ def _merge_meta(base_meta, title, auto_fetch, is_movie=True):
+     """Overlay auto-discovered metadata under any explicit metadata.
+     Explicit values always win; auto-discovery only fills missing/blank fields.
+@@ -1919,7 +1950,7 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
+                 prof = (_row_profession(r) or default_profession) if kind_r == 'talent' else ''
+                 if auto_fetch:
+                     disc = dict((fetch_person(t, profession=prof) if kind_r == 'talent'
+-                                 else fetch_game(t)) or {})
++                                 else fetch_game(t, year_hint=_release_hint(r))) or {})
+                     for k, v in r.items():
+                         if v not in (None, ''):
+                             disc[k] = v
+@@ -2038,7 +2069,8 @@ def build_rows_from_titles(data, max_titles=None, progress=None):
+             # publisher = a single DAR row per publication, no twin
+             out.append(make_row(title, False, '', metadata, publisher=True))
+         elif kind == 'game':
+-            metadata = dict(fetch_game(title) or {}) if auto_fetch else {}
++            metadata = dict(fetch_game(
++                title, year_hint=_release_hint(base_meta)) or {}) if auto_fetch else {}
+             for k, v in (base_meta or {}).items():
+                 if v not in (None, ''):
+                     metadata[k] = v
+@@ -2544,7 +2576,8 @@ def api_lookup():
+         row = make_row(title, False, '', dict(meta), talent=True)
+         return jsonify({'discovered': meta, 'row': row})
+     if 'game' in kind:
+-        meta = fetch_game(title)
++        meta = fetch_game(title, year_hint=(request.args.get('released_on', '')
++                                            or request.args.get('year', '')))
+         row = make_row(title, False, '', dict(meta), game=True)
+         return jsonify({'discovered': meta, 'row': row})
+     is_movie = 'tv' not in kind
+@@ -3900,7 +3933,8 @@ def build_review(src, auto_fetch=True, progress=None):
+         sub = _sub_parts(r.get(lower_cols.get('title_sub_category', '')))
+ 
+         if is_game:
+-            meta = dict(fetch_game(t) or {}) if auto_fetch else {}
++            meta = dict(fetch_game(
++                t, year_hint=_release_hint(r, lower_cols)) or {}) if auto_fetch else {}
+             # manual sub lines fill discovery gaps (developer / platforms)
+             if not meta.get('developer') and sub.get('Developer'):
+                 meta['developer'] = sub['Developer']
+@@ -4006,6 +4040,16 @@ def build_review(src, auto_fetch=True, progress=None):
+                 row=i + 2, title=t, column='imdb_id', status='Mismatch',
+                 current=str(r.get(lower_cols.get('imdb_id', ''), '') or ''),
+                 suggested=_imdb_note))
++        # date-first Wikipedia / Wikidata socials / Metacritic / RT: the value
++        # is kept (it is the best match we have) but the reviewer is told it
++        # could not be confirmed against the release-date column
++        for _note_txt in meta.pop('_year_notes', []) or []:
++            _col = _YEAR_NOTE_COLUMN(_note_txt)
++            findings.append(dict(
++                row=i + 2, title=t, column=lower_cols.get(_col, _col),
++                status='Mismatch',
++                current=str(r.get(lower_cols.get(_col, ''), '') or ''),
++                suggested=_note_txt))
+ 
+         exp_net = str(meta.get('network') or
+                       r.get(lower_cols.get('network', ''), '') or '').strip()
+diff --git a/metadata_fetcher.py b/metadata_fetcher.py
+index 9261cc8..3b5fcb1 100644
+--- a/metadata_fetcher.py
++++ b/metadata_fetcher.py
+@@ -262,6 +262,23 @@ def _year_from(value):
+     return int(m.group(0)) if m else None
+ 
+ 
++def _slug_year(url):
++    """The 4-digit year a Metacritic / Rotten Tomatoes slug carries
++    ('/m/superman_2025', '/movie/superman-2025'), or None. Only the last path
++    segment is inspected, so a year elsewhere in the URL is never mistaken for
++    the slug's year."""
++    tail = str(url or "").rstrip("/").rsplit("/", 1)[-1]
++    m = re.search(r"[-_]((?:19|20)\d{2})$", tail)
++    return int(m.group(1)) if m else None
++
++
++def _note(notes, msg):
++    """Collect a reviewer-facing note without changing a function's return
++    type (callers pass a list; None means 'nobody is listening')."""
++    if notes is not None and msg and msg not in notes:
++        notes.append(msg)
++
++
+ # ---------------- Metacritic URL validation ----------------
+ def _mc_slug(title):
+     """Slug the way Metacritic builds movie/tv paths (best-effort guess)."""
+@@ -284,7 +301,8 @@ def _mc_alive(url):
+     return None  # 403/429/5xx: fail open, we can't tell
+ 
+ 
+-def resolve_metacritic(title, is_movie=True, candidate=None, curated=False, year=None):
++def resolve_metacritic(title, is_movie=True, candidate=None, curated=False, year=None,
++                       notes=None):
+     """Return a Metacritic URL that is known (or safely presumed) valid, or ''.
+ 
+     Release-date first (same rule as IMDb): when a release year is known, the
+@@ -301,14 +319,15 @@ def resolve_metacritic(title, is_movie=True, candidate=None, curated=False, year
+     """
+     if not VALIDATE_URLS:
+         return candidate or ""
+-    if candidate:
++    cyear = _slug_year(candidate)
++    candidate_fits_year = (not year) or (cyear is not None
++                                         and abs(cyear - year) <= IMDB_YEAR_TOLERANCE)
++    if candidate and candidate_fits_year:
+         alive = _mc_alive(candidate)
+         if alive or (curated and alive is None):
+             return candidate
+     slug = _mc_slug(title)
+-    if not slug:
+-        return ""
+-    slugs = [f"{slug}-{year}", slug] if year else [slug]
++    slugs = ([f"{slug}-{year}", slug] if year else [slug]) if slug else []
+     sections = ("movie", "tv") if is_movie else ("tv", "movie")
+     for sec in sections:
+         for sl in slugs:
+@@ -318,6 +337,17 @@ def resolve_metacritic(title, is_movie=True, candidate=None, curated=False, year
+                 continue  # already tried above
+             if _mc_alive(url):
+                 return "http://www.metacritic.com/%s/%s/" % (sec, sl)
++    # No page for the known release year. A curated candidate is still the best
++    # value we have -- keep it, but tell the reviewer it is unverified for the
++    # year in the release-date column rather than shipping it silently.
++    if candidate and not candidate_fits_year:
++        alive = _mc_alive(candidate)
++        if alive or (curated and alive is None):
++            _note(notes, "Metacritic %s could not be confirmed as the %s title%s "
++                         "-- verify it is the right year's page."
++                  % (candidate, year,
++                     " (the page is dated %s)" % cyear if cyear else ""))
++            return candidate
+     return ""
+ 
+ 
+@@ -356,7 +386,8 @@ def _rt_alive(url):
+     return None  # 403/429/5xx: fail open, we can't tell
+ 
+ 
+-def resolve_rottentomatoes(title, is_movie=True, candidate=None, curated=False, year=None):
++def resolve_rottentomatoes(title, is_movie=True, candidate=None, curated=False,
++                           year=None, notes=None):
+     """Return a movie-only (/m/) Rotten Tomatoes URL, or ''.
+ 
+     Same rule as IMDb/Metacritic: with a known release year the year-suffixed
+@@ -370,16 +401,17 @@ def resolve_rottentomatoes(title, is_movie=True, candidate=None, curated=False,
+     cand = clean_rottentomatoes(candidate)
+     if not VALIDATE_URLS:
+         return cand
+-    if cand:
++    cyear = _slug_year(cand)
++    cand_fits_year = (not year) or (cyear is not None
++                                    and abs(cyear - year) <= IMDB_YEAR_TOLERANCE)
++    if cand and cand_fits_year:
+         alive = _rt_alive(cand)
+         if alive or (curated and alive is None):
+             return cand
+     if not is_movie:
+         return ""  # only movie /m/ RT URLs are shipped
+     slug = _rt_slug(title)
+-    if not slug:
+-        return ""
+-    slugs = [f"{slug}_{year}", slug] if year else [slug]
++    slugs = ([f"{slug}_{year}", slug] if year else [slug]) if slug else []
+     for sl in slugs:
+         url = "https://www.rottentomatoes.com/m/%s" % sl
+         if cand and url.rstrip("/") == str(cand).replace(
+@@ -387,6 +419,14 @@ def resolve_rottentomatoes(title, is_movie=True, candidate=None, curated=False,
+             continue
+         if _rt_alive(url):
+             return "http://www.rottentomatoes.com/m/%s" % sl
++    if cand and not cand_fits_year:
++        alive = _rt_alive(cand)
++        if alive or (curated and alive is None):
++            _note(notes, "Rotten Tomatoes %s could not be confirmed as the %s "
++                         "title%s -- verify it is the right year's page."
++                  % (cand, year,
++                     " (the page is dated %s)" % cyear if cyear else ""))
++            return cand
+     return ""
+ 
+ 
+@@ -632,14 +672,29 @@ def _page_qid(page_title):
+     return None
+ 
+ 
+-def wiki_lookup(title, is_movie=True, tt=None):
++WIKI_MAX_CANDIDATES = 5  # articles whose Wikidata item we are willing to fetch
++
++
++def wiki_lookup(title, is_movie=True, tt=None, year=None):
+     """Find the enwiki article for this exact film/show.
+-    Returns (url, page_title, wikidata_qid) or (None, None, None).
++    Returns (url, page_title, wikidata_qid, year_ok).
++
+     A candidate must match the title (ignoring a trailing '(film)'/'(TV...)')
+-    and, when we know the IMDb id, its Wikidata P345 must agree."""
++    and, when we know the IMDb id, its Wikidata P345 must agree.
++
++    RELEASE-DATE FIRST (same rule as IMDb / Metacritic / RT): when Ops gave a
++    release year, every same-named article is ranked by whether it is that
++    year's title -- the disambiguator ('Superman (2025 film)') first, then the
++    Wikidata item's own P577/P580 dates -- so a remake no longer lands on the
++    original's article. `year_ok` is False when the only article we could find
++    demonstrably belongs to another year, so the caller can flag it for review
++    instead of shipping it silently."""
+     kind = "film" if is_movie else "TV series"
+     hits = []
+-    for q in (f'{title} {kind}', title):
++    queries = [f'{title} {kind}', title]
++    if year:  # the year-qualified search surfaces the remake's article directly
++        queries.insert(0, f'{title} {year} {kind}')
++    for q in queries:
+         data = _get_json(WIKIPEDIA_API, {"action": "query", "list": "search",
+                                          "srsearch": q, "srlimit": 6, "format": "json"})
+         for h in ((data or {}).get("query", {}) or {}).get("search", []):
+@@ -649,10 +704,15 @@ def wiki_lookup(title, is_movie=True, tt=None):
+     kind_paren = re.compile(
+         r"\([^)]*\b(film|movie|miniseries|mini-series|tv series|television series|"
+         r"tv film|television film|series)\)\s*$", re.IGNORECASE)
++    best = None  # (rank, url, page_title, qid, year_ok)
++    considered = 0
+     for pt in hits:
+         base = _norm(re.sub(r"\s*\([^)]*\)\s*$", "", pt))
+         if base != tl:
+             continue
++        if considered >= WIKI_MAX_CANDIDATES:
++            break  # cap the Wikidata round-trips on very common titles
++        considered += 1
+         qid = _page_qid(pt)
+         ent = _entity(qid) if qid else None
+         if ent is not None:
+@@ -663,9 +723,30 @@ def wiki_lookup(title, is_movie=True, tt=None):
+             if not (entity_is_wanted_work(ent, is_movie, tt) or kind_paren.search(pt)):
+                 log.info("wiki_lookup: skipped %r (%s) - not a %s", pt, qid, kind)
+                 continue
+-        url = "http://en.wikipedia.org/wiki/" + pt.replace(" ", "_")
+-        return url, pt, qid
+-    return None, None, None
++        # 2 = this article is the wanted year, 0 = undated / no year known,
++        # -1 = it belongs to another year (kept only if nothing better exists)
++        py = _paren_year(pt)
++        if not year:
++            rank = 0
++        elif py:
++            rank = 2 if abs(py - year) <= IMDB_YEAR_TOLERANCE else -1
++        else:
++            fits = _year_fits(ent, year)
++            rank = 0 if fits is None else (2 if fits else -1)
++        if tt and ent is not None and tt in (_claim_values(ent.get("claims", {}) or {}, "P345")):
++            rank = max(rank, 2)  # the IMDb id agreeing settles it
++        cand = (rank, "http://en.wikipedia.org/wiki/" + pt.replace(" ", "_"),
++                pt, qid, rank >= 0)
++        if best is None or cand[0] > best[0]:
++            best = cand
++        if rank == 2:
++            break  # exact year match -- nothing can beat it
++    if best is None:
++        return None, None, None, True
++    if not best[4]:
++        log.info("wiki_lookup: %r best article %r does not match release year %s",
++                 title, best[2], year)
++    return best[1], best[2], best[3], best[4]
+ 
+ 
+ def wiki_infobox_network(page_title, is_movie=True):
+@@ -1054,6 +1135,42 @@ def _parse_time(val):
+     return "%s-%s-%s" % (y, "01" if mo == "00" else mo, "01" if d == "00" else d)
+ 
+ 
++def _entity_year_span(ent):
++    """(first_year, last_year) spanned by a Wikidata item's own dates:
++    P577 publication date, P580 start time, P582 end time. A film collapses to
++    a single year; a series spans its run, so a 2019-2023 show fits a 2022
++    release-date column. (None, None) when the item carries no usable date --
++    an undated (usually upcoming) item is never rejected on year."""
++    claims = (ent or {}).get("claims", {}) or {}
++    years = []
++    for p in ("P577", "P580", "P582"):
++        for v in _claim_values(claims, p, prefer_us=True):
++            y = _year_from(_parse_time(v))
++            if y:
++                years.append(y)
++    if not years:
++        return None, None
++    return min(years), max(years)
++
++
++def _year_fits(ent, want_year, tol=IMDB_YEAR_TOLERANCE):
++    """True / False / None (undated -- unknown) for 'is this item's own date
++    compatible with the release year Ops gave us'."""
++    if not want_year:
++        return None
++    lo, hi = _entity_year_span(ent)
++    if not lo:
++        return None
++    return (lo - tol) <= want_year <= (hi + tol)
++
++
++def _paren_year(page_title):
++    """The year inside an enwiki disambiguator -- 'Superman (2025 film)' -> 2025.
++    None when the article title carries no year."""
++    m = re.search(r"\(([^)]*)\)\s*$", str(page_title or ""))
++    return _year_from(m.group(1)) if m else None
++
++
+ def _is_film_or_tv(claims):
+     return bool(set(_claim_values(claims, "P31")) & FILM_TV_TYPES)
+ 
+@@ -1087,6 +1204,14 @@ def entity_is_wanted_work(ent, is_movie=True, tt=None):
+ _FOREIGN_HANDLE_MARKERS = ("band", "vevo", "topic")  # "band" already covers *bandofficial
+ 
+ 
++# Words that merely CONTAIN 'band' and say nothing about the owner. Handles are
++# compared with punctuation stripped, so without this 'bandainamco' (a game
++# publisher) read as a band account -- which matters now that the video-game
++# path runs this check too.
++_BAND_FALSE_POSITIVES = ("bandai", "bandcamp", "bandit", "bandana", "bandwidth",
++                         "bandage", "husband", "headband", "wristband", "contraband")
++
++
+ def _handle_foreign_to_title(handle, title):
+     """True when a social handle looks like a band/artist account rather than
+     the title -- e.g. 'crawlersband' for the movie 'Crawlers'. A marker that
+@@ -1095,28 +1220,50 @@ def _handle_foreign_to_title(handle, title):
+     t = re.sub(r"[^a-z0-9]", "", str(title or "").lower())
+     if not h:
+         return False
+-    return any(m in h and m not in t for m in _FOREIGN_HANDLE_MARKERS)
++    h_band = h
++    for w in _BAND_FALSE_POSITIVES:
++        h_band = h_band.replace(w, "")
++    return any(m in (h_band if m == "band" else h) and m not in t
++               for m in _FOREIGN_HANDLE_MARKERS)
+ 
+ 
+-def wikidata_meta(title, qid=None, is_movie=True, tt=None, verify=True):
++def wikidata_meta(title, qid=None, is_movie=True, tt=None, verify=True, year=None):
+     """Socials / RT / metacritic / distributor / genres off the Wikidata item.
+ 
+     With verify=True (default) the item must be confirmed to be the film/TV
+     title -- see entity_is_wanted_work -- before ANY field, above all its social
+     handles, is trusted. This is the guard that keeps a same-named band, album
+-    or person from supplying a movie's Facebook / Instagram / Twitter."""
++    or person from supplying a movie's Facebook / Instagram / Twitter.
++
++    RELEASE-DATE FIRST: the social handles on this row come from THIS item, so
++    a same-named title from another year passing the film/TV check is exactly
++    how a 1978 film's accounts used to land on a 2025 remake. When Ops gave a
++    release year, an item whose own P577/P580 dates disagree with it is only
++    used if no year-matching item exists, and '_wikidata_year_note' is set so
++    the reviewer is told the handles are unverified for that year."""
++    year_mismatch = False
+     entity = _entity(qid) if qid else None
+     if entity is not None and verify and not entity_is_wanted_work(entity, is_movie, tt):
+         log.info("wikidata_meta: rejected %s for %r - not the %s being ingested (P31=%s)",
+                  qid, title, "film" if is_movie else "TV title",
+                  ",".join(_claim_values(entity.get("claims", {}) or {}, "P31")) or "none")
+         entity = None
++    # a supplied qid that is the right KIND but the wrong YEAR: look for the
++    # right year's item before settling for it
++    if entity is not None and year and _year_fits(entity, year) is False:
++        log.info("wikidata_meta: %s for %r is dated %s, want ~%s - looking for the "
++                 "right year's item", qid, title, _entity_year_span(entity), year)
++        better = _wikidata_pick(title, is_movie, tt, year)
++        if better is not None:
++            entity = better
++        else:
++            year_mismatch = True
+     if entity is None:
+-        for cand in _search_candidates(title)[:5]:
+-            ent = _entity(cand)
+-            if ent and entity_is_wanted_work(ent, is_movie, tt):
+-                entity = ent
+-                break
++        entity = _wikidata_pick(title, is_movie, tt, year)
++        # nothing dated right: fall back to any confirmed film/TV item, flagged
++        if entity is None and year:
++            entity = _wikidata_pick(title, is_movie, tt, None)
++            year_mismatch = entity is not None and _year_fits(entity, year) is False
+         # No untyped fallback: taking the first search hit regardless of type is
+         # exactly how a band's item used to reach a movie row.
+     if entity is None:
+@@ -1196,9 +1343,29 @@ def wikidata_meta(title, qid=None, is_movie=True, tt=None, verify=True):
+     enwiki = entity.get("sitelinks", {}).get("enwiki")
+     if enwiki and enwiki.get("title"):
+         meta["wikipedia_page"] = "http://en.wikipedia.org/wiki/" + enwiki["title"].replace(" ", "_")
++    if year_mismatch:
++        lo, hi = _entity_year_span(entity)
++        meta["_wikidata_year_note"] = (
++            "Social handles/links come from the Wikidata item for %s (%s), but the "
++            "release date says %s -- verify they belong to this title."
++            % (title, lo if lo == hi else "%s-%s" % (lo, hi), year))
+     return meta
+ 
+ 
++def _wikidata_pick(title, is_movie, tt, year):
++    """First searched Wikidata item that is confirmed to be the film/TV title
++    being ingested -- and, when a release year is known, that is also dated to
++    that year. None when no candidate qualifies."""
++    for cand in _search_candidates(title)[:5]:
++        ent = _entity(cand)
++        if not (ent and entity_is_wanted_work(ent, is_movie, tt)):
++            continue
++        if year and _year_fits(ent, year) is False:
++            continue
++        return ent
++    return None
++
++
+ # ---------------- Talent (people) ----------------
+ _GENDER_QIDS = {"Q6581097": "Gender - Man", "Q6581072": "Gender - Woman"}
+ 
+@@ -2010,35 +2177,189 @@ def fetch_metacritic_game(url):
+     return out
+ 
+ 
+-def fetch_game(name, qid=None):
++_GAME_PAREN = re.compile(
++    r"\([^)]*\b(video game|game|game series|video game series)\)\s*$", re.IGNORECASE)
++
++
++def _ent_is_gamey(ent):
++    """True when a Wikidata item looks like a video game: an explicit P31 game
++    type, or the game-only properties developer (P178) / platform (P400)."""
++    claims = (ent or {}).get("claims", {}) or {}
++    return bool(set(_claim_values(claims, "P31")) & _GAME_TYPES) \
++        or bool(_claim_values(claims, "P178") or _claim_values(claims, "P400"))
++
++
++def _game_name_match(ent, clean):
++    """2 = a label/alias IS the requested name, 1 = the name is a prefix of one
++    ('Doom Eternal' for 'Doom'), 0 = a different game entirely.
++
++    This is the guard that stopped fetch_game settling for 'the first search hit
++    that happens to be a game' -- which is how another game's developer,
++    publisher and social handles reached the row."""
++    want = _norm(clean)
++    if not want or ent is None:
++        return 0
++    names = []
++    lbl = ((ent.get("labels", {}) or {}).get("en", {}) or {}).get("value", "")
++    if lbl:
++        names.append(lbl)
++    for a in ((ent.get("aliases", {}) or {}).get("en", []) or []):
++        v = a.get("value") if isinstance(a, dict) else a
++        if v:
++            names.append(v)
++    best = 0
++    for n in names:
++        nn = _norm(n)
++        if not nn:
++            continue
++        if nn == want:
++            return 2
++        if nn.startswith(want) or want.startswith(nn):
++            best = 1
++    return best
++
++
++def wiki_lookup_game(title, year=None):
++    """enwiki article for a VIDEO GAME, ranked by release year the same way the
++    film/TV lookup is -- so a reboot ('Doom', 2016) no longer lands on the
++    original's article. Returns (url, page_title, qid, year_ok).
++
++    Wikidata carries an enwiki sitelink for most games, but a thin or missing
++    item used to leave the Wikipedia cell blank; this is the fallback."""
++    hits, from_game_query = [], set()
++    queries = [(f"{title} video game", True), (title, False)]
++    if year:
++        queries.insert(0, (f"{title} {year} video game", True))
++    for q, gameish in queries:
++        data = _get_json(WIKIPEDIA_API, {"action": "query", "list": "search",
++                                         "srsearch": q, "srlimit": 6, "format": "json"})
++        for h in ((data or {}).get("query", {}) or {}).get("search", []):
++            if h["title"] not in hits:
++                hits.append(h["title"])
++            if gameish:
++                from_game_query.add(h["title"])
++    tl = _norm(title)
++    best, considered = None, 0
++    for pt in hits:
++        if _norm(re.sub(r"\s*\([^)]*\)\s*$", "", pt)) != tl:
++            continue
++        if considered >= WIKI_MAX_CANDIDATES:
++            break
++        considered += 1
++        qid = _page_qid(pt)
++        ent = _entity(qid) if qid else None
++        confirmed = _ent_is_gamey(ent) if ent is not None else False
++        if not (confirmed or _GAME_PAREN.search(pt) or pt in from_game_query):
++            log.info("wiki_lookup_game: skipped %r (%s) - not a video game", pt, qid)
++            continue
++        py = _paren_year(pt)
++        if not year:
++            rank = 0
++        elif py:
++            rank = 2 if abs(py - year) <= IMDB_YEAR_TOLERANCE else -1
++        else:
++            fits = _year_fits(ent, year)
++            rank = 0 if fits is None else (2 if fits else -1)
++        cand = (rank, "https://en.wikipedia.org/wiki/" + pt.replace(" ", "_"),
++                pt, qid, rank >= 0)
++        if best is None or cand[0] > best[0]:
++            best = cand
++        if rank == 2:
++            break
++    if best is None:
++        return None, None, None, True
++    return best[1], best[2], best[3], best[4]
++
++
++def imdb_suggest_game(title, year=None):
++    """IMDb's suggestion API restricted to VIDEO GAME entries.
++    Returns (item, year_ok) or (None, True).
++
++    Wikidata records P345 for very few games, so the IMDb cell was blank for
++    most of them; IMDb's own suggestion API has the id. Only an exact title
++    match of type videoGame is accepted, and when a release year is known the
++    entry for that year wins -- a wrong-year entry is still returned, flagged,
++    rather than silently shipped."""
++    if not title:
++        return None, True
++    q = urllib.parse.quote(title.strip().lower())
++    data = _get_json(IMDB_SUGGEST.format(q=q), headers=HTML_HEADERS)
++    tl = _norm(title)
++    items = [it for it in (data or {}).get("d", [])
++             if str(it.get("id", "")).startswith("tt")
++             and str(it.get("qid") or "").lower() == "videogame"
++             and _norm(it.get("l")) == tl]
++    if not items:
++        return None, True
++    if not year:
++        return items[0], True
++    fit = [it for it in items if it.get("y")
++           and abs(int(it["y"]) - year) <= IMDB_YEAR_TOLERANCE]
++    if fit:
++        return fit[0], True
++    undated = [it for it in items if not it.get("y")]
++    if undated:  # an unreleased game has no year on IMDb -- never reject on it
++        return undated[0], True
++    return items[0], False
++
++
++def fetch_game(name, qid=None, year_hint=""):
+     """Auto-discover a VIDEO GAME via Wikidata: developer (P178), publisher
+     (P123), platforms (P400), genres (P136), release (P577), socials,
+-    wikipedia, metacritic, imdb. Fails soft ({}). qid skips the search."""
++    wikipedia, metacritic, imdb. Fails soft ({}). qid skips the search.
++
++    `year_hint` is the sheet's release date. Games are reboot-heavy ('Doom'
++    1993 vs 2016, 'Modern Warfare' 2007 vs 2019), so -- exactly as on the
++    film/TV path -- the release year picks which same-named item is used, and
++    therefore whose socials, Wikipedia article and IMDb id land on the row.
++
++    Wikipedia and IMDb no longer depend on Wikidata alone: when the item has no
++    enwiki sitelink or no P345 (true for most games), they are resolved from
++    Wikipedia search and IMDb's suggestion API instead of being left blank."""
+     if not name and not qid:
+         return {}
+     clean = re.sub(r"\s*-\s*DAR\s*$", "", name or "", flags=re.IGNORECASE).strip()
+-    clean, _ = _split_disambiguator(clean)
+-    key = ("game:qid:" + qid,) if qid else ("game:" + clean.lower(),)
++    clean, hint = _split_disambiguator(clean)
++    want_year = _year_from(year_hint)
++    if not want_year and hint.isdigit() and len(hint) == 4:
++        want_year = int(hint)
++    key = ("game:qid:" + qid, want_year or 0) if qid \
++        else ("game:" + clean.lower(), want_year or 0)
+     if key in _CACHE:
+         return dict(_CACHE[key])
+     meta = {}
++    notes = []
+     try:
+         entity = _entity(qid) if qid else None
+-        fallback = None
+-        for cand in ([] if qid else _search_candidates(clean, limit=8)[:6]):
+-            ent = _entity(cand)
+-            if not ent:
+-                continue
+-            claims = ent.get("claims", {})
+-            is_game = bool(set(_claim_values(claims, "P31")) & _GAME_TYPES)
+-            has_gamey = bool(_claim_values(claims, "P178") or _claim_values(claims, "P400"))
+-            lbl = (ent.get("labels", {}).get("en", {}) or {}).get("value", "")
+-            if (is_game or has_gamey) and _norm(lbl) == _norm(clean):
+-                entity = ent
+-                break
+-            if is_game and fallback is None:
+-                fallback = ent
+-        entity = entity or fallback
++        if entity is None:
++            # rank the search hits instead of taking the first game-shaped one:
++            # name match first, then the release year, then an explicit P31 game
++            best = None
++            for cand in _search_candidates(clean, limit=8)[:6]:
++                ent = _entity(cand)
++                if not (ent and _ent_is_gamey(ent)):
++                    continue
++                nm = _game_name_match(ent, clean)
++                if nm == 0:
++                    continue  # a differently-named game is never the fallback
++                fits = _year_fits(ent, want_year)
++                yr = 0 if fits is None else (2 if fits else -1)
++                is_game = bool(set(_claim_values(ent.get("claims", {}) or {}, "P31"))
++                               & _GAME_TYPES)
++                rank = (nm, yr, 1 if is_game else 0)
++                if best is None or rank > best[0]:
++                    best = (rank, ent)
++                if nm == 2 and yr == 2:
++                    break
++            if best is not None:
++                entity = best[1]
++                if want_year and best[0][1] < 0:
++                    lo, hi = _entity_year_span(entity)
++                    _note(notes, "Social handles for %s come from a Wikidata item "
++                                 "dated %s, but the release date says %s -- verify "
++                                 "they (and the developer/publisher) belong to this "
++                                 "release." % (clean, lo if lo == hi else
++                                               "%s-%s" % (lo, hi), want_year))
+         if entity is not None:
+             claims = entity.get("claims", {})
+             raw = {}
+@@ -2127,7 +2448,32 @@ def fetch_game(name, qid=None):
+     # the quota note).
+     if not meta.get("youtube_own_channel") and clean:
+         _fill(meta, youtube_channel(clean))
+-    verify_socials(meta)
++
++    # ---- Wikipedia / IMDb: Wikidata is the first source, not the only one ----
++    # A game whose item has no enwiki sitelink used to ship a blank Wikipedia
++    # cell, and P345 is recorded for so few games that the IMDb cell was blank
++    # almost always. Both now fall back to a year-aware search.
++    if clean and not meta.get("wikipedia_page"):
++        wurl, wtitle, _wqid, wyear_ok = wiki_lookup_game(clean, year=want_year)
++        if wurl:
++            meta["wikipedia_page"] = wurl
++            if not wyear_ok:
++                _note(notes, "Wikipedia article %r is not the %s release -- verify "
++                             "it is the right version of the game."
++                      % (wtitle, want_year))
++    if clean and not meta.get("imdb_id"):
++        item, iyear_ok = imdb_suggest_game(clean, year=want_year)
++        if item:
++            meta["imdb_id"] = "https://www.imdb.com/title/" + item["id"]
++            if not iyear_ok:
++                _note(notes, "IMDb %s is dated %s but the release date says %s -- "
++                             "verify it is the right version of the game."
++                      % (item["id"], item.get("y"), want_year))
++
++    # the title is what tells a wrong-owner handle from the game's own, so pass
++    # it -- the film/TV path has always done this, the game path never did
++    verify_socials(meta, clean, reject_foreign=True)
++    _carry_year_notes(meta, notes)
+     _CACHE[key] = dict(meta)
+     return meta
+ 
+@@ -2307,10 +2653,17 @@ def _fill(dst, src):
+ _CACHE = {}
+ 
+ 
+-def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
++def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None, want_year=None):
+     """Merge all sources keyed off an exact IMDb tt (see module docstring
+-    for the field-priority rationale)."""
++    for the field-priority rationale).
++
++    `want_year` is the year in the sheet's release-date column. It is the
++    AUTHORITY for every same-named-title decision here -- Wikipedia article,
++    Wikidata item (and therefore the social handles), Metacritic and Rotten
++    Tomatoes -- and it is used even when the resolved release date is missing
++    (upcoming titles) or is a festival date."""
+     meta = {}
++    notes = []
+ 
+     # 0) upcoming-release-movies service (BOM calendar): distributor, genres,
+     #    release date + Wide/Limited scale -- authoritative when present
+@@ -2320,17 +2673,21 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
+     # 1) Box Office Mojo -- US Domestic Distributor (released titles only)
+     _fill(meta, bom_scrape(tt))
+ 
+-    # 2) Wikipedia article, verified against the IMDb id
+-    wurl, wtitle, wqid = wiki_lookup(title_hint, is_movie, tt=tt)
++    # 2) Wikipedia article, verified against the IMDb id and the release year
++    wurl, wtitle, wqid, wyear_ok = wiki_lookup(title_hint, is_movie, tt=tt, year=want_year)
+     if wurl:
+         meta.setdefault("wikipedia_page", wurl)
++        if not wyear_ok:
++            _note(notes, "Wikipedia article %r is not the %s title -- verify it is "
++                         "the right year's page." % (wtitle, want_year))
+     if wtitle and not meta.get("network"):
+         dist = wiki_infobox_network(wtitle, is_movie)
+         if dist:
+             meta["network"] = dist
+ 
+     # 3) Wikidata item -> RT / metacritic / socials / own-YouTube / distributor
+-    _fill(meta, wikidata_meta(title_hint, qid=(wqid or wikidata_id), is_movie=is_movie, tt=tt, verify=True))
++    _fill(meta, wikidata_meta(title_hint, qid=(wqid or wikidata_id), is_movie=is_movie,
++                              tt=tt, verify=True, year=want_year))
+ 
+     # 4) OMDb by exact id -> genre / release fallback (reliable API)
+     _fill(meta, omdb_by_id(tt))
+@@ -2343,7 +2700,8 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
+     prod_co = tmeta.pop("production_company", None)
+     _fill(meta, tmeta)
+     if not (wqid or wikidata_id) and wid:
+-        _fill(meta, wikidata_meta(title_hint, qid=wid, is_movie=is_movie, tt=tt, verify=True))
++        _fill(meta, wikidata_meta(title_hint, qid=wid, is_movie=is_movie, tt=tt,
++                                  verify=True, year=want_year))
+ 
+     # 6) IMDb page scrape -- genre + datePublished as last resort
+     imeta = imdb_scrape(tt)
+@@ -2374,8 +2732,10 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
+     meta.setdefault("imdb_id", "http://www.imdb.com/title/" + tt)
+ 
+     # release-date first for MC & RT (same rule as IMDb): the known year picks
+-    # the correct same-named title's page.
+-    _yr = _year_from(meta.get("released_on"))
++    # the correct same-named title's page. The sheet's release date wins over
++    # the resolved one -- the latter is blank for upcoming titles and is
++    # sometimes a festival date.
++    _yr = want_year or _year_from(meta.get("released_on"))
+ 
+     # metacritic: verify what we found. A Wikidata URL is curated (kept unless
+     # definitively 404); the calendar service's slug guess is only kept when the
+@@ -2384,7 +2744,7 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
+     curated = bool(meta.get("metacritic"))
+     mc = resolve_metacritic(title_hint, is_movie,
+                             candidate=meta.get("metacritic") or guess,
+-                            curated=curated, year=_yr)
++                            curated=curated, year=_yr, notes=notes)
+     if mc:
+         meta["metacritic"] = mc
+     else:
+@@ -2394,7 +2754,8 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
+     # the year-suffixed /m/ slug; keep a generated URL only if it verifies.
+     rt = resolve_rottentomatoes(title_hint, is_movie,
+                                 candidate=meta.get("rottentomatoes"),
+-                                curated=bool(meta.get("rottentomatoes")), year=_yr)
++                                curated=bool(meta.get("rottentomatoes")),
++                                year=_yr, notes=notes)
+     if rt:
+         meta["rottentomatoes"] = rt
+     else:
+@@ -2402,9 +2763,21 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None):
+ 
+     # drop wrong-owner (band/artist) handles first, then dead ones
+     verify_socials(meta, title_hint, reject_foreign=True)
++    _carry_year_notes(meta, notes)
+     return meta
+ 
+ 
++def _carry_year_notes(meta, notes):
++    """Surface release-year warnings on the row instead of dropping the value.
++    '_wikidata_year_note' is set by wikidata_meta itself; the rest arrive via
++    the notes list the resolvers append to."""
++    wd = meta.pop("_wikidata_year_note", "")
++    if wd:
++        _note(notes, wd)
++    if notes:
++        meta["_year_notes"] = list(notes)
++
++
+ def fetch_metadata_by_tt(tt, is_movie=True, title="", year_hint=""):
+     """Preferred entry point when the exact IMDb id is known (reliable).
+ 
+@@ -2422,7 +2795,7 @@ def fetch_metadata_by_tt(tt, is_movie=True, title="", year_hint=""):
+     try:
+         hint_title, _ = _split_disambiguator(
+             re.sub(r"\s*-\s*DAR\s*$", "", title or "", flags=re.IGNORECASE).strip())
+-        meta = _enrich_by_tt(tt, is_movie, hint_title or tt)
++        meta = _enrich_by_tt(tt, is_movie, hint_title or tt, want_year=want_year)
+         if want_year:
+             yr = _year_from(meta.get("released_on"))
+             if yr and abs(yr - want_year) > IMDB_YEAR_TOLERANCE:
+@@ -2481,32 +2854,45 @@ def fetch_metadata(title, is_movie=True, year_hint=""):
+             tmdb_meta, wid = tmdb_lookup(lookup, is_movie, want_year)
+             tt = _tt(tmdb_meta.get("imdb_id")) or _tt(omdb_lookup(lookup, want_year).get("imdb_id"))
+         if tt:
+-            meta = _enrich_by_tt(tt, is_movie, lookup, wikidata_id=wid)
++            meta = _enrich_by_tt(tt, is_movie, lookup, wikidata_id=wid, want_year=want_year)
+             tmdb_meta.pop("production_company", None)
+             tmdb_meta.pop("released_on_us", None)
+             _fill(meta, tmdb_meta)
+         else:
++            notes = []
+             tmdb_meta.pop("production_company", None)
+             tmdb_meta.pop("released_on_us", None)
+             _fill(meta, tmdb_meta)
+-            _fill(meta, wikidata_meta(lookup, qid=wid, is_movie=is_movie, verify=True))
++            # no IMDb id to verify against, so the release year is the ONLY
++            # thing separating this title from its same-named siblings
++            wurl, wtitle, wqid, wyear_ok = wiki_lookup(lookup, is_movie, year=want_year)
++            if wurl:
++                meta.setdefault("wikipedia_page", wurl)
++                if not wyear_ok:
++                    _note(notes, "Wikipedia article %r is not the %s title -- verify "
++                                 "it is the right year's page." % (wtitle, want_year))
++            _fill(meta, wikidata_meta(lookup, qid=(wqid or wid), is_movie=is_movie,
++                                      verify=True, year=want_year))
+             _fill(meta, omdb_lookup(lookup, want_year))
+             _yr = want_year or _year_from(meta.get("released_on"))
+             mc = resolve_metacritic(lookup, is_movie,
+                                     candidate=meta.get("metacritic"),
+-                                    curated=bool(meta.get("metacritic")), year=_yr)
++                                    curated=bool(meta.get("metacritic")),
++                                    year=_yr, notes=notes)
+             if mc:
+                 meta["metacritic"] = mc
+             else:
+                 meta.pop("metacritic", None)
+             rt = resolve_rottentomatoes(lookup, is_movie,
+                                         candidate=meta.get("rottentomatoes"),
+-                                        curated=bool(meta.get("rottentomatoes")), year=_yr)
++                                        curated=bool(meta.get("rottentomatoes")),
++                                        year=_yr, notes=notes)
+             if rt:
+                 meta["rottentomatoes"] = rt
+             else:
+                 meta.pop("rottentomatoes", None)
+             verify_socials(meta, lookup, reject_foreign=True)
++            _carry_year_notes(meta, notes)
+         if sug_ptype:
+             meta["program_type"] = sug_ptype  # IMDb's own type beats TMDB's
+         # date is authoritative: if we still hold an IMDb id whose year disagrees
+diff --git a/test_metacritic_game.py b/test_metacritic_game.py
+index c88bc50..0c87098 100644
+--- a/test_metacritic_game.py
++++ b/test_metacritic_game.py
+@@ -227,7 +227,11 @@ class SourcingPolicyTests(unittest.TestCase):
+             _claim_values=fake_claim_values,
+             _labels=lambda qids: labels,
+             youtube_channel=lambda name: {},
+-            verify_socials=lambda meta: None,
++            verify_socials=lambda meta, title=None, reject_foreign=False: None,
++            # the Wikipedia / IMDb fallbacks are exercised in
++            # test_year_aware_metadata; here they must stay off the network
++            wiki_lookup_game=lambda title, year=None: (None, None, None, True),
++            imdb_suggest_game=lambda title, year=None: (None, True),
+             _resolve_metacritic_game=lambda title, candidate=None:
+                 "https://www.metacritic.com/game/agefield-high-rock-the-school/",
+             fetch_metacritic_game=lambda url: {
+diff --git a/test_year_aware_metadata.py b/test_year_aware_metadata.py
+new file mode 100644
+index 0000000..6bed29c
+--- /dev/null
++++ b/test_year_aware_metadata.py
+@@ -0,0 +1,302 @@
++"""Release-date-first resolution for Wikipedia, the Wikidata item (and therefore
++the social handles) and the video-game path. No network: every primitive that
++would leave the machine is monkeypatched."""
++import unittest
++import metadata_fetcher as mf
++
++
++class _Patch:
++    """Set module attrs for the duration of a with-block, restore on exit."""
++    def __init__(self, **kw):
++        self.kw = kw
++        self.old = {}
++
++    def __enter__(self):
++        for k, v in self.kw.items():
++            self.old[k] = getattr(mf, k)
++            setattr(mf, k, v)
++        return self
++
++    def __exit__(self, *a):
++        for k, v in self.old.items():
++            setattr(mf, k, v)
++        return False
++
++
++def _id_claim(qid):
++    return {"mainsnak": {"snaktype": "value",
++                         "datavalue": {"value": {"id": qid}}}}
++
++
++def _str_claim(v):
++    return {"mainsnak": {"snaktype": "value", "datavalue": {"value": v}}}
++
++
++def _time_claim(year):
++    return {"mainsnak": {"snaktype": "value",
++                         "datavalue": {"value": {"time": "+%s-01-01T00:00:00Z" % year}}}}
++
++
++def mk(qid, label, p31, year=None, imdb=None, aliases=(), sitelink=None, extra=None):
++    """A Wikidata entity shaped the way the real API returns one, so the real
++    _claim_values / _parse_time run in these tests."""
++    claims = {"P31": [_id_claim(q) for q in p31]}
++    if year:
++        claims["P577"] = [_time_claim(year)]
++    if imdb:
++        claims["P345"] = [_str_claim(imdb)]
++    for prop, vals in (extra or {}).items():
++        claims[prop] = [_str_claim(v) for v in vals]
++    return {"id": qid, "labels": {"en": {"value": label}},
++            "aliases": {"en": [{"value": a} for a in aliases]},
++            "sitelinks": ({"enwiki": {"title": sitelink}} if sitelink else {}),
++            "claims": claims}
++
++
++def _wire(entities):
++    """Monkeypatch set that serves the given {qid: entity} map with no HTTP."""
++    return dict(_entity=lambda qid: entities.get(qid),
++                _labels=lambda qids: {},
++                VALIDATE_URLS=False)
++
++
++FILM = "Q11424"
++GAME = "Q7889"
++
++
++# --------------------------------------------------------------------------
++class WikiLookupYear(unittest.TestCase):
++    """A remake must not land on the original's article."""
++
++    PAGES = ["Superman (1978 film)", "Superman (2025 film)", "Superman"]
++
++    def _patch(self, entities=None):
++        pages = self.PAGES
++
++        def search(url, params=None, headers=None):
++            if params and params.get("list") == "search":
++                return {"query": {"search": [{"title": p} for p in pages]}}
++            return {}
++        return _Patch(_get_json=search, _page_qid=lambda pt: None,
++                      _entity=lambda q: None, VALIDATE_URLS=False)
++
++    def test_year_suffixed_article_wins(self):
++        with self._patch():
++            url, pt, qid, ok = mf.wiki_lookup("Superman", True, year=2025)
++        self.assertEqual(pt, "Superman (2025 film)")
++        self.assertTrue(ok)
++
++    def test_original_article_when_that_year_is_asked_for(self):
++        with self._patch():
++            _, pt, _, ok = mf.wiki_lookup("Superman", True, year=1978)
++        self.assertEqual(pt, "Superman (1978 film)")
++        self.assertTrue(ok)
++
++    def test_wrong_year_only_is_kept_but_flagged(self):
++        self.PAGES = ["Superman (1978 film)"]
++        try:
++            with self._patch():
++                _, pt, _, ok = mf.wiki_lookup("Superman", True, year=2025)
++            self.assertEqual(pt, "Superman (1978 film)")
++            self.assertFalse(ok)          # caller flags it for review
++        finally:
++            self.PAGES = WikiLookupYear.PAGES
++
++    def test_no_year_behaves_as_before(self):
++        with self._patch():
++            _, pt, _, ok = mf.wiki_lookup("Superman", True)
++        self.assertEqual(pt, "Superman (1978 film)")
++        self.assertTrue(ok)
++
++
++# --------------------------------------------------------------------------
++class YearSpan(unittest.TestCase):
++    def test_series_run_covers_every_year_in_it(self):
++        ent = mk("Q1", "Show", [FILM])
++        ent["claims"]["P580"] = [_time_claim(2019)]
++        ent["claims"]["P582"] = [_time_claim(2023)]
++        self.assertEqual(mf._entity_year_span(ent), (2019, 2023))
++        self.assertTrue(mf._year_fits(ent, 2022))
++        self.assertFalse(mf._year_fits(ent, 2015))
++
++    def test_undated_item_is_never_rejected(self):
++        self.assertIsNone(mf._year_fits(mk("Q1", "Upcoming", [FILM]), 2026))
++
++    def test_a_films_single_date_collapses_to_one_year(self):
++        self.assertEqual(mf._entity_year_span(mk("Q1", "F", [FILM], year=2025)),
++                         (2025, 2025))
++
++
++# --------------------------------------------------------------------------
++class WikidataSocialsYear(unittest.TestCase):
++    """The socials on the row come from the item, so the item must be the right
++    year's title."""
++
++    def _entities(self):
++        return {
++            "Q_OLD": mk("Q_OLD", "Superman", [FILM], year=1978,
++                        extra={"P2003": ["superman1978"]}),
++            "Q_NEW": mk("Q_NEW", "Superman", [FILM], year=2025,
++                        extra={"P2003": ["superman2025"]}),
++        }
++
++    def test_right_years_item_supplies_the_handles(self):
++        ents = self._entities()
++        with _Patch(_search_candidates=lambda t, limit=6: ["Q_OLD", "Q_NEW"],
++                    **_wire(ents)):
++            meta = mf.wikidata_meta("Superman", is_movie=True, year=2025)
++        self.assertEqual(meta.get("instagram_user"), "superman2025")
++        self.assertNotIn("_wikidata_year_note", meta)
++
++    def test_supplied_qid_from_the_wrong_year_is_replaced(self):
++        ents = self._entities()
++        with _Patch(_search_candidates=lambda t, limit=6: ["Q_OLD", "Q_NEW"],
++                    **_wire(ents)):
++            meta = mf.wikidata_meta("Superman", qid="Q_OLD", is_movie=True, year=2025)
++        self.assertEqual(meta.get("instagram_user"), "superman2025")
++
++    def test_only_wrong_year_available_is_kept_but_flagged(self):
++        ents = {"Q_OLD": self._entities()["Q_OLD"]}
++        with _Patch(_search_candidates=lambda t, limit=6: ["Q_OLD"], **_wire(ents)):
++            meta = mf.wikidata_meta("Superman", is_movie=True, year=2025)
++        self.assertEqual(meta.get("instagram_user"), "superman1978")
++        self.assertIn("_wikidata_year_note", meta)
++
++    def test_no_year_behaves_as_before(self):
++        ents = self._entities()
++        with _Patch(_search_candidates=lambda t, limit=6: ["Q_OLD", "Q_NEW"],
++                    **_wire(ents)):
++            meta = mf.wikidata_meta("Superman", is_movie=True)
++        self.assertEqual(meta.get("instagram_user"), "superman1978")
++
++
++# --------------------------------------------------------------------------
++class GameEntityPicking(unittest.TestCase):
++    """Tightened fallback + release-year disambiguation for video games."""
++
++    def setUp(self):
++        mf._CACHE.clear()
++
++    def _run(self, entities, order, year_hint=""):
++        off = dict(youtube_channel=lambda n: {},
++                   verify_socials=lambda m, t=None, reject_foreign=False: None,
++                   _resolve_metacritic_game=lambda t, candidate=None: "",
++                   fetch_metacritic_game=lambda u: {},
++                   wiki_lookup_game=lambda t, year=None: (None, None, None, True),
++                   imdb_suggest_game=lambda t, year=None: (None, True))
++        with _Patch(_search_candidates=lambda t, limit=8: order,
++                    **dict(_wire(entities), **off)):
++            return mf.fetch_game("Doom", year_hint=year_hint)
++
++    def test_release_year_picks_the_reboot(self):
++        ents = {"Q93": mk("Q93", "Doom", [GAME], year=1993,
++                          extra={"P2003": ["doom1993"]}),
++                "Q16": mk("Q16", "Doom", [GAME], year=2016,
++                          extra={"P2003": ["doom2016"]})}
++        meta = self._run(ents, ["Q93", "Q16"], year_hint="2016-05-13")
++        self.assertEqual(meta.get("instagram_user"), "doom2016")
++
++    def test_differently_named_game_is_no_longer_the_fallback(self):
++        ents = {"QX": mk("QX", "Quake", [GAME], year=1996,
++                         extra={"P2003": ["quake"]})}
++        meta = self._run(ents, ["QX"])
++        self.assertNotIn("instagram_user", meta)   # used to inherit Quake's
++
++    def test_wrong_year_only_is_kept_but_flagged(self):
++        ents = {"Q93": mk("Q93", "Doom", [GAME], year=1993,
++                          extra={"P2003": ["doom1993"]})}
++        meta = self._run(ents, ["Q93"], year_hint="2016")
++        self.assertEqual(meta.get("instagram_user"), "doom1993")
++        self.assertTrue(any("Social handles" in n for n in meta.get("_year_notes", [])))
++
++
++# --------------------------------------------------------------------------
++class GameFallbacks(unittest.TestCase):
++    """Wikipedia and IMDb no longer depend on Wikidata alone."""
++
++    def setUp(self):
++        mf._CACHE.clear()
++
++    def test_imdb_suggest_game_filters_to_video_games_and_year(self):
++        d = {"d": [{"id": "tt0001", "l": "Doom", "qid": "movie", "y": 2005},
++                   {"id": "tt0002", "l": "Doom", "qid": "videoGame", "y": 1993},
++                   {"id": "tt0003", "l": "Doom", "qid": "videoGame", "y": 2016}]}
++        with _Patch(_get_json=lambda url, params=None, headers=None: d):
++            item, ok = mf.imdb_suggest_game("Doom", year=2016)
++            self.assertEqual(item["id"], "tt0003")
++            self.assertTrue(ok)
++            item, ok = mf.imdb_suggest_game("Doom", year=2099)
++            self.assertEqual(item["id"], "tt0002")   # kept...
++            self.assertFalse(ok)                     # ...and flagged
++
++    def test_imdb_suggest_game_ignores_a_different_title(self):
++        d = {"d": [{"id": "tt0009", "l": "Doom Eternal", "qid": "videoGame", "y": 2020}]}
++        with _Patch(_get_json=lambda url, params=None, headers=None: d):
++            self.assertEqual(mf.imdb_suggest_game("Doom"), (None, True))
++
++    def test_game_name_match_ranks_exact_over_prefix(self):
++        exact = mk("Q1", "Doom", [GAME])
++        prefix = mk("Q2", "Doom Eternal", [GAME])
++        other = mk("Q3", "Quake", [GAME])
++        with _Patch(**_wire({"Q1": exact, "Q2": prefix, "Q3": other})):
++            self.assertEqual(mf._game_name_match(mf._entity("Q1"), "Doom"), 2)
++            self.assertEqual(mf._game_name_match(mf._entity("Q2"), "Doom"), 1)
++            self.assertEqual(mf._game_name_match(mf._entity("Q3"), "Doom"), 0)
++
++
++# --------------------------------------------------------------------------
++class MetacriticRottenTomatoesCandidateYear(unittest.TestCase):
++    """A curated URL from another year no longer short-circuits the lookup."""
++
++    def test_year_page_beats_a_curated_wrong_year_url(self):
++        exists = {"https://www.metacritic.com/movie/superman-2025",
++                  "https://www.metacritic.com/movie/superman-1978"}
++        with _Patch(VALIDATE_URLS=True,
++                    _url_status=lambda u: 200 if u.replace("http://", "https://").rstrip("/") in exists else 404):
++            got = mf.resolve_metacritic(
++                "Superman", True, candidate="http://www.metacritic.com/movie/superman-1978",
++                curated=True, year=2025)
++        self.assertEqual(got, "http://www.metacritic.com/movie/superman-2025/")
++
++    def test_curated_url_kept_and_flagged_when_no_year_page_exists(self):
++        notes = []
++        with _Patch(VALIDATE_URLS=True, _url_status=lambda u: 200 if "superman-1978" in u else 404):
++            got = mf.resolve_metacritic(
++                "Superman", True, candidate="http://www.metacritic.com/movie/superman-1978",
++                curated=True, year=2025, notes=notes)
++        self.assertEqual(got, "http://www.metacritic.com/movie/superman-1978")
++        self.assertTrue(notes and notes[0].startswith("Metacritic"))
++
++    def test_rt_year_page_beats_a_curated_wrong_year_url(self):
++        exists = {"https://www.rottentomatoes.com/m/superman_2025"}
++        with _Patch(VALIDATE_URLS=True,
++                    _url_status=lambda u: 200 if u.replace("http://", "https://").rstrip("/") in exists else 404):
++            got = mf.resolve_rottentomatoes(
++                "Superman", True, candidate="http://www.rottentomatoes.com/m/superman_1978",
++                curated=True, year=2025)
++        self.assertEqual(got, "http://www.rottentomatoes.com/m/superman_2025")
++
++    def test_slug_year_is_read_from_the_last_segment_only(self):
++        self.assertEqual(mf._slug_year("http://www.rottentomatoes.com/m/superman_2025"), 2025)
++        self.assertEqual(mf._slug_year("http://www.metacritic.com/movie/superman-2025/"), 2025)
++        self.assertIsNone(mf._slug_year("http://www.metacritic.com/movie/superman"))
++        self.assertIsNone(mf._slug_year("http://www.rottentomatoes.com/m/blade_runner_2049_sequel"))
++
++
++class ForeignHandleMarkers(unittest.TestCase):
++    """The band/VEVO guard now runs on games too, so 'band' inside a longer
++    word must not read as a band account."""
++
++    def test_band_suffix_is_still_rejected(self):
++        self.assertTrue(mf._handle_foreign_to_title("crawlersband", "Crawlers"))
++
++    def test_publisher_handles_containing_band_are_kept(self):
++        for h in ("bandainamcous", "bandcampgame", "contrabandgame"):
++            self.assertFalse(mf._handle_foreign_to_title(h, "Whatever"), h)
++
++    def test_marker_in_the_title_itself_is_allowed(self):
++        self.assertFalse(mf._handle_foreign_to_title("thebandofficial", "The Band"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
