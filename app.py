@@ -24,7 +24,7 @@ except Exception:  # keep the app running even if the module is missing
     def fetch_person(name, qid=None, profession=""):
         return {}
 
-    def fetch_game(name):
+    def fetch_game(name, qid=None, year_hint=""):
         return {}
 
     def fetch_brand(name):
@@ -1678,6 +1678,37 @@ def _read_upload(src):
     return df
 
 
+def _release_hint(src, lower_cols=None):
+    """The release date on a row / metadata dict, as a year hint for discovery.
+    Video games are as reboot-heavy as films ('Doom' 1993 vs 2016), so the same
+    release-date-first rule the movie/TV path uses applies to them."""
+    if not src:
+        return ''
+    for key in ('released_on', 'street_date'):
+        col = (lower_cols or {}).get(key, key)
+        v = str((src.get(col) if hasattr(src, 'get') else '') or '').strip()
+        if v and v.lower() != 'nan':
+            return v[:10]
+    return ''
+
+
+_YEAR_NOTE_COLUMNS = (
+    ('Wikipedia', 'wikipedia_page'),
+    ('Metacritic', 'metacritic'),
+    ('Rotten Tomatoes', 'rottentomatoes'),
+    ('IMDb', 'imdb_id'),
+    ('Social handles', 'instagram_user'),
+)
+
+
+def _YEAR_NOTE_COLUMN(note):
+    """Which column a release-year warning belongs against."""
+    for prefix, col in _YEAR_NOTE_COLUMNS:
+        if str(note or '').startswith(prefix):
+            return col
+    return 'released_on'
+
+
 def _merge_meta(base_meta, title, auto_fetch, is_movie=True):
     """Overlay auto-discovered metadata under any explicit metadata.
     Explicit values always win; auto-discovery only fills missing/blank fields.
@@ -1919,7 +1950,7 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
                 prof = (_row_profession(r) or default_profession) if kind_r == 'talent' else ''
                 if auto_fetch:
                     disc = dict((fetch_person(t, profession=prof) if kind_r == 'talent'
-                                 else fetch_game(t)) or {})
+                                 else fetch_game(t, year_hint=_release_hint(r))) or {})
                     for k, v in r.items():
                         if v not in (None, ''):
                             disc[k] = v
@@ -2038,7 +2069,8 @@ def build_rows_from_titles(data, max_titles=None, progress=None):
             # publisher = a single DAR row per publication, no twin
             out.append(make_row(title, False, '', metadata, publisher=True))
         elif kind == 'game':
-            metadata = dict(fetch_game(title) or {}) if auto_fetch else {}
+            metadata = dict(fetch_game(
+                title, year_hint=_release_hint(base_meta)) or {}) if auto_fetch else {}
             for k, v in (base_meta or {}).items():
                 if v not in (None, ''):
                     metadata[k] = v
@@ -2544,7 +2576,8 @@ def api_lookup():
         row = make_row(title, False, '', dict(meta), talent=True)
         return jsonify({'discovered': meta, 'row': row})
     if 'game' in kind:
-        meta = fetch_game(title)
+        meta = fetch_game(title, year_hint=(request.args.get('released_on', '')
+                                            or request.args.get('year', '')))
         row = make_row(title, False, '', dict(meta), game=True)
         return jsonify({'discovered': meta, 'row': row})
     is_movie = 'tv' not in kind
@@ -3900,7 +3933,8 @@ def build_review(src, auto_fetch=True, progress=None):
         sub = _sub_parts(r.get(lower_cols.get('title_sub_category', '')))
 
         if is_game:
-            meta = dict(fetch_game(t) or {}) if auto_fetch else {}
+            meta = dict(fetch_game(
+                t, year_hint=_release_hint(r, lower_cols)) or {}) if auto_fetch else {}
             # manual sub lines fill discovery gaps (developer / platforms)
             if not meta.get('developer') and sub.get('Developer'):
                 meta['developer'] = sub['Developer']
@@ -4006,6 +4040,16 @@ def build_review(src, auto_fetch=True, progress=None):
                 row=i + 2, title=t, column='imdb_id', status='Mismatch',
                 current=str(r.get(lower_cols.get('imdb_id', ''), '') or ''),
                 suggested=_imdb_note))
+        # date-first Wikipedia / Wikidata socials / Metacritic / RT: the value
+        # is kept (it is the best match we have) but the reviewer is told it
+        # could not be confirmed against the release-date column
+        for _note_txt in meta.pop('_year_notes', []) or []:
+            _col = _YEAR_NOTE_COLUMN(_note_txt)
+            findings.append(dict(
+                row=i + 2, title=t, column=lower_cols.get(_col, _col),
+                status='Mismatch',
+                current=str(r.get(lower_cols.get(_col, ''), '') or ''),
+                suggested=_note_txt))
 
         exp_net = str(meta.get('network') or
                       r.get(lower_cols.get('network', ''), '') or '').strip()

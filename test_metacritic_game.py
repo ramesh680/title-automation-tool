@@ -227,7 +227,11 @@ class SourcingPolicyTests(unittest.TestCase):
             _claim_values=fake_claim_values,
             _labels=lambda qids: labels,
             youtube_channel=lambda name: {},
-            verify_socials=lambda meta: None,
+            verify_socials=lambda meta, title=None, reject_foreign=False: None,
+            # the Wikipedia / IMDb fallbacks are exercised in
+            # test_year_aware_metadata; here they must stay off the network
+            wiki_lookup_game=lambda title, year=None: (None, None, None, True),
+            imdb_suggest_game=lambda title, year=None: (None, True),
             _resolve_metacritic_game=lambda title, candidate=None:
                 "https://www.metacritic.com/game/agefield-high-rock-the-school/",
             fetch_metacritic_game=lambda url: {

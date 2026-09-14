@@ -47,3 +47,50 @@ Applied to titles, talent (`fetch_person`) and games.
 ## Verification
 
 23 unit tests (mocked HTTP) cover: slug building (punctuation, `&`, accents), guess-404 dropped, verified fallback found, curated kept/dropped correctly, Wikidata end-time/deprecated/preferred filtering, dead-account removal, fail-open behavior, and the `VALIDATE_URLS=0` kill switch. All pass; the module compiles clean.
+
+---
+
+## Release-date-first, extended (Sep 2026)
+
+Previously the year in the release-date column steered only **IMDb**,
+**Metacritic** and **Rotten Tomatoes**. Wikipedia and the Wikidata item — the
+item that supplies the row's **social handles** — were picked with no year check
+at all, so a remake could take the original's article and the original's
+Instagram/X/Facebook. Video games ignored the release date entirely.
+
+### Movies & TV
+
+* `wiki_lookup()` now ranks same-named articles by year: the disambiguator
+  (`Superman (2025 film)`) first, then the item's own P577/P580 dates. It also
+  runs a year-qualified search query, and returns a `year_ok` flag.
+* `wikidata_meta(year=...)` prefers the item dated to the release year. A
+  supplied qid that is the right *kind* but the wrong *year* is replaced when a
+  better item exists.
+* `_enrich_by_tt()` takes the sheet's year and uses it for Wikipedia, Wikidata,
+  Metacritic and Rotten Tomatoes — instead of deriving it from `released_on`,
+  which is blank for upcoming titles and is sometimes a festival date.
+* The no-IMDb-id path of `fetch_metadata()` now resolves a Wikipedia article
+  too (it previously shipped a blank cell) and passes the year to Wikidata.
+* A curated Metacritic/RT URL whose slug carries a *different* year no longer
+  short-circuits the lookup: the year-suffixed slug is tried first.
+
+### Video games
+
+* `fetch_game(year_hint=...)` — reboots (`Doom` 1993 vs 2016) resolve to the
+  right item.
+* The fallback is tightened: a search hit whose name does not match is never
+  used, so another game's developer/publisher/handles cannot reach the row.
+* Wikipedia falls back to `wiki_lookup_game()` and IMDb to
+  `imdb_suggest_game()` when Wikidata has no sitelink / no P345 — which is the
+  common case for games.
+* `verify_socials()` is finally called **with the title**, so wrong-owner
+  handles are rejected as they are for films. `_handle_foreign_to_title()` was
+  hardened so publisher handles containing "band" (`bandainamco`) are kept.
+
+### When the year cannot be confirmed
+
+The value is **kept** (it is the best match available) and a note is attached,
+surfaced in the Manual File Review as a `Mismatch` finding against the relevant
+column. Nothing is silently blanked.
+
+Tests: `test_year_aware_metadata.py`.
