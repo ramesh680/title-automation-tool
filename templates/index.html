@@ -220,7 +220,7 @@
                     </label>
                 </div>
 
-                <div class="form-group">
+                <div class="form-group" id="geminiTogglePanel" style="display:none">
                     <label class="toggle">
                         <input type="checkbox" id="geminiCompare"><span class="slider"></span>
                         <span class="t-txt">Add Gemini comparison columns
@@ -232,7 +232,7 @@
                     </label>
                 </div>
 
-                <div class="form-group" id="geminiSheetPanel">
+                <div class="form-group" id="geminiSheetPanel" style="display:none">
                     <div style="border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:14px">
                         <div style="font-weight:600;margin-bottom:4px">
                             Gemini comparison via Google Sheets
@@ -746,6 +746,9 @@
         document.addEventListener('DOMContentLoaded', function () {
             const box = document.getElementById('geminiCompare');
             if (!box) return;
+            // Gemini comparison UI is hidden; skip the status probe entirely.
+            const geminiPanel = document.getElementById('geminiTogglePanel');
+            if (!geminiPanel || geminiPanel.style.display === 'none') return;
             fetch('/api/gemini_status').then(r => r.json()).then(s => {
                 if (s && s.available) {
                     const hint = document.getElementById('geminiHint');
