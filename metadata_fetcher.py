@@ -1,7 +1,17 @@
 """
-metadata_fetcher.py (v3)
-------------------------
+metadata_fetcher.py (v3.1)
+--------------------------
 Auto-discover title metadata by layering several sources.
+
+v3.1 CHANGE -- OFFICIAL YOUTUBE CHANNELS ONLY:
+  youtube_channel() previously accepted any channel whose NAME looked like the
+  title, which let fan / clip / reaction channels reach the
+  youtube_channel_username column. Every candidate is now additionally scored by
+  youtube_validator.YouTubeChannelValidator (verification badge, "official"
+  wording, subscriber count, fan/clip/reaction disqualifiers) and only channels
+  that clear the official threshold are returned. Set YOUTUBE_OFFICIAL_ONLY=0 to
+  restore the old behaviour; if youtube_validator.py is missing the module still
+  imports and simply skips the extra filtering.
 
 RESOLUTION (finding the right title):
   * IMDb suggestion API (keyless) -> exact tt id; handles apostrophes, colons
@@ -59,6 +69,18 @@ except Exception:
 
 log = logging.getLogger(__name__)
 
+# ---- official-YouTube-channel filter (v3.1) --------------------------------
+# Imported defensively: if youtube_validator.py has not been deployed yet the
+# module still loads and the extra filtering is simply skipped, so a partial
+# deploy can never take the tool down.
+try:
+    from youtube_validator import YouTubeChannelValidator
+    _YT_VALIDATOR = YouTubeChannelValidator()
+except Exception as _e:  # noqa: BLE001
+    _YT_VALIDATOR = None
+    logging.getLogger(__name__).warning(
+        "youtube_validator unavailable (%s) - official-channel filtering is OFF", _e)
+
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
 OMDB_API_KEY = os.getenv("OMDB_API_KEY", "")
 YOUTUBE_API_KEY = (os.getenv("YOUTUBE_API_KEY", "") or "").strip('"')
@@ -68,9 +90,16 @@ try:
 except ValueError:
     TIMEOUT = 10
 
+#: Drop YouTube channels that do not look like the title's OFFICIAL channel.
+#: Set YOUTUBE_OFFICIAL_ONLY=0 to return every name-matching channel (the
+#: pre-v3.1 behaviour) without redeploying any code.
+YOUTUBE_OFFICIAL_ONLY = os.getenv("YOUTUBE_OFFICIAL_ONLY", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+
 TMDB = "https://api.themoviedb.org/3"
 OMDB = "https://www.omdbapi.com/"
 YT_SEARCH = "https://www.googleapis.com/youtube/v3/search"
+YT_CHANNELS = "https://www.googleapis.com/youtube/v3/channels"
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 ENTITYDATA = "https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
@@ -2612,6 +2641,77 @@ def _yt_own_channel_matches(channel_title, title):
     return False
 
 
+_YT_CHANNEL_DETAIL_CACHE = {}
+
+
+def _yt_channel_details(channel_id):
+    """snippet + statistics for a channel id, so the official-channel filter can
+    see the description and the subscriber count (search.list returns neither).
+    One cheap channels.list call (1 quota unit), cached for the process lifetime.
+    Returns {} on any failure -- the filter then scores on the search snippet
+    alone rather than losing the candidate."""
+    if not channel_id or not YOUTUBE_API_KEY:
+        return {}
+    if channel_id in _YT_CHANNEL_DETAIL_CACHE:
+        return _YT_CHANNEL_DETAIL_CACHE[channel_id]
+    detail = {}
+    data = _get_json(YT_CHANNELS, {"part": "snippet,statistics,status",
+                                   "id": channel_id, "key": YOUTUBE_API_KEY})
+    for item in (data or {}).get("items", []) or []:
+        snip = item.get("snippet", {}) or {}
+        stats = item.get("statistics", {}) or {}
+        subs = stats.get("subscriberCount")
+        try:
+            subs = int(subs) if subs is not None else 0
+        except (TypeError, ValueError):
+            subs = 0
+        detail = {
+            "channel_id": channel_id,
+            "title": snip.get("title") or "",
+            "description": snip.get("description") or "",
+            "custom_url": snip.get("customUrl") or "",
+            "subscriber_count": subs,
+            "hidden_subscriber_count": bool(stats.get("hiddenSubscriberCount")),
+        }
+        break
+    _YT_CHANNEL_DETAIL_CACHE[channel_id] = detail
+    return detail
+
+
+def _yt_channel_is_official(channel_id, snippet, title):
+    """True when a name-matching channel also looks like the title's OFFICIAL
+    channel rather than a fan / clips / reaction channel.
+
+    Delegates the scoring to youtube_validator.YouTubeChannelValidator. Fails
+    OPEN in two cases, so the filter can never silently empty the column:
+      * YOUTUBE_OFFICIAL_ONLY is switched off, or
+      * youtube_validator.py is not deployed / raised.
+    """
+    if not YOUTUBE_OFFICIAL_ONLY or _YT_VALIDATOR is None:
+        return True
+    snippet = snippet or {}
+    channel = {
+        "channel_id": channel_id,
+        "title": snippet.get("title") or "",
+        "description": snippet.get("description") or "",
+        "url": "http://www.youtube.com/channel/" + str(channel_id),
+        "subscriber_count": 0,
+        "is_verified": False,
+    }
+    detail = _yt_channel_details(channel_id)
+    if detail:
+        channel["title"] = detail.get("title") or channel["title"]
+        channel["description"] = detail.get("description") or channel["description"]
+        channel["custom_url"] = detail.get("custom_url") or ""
+        channel["subscriber_count"] = detail.get("subscriber_count") or 0
+    try:
+        return bool(_YT_VALIDATOR.is_official(channel, title=title))
+    except Exception as e:  # noqa: BLE001
+        log.warning("youtube_validator failed for %s (%s) - keeping the channel",
+                    channel_id, e)
+        return True
+
+
 def youtube_channel(title, limit=5):
     """The title's OWN YouTube channel(s) via the YouTube Data API (optional key).
 
@@ -2622,9 +2722,14 @@ def youtube_channel(title, limit=5):
     can carry them all in a single ``youtube_channel_username`` cell, one per
     row.
 
-    A hit is only trusted when the channel is named like the title (optionally
-    plus a suffix such as "Movie" or "Official"), so a same-named band, artist
-    or topic channel is not picked up.
+    A hit is only trusted when BOTH checks pass:
+      1. the channel is NAMED like the title (optionally plus a suffix such as
+         "Movie" or "Official"), so a same-named band, artist or topic channel
+         is not picked up; and
+      2. (v3.1) it clears the OFFICIAL-channel score in youtube_validator --
+         verification badge / official wording / subscriber scale, with fan,
+         clips, reaction, tribute and parody channels disqualified outright.
+    Set YOUTUBE_OFFICIAL_ONLY=0 to skip check 2.
     """
     if not YOUTUBE_API_KEY or not title:
         return {}
@@ -2636,6 +2741,10 @@ def youtube_channel(title, limit=5):
         snip = item.get("snippet", {}) or {}
         cid = snip.get("channelId") or (item.get("id", {}) or {}).get("channelId")
         if not cid or not _yt_own_channel_matches(snip.get("title"), title):
+            continue
+        if not _yt_channel_is_official(cid, snip, title):
+            log.info("youtube_channel: dropped %r (%s) for %r - not an official channel",
+                     snip.get("title"), cid, title)
             continue
         url = "http://www.youtube.com/channel/" + cid
         if url not in urls:
