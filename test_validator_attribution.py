@@ -34,8 +34,11 @@ def run(rows):
     return {(f['column'], f['severity']): f['message'] for f in summary['failures']}
 
 
+# is_sequel marks these rows as ones whose accounts an earlier title already
+# used -- the only rows the window applies to. test_attribution_scope.py covers
+# what happens when a row does NOT qualify.
 BASE = dict(title_category='Movies', released_on='2026-11-20', genre='Action',
-            primary_genre='Action', companies='Pristine Brand')
+            primary_genre='Action', companies='Pristine Brand', is_sequel='yes')
 
 print("\n-- with a trailer_release_date column --")
 f = run([dict(BASE, title='Movie A - DAR', trailer_release_date='2026-04-13',

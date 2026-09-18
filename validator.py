@@ -619,22 +619,36 @@ def _chk_attribution_window(val, row, rule):
     if v == "":
         return None, ""          # blank is a gap, not a bad value
 
+    # The window applies only where an EARLIER title already used these
+    # accounts. Offline, that can be established two ways: the sheet says so,
+    # or another row in the same sheet -- released earlier -- carries the same
+    # handle. When neither answers, a MISSING window is not a finding: most
+    # films are standalone and correctly carry none. A window that IS present
+    # is still checked for shape and date below, whatever the answer.
+    qualified = AW.qualifies(row)
+    if qualified is None:
+        qualified = bool(row.get("__attr_batch_qualified"))
+
     trailer = AW.trailer_date_from(row)
     expected = AW.window_date(trailer) if trailer else ""
     missing = AW.unstamped_lines(v)
     carried = AW.date_of(v)
 
     if missing:
+        if not qualified:
+            return None, ""      # standalone film: no window is correct
         if expected:
             return SEV_FAIL, (
-                "Attribution window missing: a Movies DAR row must end in "
-                "'|%s' (one month before the %s trailer). Offending line: %s"
+                "Attribution window missing: this title's accounts were already "
+                "used by an earlier title, so it must end in '|%s' (one month "
+                "before the %s trailer). Offending line: %s"
                 % (expected, trailer, missing[0]))
         return SEV_WARN, rule.get(
             "message",
-            "Attribution window missing: a Movies DAR row's social accounts "
-            "should end in '|YYYY-MM-DD', one month before the official "
-            "trailer. Add a trailer_release_date column to check the date.")
+            "Attribution window missing: this title's accounts were already "
+            "used by an earlier title, so they should end in '|YYYY-MM-DD', one "
+            "month before the official trailer. Add a trailer_release_date "
+            "column to check the date.")
 
     if not carried:
         # every line has a suffix, but they disagree with each other
@@ -911,11 +925,20 @@ def validate_workbook(file_storage, rules=None):
             h = _s(ws.cell(1, c).value)
             if h:
                 headers[h.lower()] = c
+        # which rows on this sheet share an account with an earlier-released
+        # row -- the offline evidence that an attribution window is required
+        _sheet_rows = []
+        for rr in range(2, ws.max_row + 1):
+            _sheet_rows.append({h: ws.cell(rr, c).value for h, c in headers.items()})
+        _batch_qual = AW.batch_qualification(_sheet_rows)
+
         for r in range(2, ws.max_row + 1):
             total_rows += 1
             row = {}
             for hlow, c in headers.items():
                 row[hlow] = ws.cell(r, c).value
+            if _batch_qual.get(r - 2):
+                row["__attr_batch_qualified"] = True
             flagged = set()
             for col, sev, msg in _row_rules(row, headers, ws.title):
                 c = (col or "").lower()

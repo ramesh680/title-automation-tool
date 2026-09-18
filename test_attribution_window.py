@@ -51,9 +51,13 @@ check("no trailer field", app.trailer_date_from({'released_on': '2026-11-20'}), 
 
 # ------------------------------------------------------------------- the row
 print("\n-- create_row: the Hunger Games example --")
+# The window applies only to a title whose accounts an EARLIER title already
+# used, so the fixture says so explicitly. test_attribution_scope.py owns the
+# question of when a row qualifies; this file is about the stamping itself.
 META = {
     'released_on': '2026-11-20',
     'trailer_released_on': '2026-04-13',
+    'attribution_shared_handle': True,
     'facebook_page': 'http://www.facebook.com/TheHungerGamesMovie',
     'twitter_handle': 'TheHungerGames',
     'instagram_user': 'thehungergames',
@@ -105,6 +109,13 @@ check("an existing date is replaced, not doubled",
 check("blank cell stays blank",
       app.create_row(TITLE + ' - DAR', True, 'Lionsgate',
                      dict(META, tiktok_user=''))['tiktok_user'], '')
+
+print("\n-- a title that does not qualify is never stamped --")
+check("standalone film left bare",
+      app.create_row(TITLE + ' - DAR', True, 'Lionsgate',
+                     {k: v for k, v in META.items()
+                      if k != 'attribution_shared_handle'})['twitter_handle'],
+      'TheHungerGames')
 
 print("\n-- no trailer date -> flagged, not silently skipped --")
 nodate = dict(META)

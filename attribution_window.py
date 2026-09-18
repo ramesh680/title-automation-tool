@@ -3,12 +3,13 @@ attribution_window.py
 ---------------------
 The attribution-window rule, in ONE place.
 
-Ops rule (Sep 2026): when a movie drops a second version of its trailer on the
-same Facebook / Instagram / TikTok / X accounts the first one ran on, the DAR
-row's social cells carry an "attribution window" -- the date from which that
-account's activity is attributed to the title. The window opens ONE CALENDAR
-MONTH before the OFFICIAL trailer's release and is written as a '|YYYY-MM-DD'
-suffix on the handle / URL:
+Ops rule (Sep 2026): a franchise reuses its social accounts. The @Avengers
+handles carried four films; when a new instalment's trailer drops on accounts
+an EARLIER title already used, there is no way to tell which title's activity
+is which. The attribution window is the date from which that account's
+activity belongs to the new title. It opens ONE CALENDAR MONTH before the new
+instalment's OFFICIAL trailer and is written as a '|YYYY-MM-DD' suffix on the
+handle / URL:
 
     The Hunger Games: Sunrise on the Reaping   released 2026-11-20
     official trailer                           2026-04-13
@@ -18,7 +19,19 @@ suffix on the handle / URL:
     instagram_user    thehungergames|2026-03-13
     tiktok_user       hungergamesofficial|2026-03-13
 
-Scope: Movies only, DAR rows only, and ONLY the four columns above.
+Scope: Movies only, DAR rows only, ONLY the four columns above, and ONLY when
+the row QUALIFIES -- its accounts were already used by a previously released
+title. A standalone film, or the first film of a franchise, has nothing to
+separate and carries no window. Qualification is established by, in order:
+
+  1. an explicit attribution_window / is_sequel column on the sheet;
+  2. discovery: a TMDB collection sibling released earlier that shares one of
+     this title's handles (metadata key 'attribution_shared_handle');
+  3. the batch itself: another row in the same file, released earlier, that
+     carries the same handle.
+
+When none of the three can answer, qualification is UNKNOWN and no window is
+written -- the rule never guesses a date onto a film that may not need one.
 
 This module is imported by all three sections -- Generator and Review (app.py)
 and Validator (validator.py) -- so the rule cannot drift between them. It
@@ -161,6 +174,109 @@ def unstamped_lines(value):
     return [ln for ln in lines(value) if not SUFFIX_RE.search(ln)]
 
 
+# ------------------------------------------------------------- qualification
+# Columns an analyst can use to force the answer either way. A date value is
+# treated as "yes, and here is the window"; a plain yes/no just answers the
+# question.
+QUALIFY_KEYS = ('attribution_window', 'is_sequel', 'shares_handles')
+# set by discovery (metadata_fetcher) when a TMDB collection sibling released
+# earlier shares one of this title's handles
+DISCOVERY_KEY = 'attribution_shared_handle'
+
+_YES = ('y', 'yes', 't', 'true', '1', 'shared', 'sequel')
+_NO = ('n', 'no', 'f', 'false', '0', 'standalone', 'original')
+
+
+def _lower_map(meta):
+    try:
+        items = list(meta.items())
+    except AttributeError:
+        return {}
+    return {re.sub(r'[\s-]+', '_', str(k).strip().lower()): v for k, v in items}
+
+
+def qualifies(meta):
+    """Does this row need an attribution window?
+
+    True  -- its accounts were already used by an earlier title
+    False -- established that they were not
+    None  -- unknown; the caller must not write a window
+    """
+    lm = _lower_map(meta)
+    for k in QUALIFY_KEYS:
+        if k not in lm:
+            continue
+        v = lm[k]
+        if v is None or str(v).strip() == '' or str(v).strip().lower() in ('nan', 'none'):
+            continue
+        if iso_date(v):                      # a date answers 'yes' outright
+            return True
+        sv = str(v).strip().lower()
+        if sv in _YES:
+            return True
+        if sv in _NO:
+            return False
+    if DISCOVERY_KEY in lm and lm[DISCOVERY_KEY] is not None:
+        return bool(lm[DISCOVERY_KEY])
+    return None
+
+
+def handle_key(value):
+    """Identity of a social account, for comparing rows: no URL, no '@', no
+    attribution window, lower-cased. '' when the cell holds nothing usable."""
+    s = str(value if value is not None else '').strip()
+    if not s or s.lower() in ('nan', 'none'):
+        return ''
+    s = SUFFIX_RE.sub('', s).strip()
+    s = re.sub(r'^https?://', '', s, flags=re.I)
+    s = re.sub(r'^www\.', '', s, flags=re.I)
+    s = re.sub(r'^(facebook|twitter|x|instagram|tiktok)\.com/', '', s, flags=re.I)
+    s = s.split('?')[0].strip('/@').strip()
+    return s.lower()
+
+
+def row_handle_keys(row, columns=COLUMNS):
+    """Every account identity a row carries, as {column: {key, ...}}."""
+    out = {}
+    for col in columns:
+        keys = {handle_key(ln) for ln in lines(_lower_map(row).get(col, ''))}
+        keys.discard('')
+        if keys:
+            out[col] = keys
+    return out
+
+
+def batch_qualification(rows, released_key='released_on'):
+    """Which rows in a batch share an account with an EARLIER-released row.
+
+    Returns {index: True} for rows whose handles a previously released title
+    already used. Rows with no shared handle, and rows we cannot order by
+    release date, are simply absent -- absent means "unknown", never "no".
+    """
+    dated = []
+    for i, r in enumerate(rows):
+        lm = _lower_map(r)
+        rel = iso_date(lm.get(released_key)) or iso_date(lm.get('street_date'))
+        keys = set()
+        for ks in row_handle_keys(r).values():
+            keys |= ks
+        dated.append((i, rel, keys, strip_dar_suffix(lm.get('title', '')).lower()))
+
+    out = {}
+    for i, rel, keys, title in dated:
+        if not keys or not rel:
+            continue
+        for j, rel2, keys2, title2 in dated:
+            if j == i or not rel2 or not keys2:
+                continue
+            if title2 == title:          # the same film's own base/DAR twin
+                continue
+            if rel2 < rel and (keys & keys2):
+                out[i] = True
+                break
+    return out
+
+
 def apply_to_row(row, window, columns=COLUMNS):
     """Stamp the window onto a row's social columns, in place. Empty cells are
     left empty -- the rule adds a date, never a handle."""
@@ -172,9 +288,17 @@ def apply_to_row(row, window, columns=COLUMNS):
     return row
 
 
-def window_for(metadata, is_movie, is_dar):
-    """The window a row should carry, '' when the rule does not apply (not a
-    Movies DAR row, no trailer date known, or the rule is switched off)."""
+def window_for(metadata, is_movie, is_dar, qualified=None):
+    """The window a row should carry, '' when the rule does not apply.
+
+    It does not apply unless the row is a Movies DAR row, the rule is on, the
+    row QUALIFIES (its accounts were already used by an earlier title), and a
+    trailer date is known. `qualified` lets a caller supply an answer it worked
+    out from the batch; otherwise the metadata is asked.
+    """
     if not (ENABLED and is_movie and is_dar):
+        return ''
+    q = qualifies(metadata) if qualified is None else qualified
+    if q is not True:
         return ''
     return window_date(trailer_date_from(metadata))

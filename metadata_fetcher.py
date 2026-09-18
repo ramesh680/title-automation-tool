@@ -898,6 +898,70 @@ def _us_theatrical_date(details):
     return None
 
 
+def _social_key(v):
+    """Identity of a social account, for comparing two titles' handles."""
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"^https?://", "", s, flags=re.I)
+    s = re.sub(r"^www\.", "", s, flags=re.I)
+    s = re.sub(r"^(facebook|twitter|x|instagram|tiktok)\.com/", "", s, flags=re.I)
+    return s.split("?")[0].strip("/@").strip().lower()
+
+
+def _ext_social_keys(ext):
+    """The account identities a TMDB external_ids block carries."""
+    return {_social_key(ext.get(k)) for k in
+            ("facebook_id", "twitter_id", "instagram_id")} - {""}
+
+
+# how many earlier siblings of a franchise to check before giving up
+_COLLECTION_LOOKBACK = 8
+
+
+def _tmdb_shared_handle_with_earlier(details):
+    """Did a PREVIOUSLY RELEASED title already use this movie's accounts?
+
+    This is what the attribution window keys off (see attribution_window.py):
+    a franchise reuses its handles, so a new instalment's activity has to be
+    separated from the previous one's. A standalone film, or the first film of
+    a collection, shares nothing and needs no window.
+
+    Returns (True/False/None, sibling_title). None means we could not tell --
+    no TMDB collection, or no handles to compare -- and the caller must then
+    leave the question open rather than assume either way.
+    """
+    if not TMDB_API_KEY:
+        return None, ""
+    mine = _ext_social_keys(details.get("external_ids") or {})
+    if not mine:
+        return None, ""
+    coll = details.get("belongs_to_collection") or {}
+    cid = coll.get("id")
+    if not cid:
+        return False, ""        # no franchise at all -> nothing came before it
+    own_date = str(details.get("release_date") or "")[:10]
+    if not own_date:
+        return None, ""
+    data = _get_json(TMDB + "/collection/" + str(cid), {"api_key": TMDB_API_KEY})
+    if not data:
+        return None, ""
+    earlier = [p for p in (data.get("parts") or [])
+               if p.get("id") and p.get("id") != details.get("id")
+               and str(p.get("release_date") or "")[:10]
+               and str(p["release_date"])[:10] < own_date]
+    if not earlier:
+        return False, ""        # it IS the first film of the franchise
+    earlier.sort(key=lambda p: str(p.get("release_date"))[:10], reverse=True)
+    for part in earlier[:_COLLECTION_LOOKBACK]:
+        ext = _get_json(TMDB + "/movie/%s/external_ids" % part["id"],
+                        {"api_key": TMDB_API_KEY}) or {}
+        if mine & _ext_social_keys(ext):
+            return True, str(part.get("title") or "")
+    # the franchise exists but every earlier film used different accounts
+    return False, ""
+
+
 def _tmdb_trailer_date(details):
     """Publish date (YYYY-MM-DD) of the movie's OFFICIAL trailer.
 
@@ -936,6 +1000,13 @@ def _tmdb_details_meta(details, kind):
         trailer = _tmdb_trailer_date(details)
         if trailer:
             meta["trailer_released_on"] = trailer
+        # does the attribution window apply at all? Only when an earlier title
+        # already used these accounts (see attribution_window.qualifies).
+        shared, sibling = _tmdb_shared_handle_with_earlier(details)
+        if shared is not None:
+            meta["attribution_shared_handle"] = shared
+            if shared and sibling:
+                meta["attribution_shared_with"] = sibling
     rel = details.get("release_date") or details.get("first_air_date")
     if rel:
         meta["released_on"] = rel

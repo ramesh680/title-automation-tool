@@ -427,15 +427,22 @@ attribution_strip = _aw.strip_window
 attribution_stamp = _aw.stamp
 attribution_date_of = _aw.date_of
 apply_attribution_window = _aw.apply_to_row
+attribution_qualifies = _aw.qualifies
+attribution_handle_key = _aw.handle_key
+attribution_batch_qualification = _aw.batch_qualification
 
 
-def attribution_window_for(metadata, is_movie, is_dar):
-    """The window a row should carry, '' when the rule does not apply. Reads
-    ATTRIBUTION_WINDOW_ENABLED from this module so tests (and an operator at a
-    REPL) can flip the switch at runtime."""
+def attribution_window_for(metadata, is_movie, is_dar, qualified=None):
+    """The window a row should carry, '' when the rule does not apply.
+
+    The rule is NOT every Movies DAR row: it applies only where an earlier
+    title already used these accounts (a franchise reusing its handles). See
+    attribution_window.qualifies. Reads ATTRIBUTION_WINDOW_ENABLED from this
+    module so tests (and an operator at a REPL) can flip the switch at runtime.
+    """
     if not (ATTRIBUTION_WINDOW_ENABLED and is_movie and is_dar):
         return ''
-    return _aw.window_date(_aw.trailer_date_from(metadata))
+    return _aw.window_for(metadata, is_movie, is_dar, qualified=qualified)
 
 
 # ======================= TV Shows (BrandIngest schema) =======================
@@ -1669,15 +1676,23 @@ def create_row(title, is_movie, network="", metadata=None):
 
     # Attribution window (Sep 2026) -- Movies DAR rows only. Stamped LAST, so
     # url_managers and twitter_search_terms above keep the bare handle.
+    # the trailer date is not a schema column, so the built row would lose it --
+    # apply_batch_attribution_windows() needs it to stamp a row that only the
+    # batch can prove qualifies. Private key: dropped from every export.
+    _trailer = trailer_date_from(metadata)
+    if _trailer:
+        row['_trailer_released_on'] = _trailer
+
     _attr_window = attribution_window_for(metadata, is_movie, is_dar)
     if _attr_window:
         apply_attribution_window(row, _attr_window)
         row['_attribution_window'] = _attr_window
     elif (ATTRIBUTION_WINDOW_ENABLED and is_movie and is_dar
+            and attribution_qualifies(metadata) is True
             and any(str(row.get(c) or '').strip()
                     for c in ATTRIBUTION_WINDOW_COLUMNS)):
-        # the row has accounts to stamp but no trailer date was found -- say so
-        # rather than shipping an un-windowed DAR row in silence
+        # this row DOES need a window (an earlier title used these accounts)
+        # but no trailer date was found -- say so rather than shipping it bare
         row['_needs_review'] = True
         _ar = ('No official trailer date found -- attribution window not '
                'applied. Add a trailer_release_date column to set it manually.')
@@ -1941,6 +1956,46 @@ def _parallel_rows(items, worker, progress=None, parallel=True):
     return out
 
 
+def apply_batch_attribution_windows(rows):
+    """Stamp the attribution window on Movies DAR rows whose accounts an
+    EARLIER-RELEASED row in the same batch already used.
+
+    Discovery answers this per title via the TMDB collection, but a file often
+    carries the franchise itself -- Avengers 1..4 in one upload -- and that is
+    the most direct evidence there is: the same handle, on a title that came
+    out first. Rows already stamped (explicit column, or discovery) are left
+    alone; rows we cannot order by release date are left unstamped, because
+    unknown must never become a guessed date.
+    """
+    if not ATTRIBUTION_WINDOW_ENABLED:
+        return rows
+    movie_dar = [i for i, r in enumerate(rows)
+                 if 'movie' in str(r.get('title_category') or '').lower()
+                 and _is_dar_title(r.get('title'))]
+    if not movie_dar:
+        return rows
+    qual = attribution_batch_qualification(rows)
+    for i in movie_dar:
+        if not qual.get(i):
+            continue
+        row = rows[i]
+        if row.get('_attribution_window'):
+            continue                      # already stamped upstream
+        win = attribution_window_date(
+            row.get('_trailer_released_on') or trailer_date_from(row))
+        if win:
+            apply_attribution_window(row, win)
+            row['_attribution_window'] = win
+        elif any(str(row.get(c) or '').strip() for c in ATTRIBUTION_WINDOW_COLUMNS):
+            row['_needs_review'] = True
+            _ar = ('Shares social accounts with an earlier title in this file, '
+                   'so it needs an attribution window, but no trailer date was '
+                   'found. Add a trailer_release_date column.')
+            _prev = str(row.get('_review_reason') or '').strip()
+            row['_review_reason'] = (_prev + '; ' + _ar) if _prev else _ar
+    return rows
+
+
 def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
                            progress=None, default_kind='movie',
                            default_profession=''):
@@ -2014,6 +2069,7 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
 
         rows = _parallel_rows(records, _one_record, progress=progress,
                               parallel=auto_fetch)
+        rows = apply_batch_attribution_windows(rows)
     else:
         title_col = lower_cols.get('title') or df.columns[0]
         type_col = lower_cols.get('type') or lower_cols.get('title_category')
@@ -2070,6 +2126,7 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
 
         rows = _parallel_rows(specs, _one_spec, progress=progress,
                               parallel=auto_fetch)
+        rows = apply_batch_attribution_windows(rows)
     return rows
 
 
@@ -3510,6 +3567,11 @@ def build_review(src, auto_fetch=True, progress=None):
     df = _read_upload(src)
     lower_cols = {c.lower(): c for c in df.columns}
     records = df.to_dict('records')
+    # Attribution window: which rows in THIS file share an account with an
+    # earlier-released row. Computed once, offline, before any lookups -- it is
+    # the most direct evidence the rule has (see apply_batch_attribution_windows).
+    _batch_qual = attribution_batch_qualification(
+        [{str(k).lower(): v for k, v in r.items()} for r in records])
     findings, fills = [], {}
     rows_reviewed = cells_checked = 0
     total = len(records)
@@ -3759,16 +3821,25 @@ def build_review(src, auto_fetch=True, progress=None):
             meta['network'] = exp_net
         expected = make_row(t, is_movie, exp_net, meta)
 
-        # Attribution window for this row (Movies DAR only). Computed here
-        # rather than read off `expected`, because discovery may not have found
-        # the accounts the manual file already carries -- in which case the
-        # expected cells are blank and carry no suffix to compare against.
-        _attr_win = attribution_window_for(meta, is_movie, _is_dar_title(t))
+        # Attribution window for this row. It applies ONLY where an earlier
+        # title already used these accounts, so qualification is settled first:
+        # the sheet's own column, then discovery, then this file's own rows.
+        # Unknown stays unknown -- the Review never asks for a window it cannot
+        # justify. Computed here rather than read off `expected`, because
+        # discovery may not have found the accounts the manual file carries.
+        _row_meta = dict(meta)
+        _row_meta.update({str(k).lower(): v for k, v in r.items()
+                          if str(v or '').strip()})
+        _qual = attribution_qualifies(_row_meta)
+        if _qual is None and _batch_qual.get(i):
+            _qual = True
+        _attr_win = attribution_window_for(meta, is_movie, _is_dar_title(t),
+                                           qualified=_qual)
 
-        # Movies DAR row with accounts but no trailer date: the attribution
-        # window cannot be computed, so flag it instead of passing it silently.
+        # A row that DOES need a window but has no trailer date: say so rather
+        # than passing it silently.
         if (ATTRIBUTION_WINDOW_ENABLED and is_movie and _is_dar_title(t)
-                and not _attr_win):
+                and _qual is True and not _attr_win):
             _acc_col = next(
                 (lower_cols[c] for c in ATTRIBUTION_WINDOW_COLUMNS
                  if c in lower_cols and _review_norm(r.get(lower_cols[c]))), '')
