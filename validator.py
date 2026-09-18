@@ -31,12 +31,16 @@ FILL_FAIL = PatternFill("solid", fgColor="FFF4C7C3")   # soft red
 FILL_WARN = PatternFill("solid", fgColor="FFFFE8A3")   # soft amber
 FILL_HEAD = PatternFill("solid", fgColor="FF7C5CFF")   # brand violet
 
-# the attribution-window rule, shared verbatim with the Generator and the
-# Review so the three sections cannot drift apart (stdlib-only module)
-try:
-    import attribution_window as AW
-except Exception:  # fail soft: the attribution rules simply do not run
-    AW = None
+# The attribution-window rule, shared verbatim with the Generator and the
+# Review so the three sections cannot drift apart (stdlib-only module).
+#
+# Imported HARD, on purpose. This used to be a try/except that left AW = None,
+# and when attribution_window.py went missing from a deploy the attribution
+# checks quietly returned "pass" for every row and _is_dar fell back to its old
+# literal match -- a validator that reports no issues because it is not running
+# looks exactly like a clean file. A missing first-party module in our own repo
+# is a packaging bug, so it should stop the app at import instead.
+import attribution_window as AW
 
 APPROVED_CATEGORIES = {"movies", "tv shows"}
 # extend with the master Title Category list from the General ingest template
@@ -151,10 +155,7 @@ def _is_dar(row):
     dashes are recognised exactly as the Generator recognises them. The old
     literal '" - dar" in title' test missed all of those and quietly treated
     such rows as non-DAR."""
-    title = _s(_row_get(row, "title"))
-    if AW is not None:
-        return AW.is_dar_title(title)
-    return " - dar" in title.lower()
+    return AW.is_dar_title(_s(_row_get(row, "title")))
 
 
 def _row_get(row, col):
@@ -562,7 +563,7 @@ def _chk_twitter_search_term_keywords(val, row, rule):
 # A blank cell is a gap, not a bad value, so it passes (mirrors facebook_page).
 
 def _chk_attribution_window(val, row, rule):
-    if AW is None or not AW.ENABLED:
+    if not AW.ENABLED:
         return None, ""
     applies = [a.lower() for a in rule.get("applies_to", [])]
     if applies and _norm(_row_get(row, "title_category")) not in applies:
@@ -605,7 +606,7 @@ def _chk_attribution_window(val, row, rule):
 # a '|<digits>' tail that is not a well-formed ISO date is always wrong, even
 # with no trailer date to check it against
 def _chk_attribution_window_format(val, row, rule):
-    if AW is None or not AW.ENABLED:
+    if not AW.ENABLED:
         return None, ""
     for ln in AW.lines(val):
         if AW.SUFFIX_RE.search(ln):

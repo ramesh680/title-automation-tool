@@ -406,148 +406,36 @@ def _norm_bool(v):
 
 
 # ================= Attribution window (Movies, DAR rows) =================
-# Ops rule (Sep 2026): when a movie drops a SECOND version of its trailer on
-# the same Facebook / Instagram / TikTok / X accounts the first one ran on, the
-# DAR row's social cells carry an "attribution window" -- the date from which
-# that account's activity is attributed to the title. The window opens ONE
-# CALENDAR MONTH before the OFFICIAL trailer's release and is written as a
-# '|YYYY-MM-DD' suffix on the handle / URL:
+# The rule itself lives in attribution_window.py so the Generator, the Review
+# and the Validator share ONE implementation and cannot drift apart. See that
+# module's docstring for the rule; the names below are the local aliases the
+# rest of this file (and the tests) use.
 #
-#     The Hunger Games: Sunrise on the Reaping   released 2026-11-20
-#     official trailer                           2026-04-13
-#
-#     facebook_page     http://www.facebook.com/TheHungerGamesMovie|2026-03-13
-#     twitter_handle    TheHungerGames|2026-03-13
-#     instagram_user    thehungergames|2026-03-13
-#     tiktok_user       hungergamesofficial|2026-03-13
-#
-# Scope: Movies only, DAR rows only, and ONLY the four columns above. TV,
-# Talent, Video Games, Publishers and the brand schemas never carry it, and
-# neither do url_managers / twitter_search_terms -- those keep the bare handle,
-# which is why the stamp is applied last in create_row().
-#
-# The trailer date comes from TMDB (earliest OFFICIAL trailer, so a later
-# "Trailer 2" never moves the window); a trailer_release_date column on the
-# uploaded sheet always wins over discovery. Set ATTRIBUTION_WINDOW=0 to switch
-# the whole rule off without touching the code.
+# Applied LAST in create_row(), so url_managers and twitter_search_terms keep
+# the bare handle.
 
-ATTRIBUTION_WINDOW_ENABLED = os.getenv('ATTRIBUTION_WINDOW', '1').strip().lower() \
-    not in ('0', 'false', 'no', 'off')
-# how far before the official trailer the window opens, in calendar months
-ATTRIBUTION_WINDOW_MONTHS = 1
-# the only columns that ever carry the '|date' suffix
-ATTRIBUTION_WINDOW_COLUMNS = ('facebook_page', 'twitter_handle',
-                              'instagram_user', 'tiktok_user')
-# accepted spellings of the trailer-date field (metadata key or sheet column)
-TRAILER_DATE_KEYS = ('trailer_released_on', 'trailer_release_date',
-                     'trailer_date', 'official_trailer_date')
+import attribution_window as _aw
 
-_ATTR_SUFFIX_RE = re.compile(r'\|\s*(\d{4}-\d{2}-\d{2})\s*$')
-_ATTR_ISO_RE = re.compile(r'\s*(\d{4})-(\d{1,2})-(\d{1,2})')
+ATTRIBUTION_WINDOW_ENABLED = _aw.ENABLED
+ATTRIBUTION_WINDOW_MONTHS = _aw.MONTHS
+ATTRIBUTION_WINDOW_COLUMNS = _aw.COLUMNS
+TRAILER_DATE_KEYS = _aw.TRAILER_DATE_KEYS
 
-
-def _attr_iso(v):
-    """'YYYY-MM-DD' from a date cell/string, '' when it is not a real date.
-    Accepts the datetime objects pandas/openpyxl hand back ('2026-04-13
-    00:00:00') as well as plain ISO text."""
-    s = str(v if v is not None else '').strip()
-    if not s or s.lower() in ('nan', 'none', 'nat'):
-        return ''
-    m = _ATTR_ISO_RE.match(s)
-    if not m:
-        return ''
-    try:
-        return date(*(int(x) for x in m.groups())).strftime('%Y-%m-%d')
-    except ValueError:
-        return ''
-
-
-def trailer_date_from(meta):
-    """The official trailer date carried by a metadata dict or an uploaded row,
-    under any of TRAILER_DATE_KEYS (column names are matched case-insensitively
-    and ' '/'-' are treated as '_'). '' when none is present."""
-    try:
-        items = list(meta.items())
-    except AttributeError:
-        return ''
-    found = {}
-    for k, v in items:
-        lk = re.sub(r'[\s-]+', '_', str(k).strip().lower())
-        if lk in TRAILER_DATE_KEYS and lk not in found:
-            found[lk] = v
-    for k in TRAILER_DATE_KEYS:          # first key in preference order wins
-        d = _attr_iso(found.get(k))
-        if d:
-            return d
-    return ''
-
-
-def attribution_window_date(trailer_date):
-    """Attribution-window date for a trailer release: ONE CALENDAR MONTH
-    earlier, same day of month -- 2026-04-13 -> 2026-03-13. A day the earlier
-    month does not have clamps to its last day (2026-03-31 -> 2026-02-28)."""
-    iso = _attr_iso(trailer_date)
-    if not iso:
-        return ''
-    y, mo, d = int(iso[:4]), int(iso[5:7]), int(iso[8:10])
-    mo -= ATTRIBUTION_WINDOW_MONTHS
-    while mo < 1:
-        mo += 12
-        y -= 1
-    return '%04d-%02d-%02d' % (y, mo, min(d, calendar.monthrange(y, mo)[1]))
-
-
-def _attr_lines(v):
-    """Non-empty trimmed lines of a social cell."""
-    return [ln.strip() for ln in
-            str(v if v is not None else '').replace('\r\n', '\n').split('\n')
-            if ln.strip() and ln.strip().lower() not in ('nan', 'none')]
-
-
-def attribution_strip(value):
-    """The value with any trailing '|YYYY-MM-DD' attribution date removed."""
-    return '\n'.join(_ATTR_SUFFIX_RE.sub('', ln).strip()
-                     for ln in _attr_lines(value))
-
-
-def attribution_stamp(value, window):
-    """Every line of a social cell re-stamped with `window` (existing dates are
-    replaced, not doubled). Curated handles are preserved as-is."""
-    if not window:
-        return str(value if value is not None else '')
-    return '\n'.join('%s|%s' % (ln, window)
-                     for ln in _attr_lines(attribution_strip(value)))
-
-
-def attribution_date_of(value):
-    """The attribution date a social cell already carries. '' when a line has
-    none or the lines disagree -- either way the cell needs re-stamping."""
-    dates = set()
-    for ln in _attr_lines(value):
-        m = _ATTR_SUFFIX_RE.search(ln)
-        if not m:
-            return ''
-        dates.add(m.group(1))
-    return dates.pop() if len(dates) == 1 else ''
-
-
-def apply_attribution_window(row, window, columns=ATTRIBUTION_WINDOW_COLUMNS):
-    """Stamp the window onto a row's social columns, in place. Empty cells are
-    left empty -- the rule adds a date, never a handle."""
-    if not window:
-        return row
-    for col in columns:
-        if str(row.get(col) or '').strip():
-            row[col] = attribution_stamp(row.get(col), window)
-    return row
+trailer_date_from = _aw.trailer_date_from
+attribution_window_date = _aw.window_date
+attribution_strip = _aw.strip_window
+attribution_stamp = _aw.stamp
+attribution_date_of = _aw.date_of
+apply_attribution_window = _aw.apply_to_row
 
 
 def attribution_window_for(metadata, is_movie, is_dar):
-    """The window a row should carry, '' when the rule does not apply (not a
-    Movies DAR row, no trailer date known, or the rule is switched off)."""
+    """The window a row should carry, '' when the rule does not apply. Reads
+    ATTRIBUTION_WINDOW_ENABLED from this module so tests (and an operator at a
+    REPL) can flip the switch at runtime."""
     if not (ATTRIBUTION_WINDOW_ENABLED and is_movie and is_dar):
         return ''
-    return attribution_window_date(trailer_date_from(metadata))
+    return _aw.window_date(_aw.trailer_date_from(metadata))
 
 
 # ======================= TV Shows (BrandIngest schema) =======================
@@ -775,18 +663,11 @@ def _tv_keywords_and_reddit(title, network, year, program_type, is_dar,
 # 'Competitive View'. The strip regex below was already lenient, so the two
 # disagreed: the suffix was removed from the title while the row was still
 # classified as a base row.
-_DAR_SUFFIX_RE = re.compile(r'[\s\u00a0]*[-\u2010-\u2015][\s\u00a0]*DAR\b[\s\u00a0]*',
-                            re.IGNORECASE)
-
-
-def _is_dar_title(title):
-    """True when a title carries a '- DAR' suffix, in any spacing/case/dash."""
-    return bool(_DAR_SUFFIX_RE.search(str(title or '')))
-
-
-def _strip_dar_suffix(title):
-    """Remove a trailing '- DAR' suffix, in any spacing/case/dash form."""
-    return _DAR_SUFFIX_RE.sub('', str(title or '')).strip()
+# the regex and both helpers now live in attribution_window.py, so the
+# Validator classifies a DAR title exactly the way the Generator does
+_DAR_SUFFIX_RE = _aw.DAR_SUFFIX_RE
+_is_dar_title = _aw.is_dar_title
+_strip_dar_suffix = _aw.strip_dar_suffix
 
 
 def create_tv_row(title, network="", metadata=None):
