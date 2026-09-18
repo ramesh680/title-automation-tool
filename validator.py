@@ -42,6 +42,28 @@ FILL_HEAD = PatternFill("solid", fgColor="FF7C5CFF")   # brand violet
 # is a packaging bug, so it should stop the app at import instead.
 import attribution_window as AW
 
+# The deterministic ingest rules the Review applies, shared verbatim (see
+# ingest_rules.py). Their findings are Review-shaped -- {column, status,
+# current, suggested} -- so _row_rules() below maps them onto this module's
+# severities: Mismatch -> fail (red), Gap -> warn (amber).
+import ingest_rules as IR
+
+# The four newer brand schemas (Beauty / Beverages / Sports Teams / General)
+# already carry their rules as JSON, which is the shape this engine eats, so
+# the Validator runs the same 36 rules the Review does.
+try:
+    import os as _os
+    from titleforge_ingest_ext import detect_schema as _tfx_detect
+    from titleforge_validator import (load_rules as _tfx_load_rules,
+                                      validate_row as _tfx_validate)
+    _TFX_RULES = _tfx_load_rules(_os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)),
+        "titleforge_validation_rules.json"))
+    TFX_OK = True
+except Exception:  # the brand schemas simply are not validated
+    TFX_OK = False
+    _TFX_RULES = {}
+
 APPROVED_CATEGORIES = {"movies", "tv shows"}
 # extend with the master Title Category list from the General ingest template
 # (Health & Beauty, Beverages, Sports Franchise, Talent, Video Game, + 44 more)
@@ -135,6 +157,29 @@ DEFAULT_RULES = {
                     "calendar month before the official trailer release."},
         {"sheet": "*", "column": "tiktok_user", "check": "attribution_window_format",
          "message": "An attribution window on tiktok_user must be written '|YYYY-MM-DD'."},
+
+        {"sheet": "*", "column": "title_sub_category", "check": "sub_category_shape",
+         "message": "title_sub_category lines must be '<Label> - <Value>' using the "
+                    "labels this schema's ingest template defines."},
+        {"sheet": "*", "column": "primary_genre", "check": "primary_genre_in_genre",
+         "applies_to": ["Movies", "TV Shows"],
+         "message": "primary_genre must be one of the values in the row's own genre column."},
+        {"sheet": "*", "column": "twitter_handle", "check": "bare_handle",
+         "message": "twitter_handle is a bare handle -- no twitter.com URL, no leading '@'."},
+        {"sheet": "*", "column": "instagram_user", "check": "bare_handle",
+         "message": "instagram_user is a bare handle -- no instagram.com URL, no leading '@'."},
+        {"sheet": "*", "column": "tiktok_user", "check": "bare_handle",
+         "message": "tiktok_user is a bare handle -- no tiktok.com URL, no leading '@'."},
+        {"sheet": "*", "column": "instagram_user", "check": "not_fanpage",
+         "message": "instagram_user must be the title's own account, not a fan page."},
+        {"sheet": "*", "column": "facebook_page", "check": "not_fanpage",
+         "message": "facebook_page must be the title's own page, not a fan page."},
+        {"sheet": "*", "column": "companies", "check": "companies_present",
+         "message": "companies is blank; a non-DAR row names its company (or 'Unknown')."},
+        {"sheet": "*", "column": "facebook_verified", "check": "verified_shape",
+         "message": "facebook_verified lines are 'TRUE|<url>' / 'FALSE|<url>'."},
+        {"sheet": "*", "column": "twitter_verified", "check": "verified_shape",
+         "message": "twitter_verified lines are 'TRUE|<url>' / 'FALSE|<url>'."},
     ]
 }
 
@@ -618,6 +663,129 @@ def _chk_attribution_window_format(val, row, rule):
     return None, ""
 
 
+# ----- Review parity rules (Sep 2026) --------------------------------------
+# Deterministic rules the Review has always applied and the Validator did not.
+# Each one is checkable offline; nothing here needs a lookup.
+
+# title_sub_category is a block of 'Label - Value' lines, and which labels are
+# allowed depends on the schema. Taken from the row builders in app.py, so the
+# Validator expects exactly what the Generator emits.
+_SUB_LABELS = {
+    "movie":     {"Release", "Studio"},
+    "tv":        {"Daypart", "Program Type", "Language Type", "Network"},
+    "talent":    {"Talent Subtype", "Gender", "Talent Type"},
+    "game":      {"Platform", "Developer", "Game Type", "Publisher"},
+    "publisher": {"Publication Type"},
+}
+# Movies deliberately omit Language Type (it belongs to TV); the generator
+# strips it, so finding one in a manual file is a real error.
+_SUB_FORBIDDEN = {"movie": {"Language Type"}}
+
+
+def _chk_sub_category_shape(val, row, rule):
+    kind = _kind_from_category(_row_get(row, "title_category"))
+    allowed = _SUB_LABELS.get(kind)
+    if not allowed:
+        return None, ""                 # brand schemas: the tfx rules own this
+    v = _s(val)
+    if v == "":
+        return None, ""                 # blank is a gap other rules speak to
+    banned = _SUB_FORBIDDEN.get(kind, set())
+    bad, unlabelled = [], []
+    for ln in [x.strip() for x in v.splitlines() if x.strip()]:
+        if " - " not in ln:
+            unlabelled.append(ln)
+            continue
+        label = ln.split(" - ", 1)[0].strip()
+        if label in banned:
+            return SEV_FAIL, ("title_sub_category must not carry a '%s' line for "
+                              "%s. Offending line: %s" % (label, kind, ln))
+        if label not in allowed:
+            bad.append(ln)
+    if unlabelled:
+        return SEV_FAIL, ("title_sub_category lines are '<Label> - <Value>'. "
+                          "Offending line: %s" % unlabelled[0])
+    if bad:
+        return SEV_WARN, ("Unexpected title_sub_category label for %s (expected "
+                          "one of: %s). Offending line: %s"
+                          % (kind, ", ".join(sorted(allowed)), bad[0]))
+    return None, ""
+
+
+def _chk_primary_genre_in_genre(val, row, rule):
+    """primary_genre must be one of the values in the row's OWN genre cell --
+    the Review's rule. Blank is covered by mandatory_for_category."""
+    applies = [a.lower() for a in rule.get("applies_to", [])]
+    if applies and _norm(_row_get(row, "title_category")) not in applies:
+        return None, ""
+    v = _s(val)
+    if not v:
+        return None, ""
+    genres = {ln.strip().lower() for ln in
+              _s(_row_get(row, "genre")).splitlines() if ln.strip()}
+    if not genres:
+        return None, ""                 # no genre to check against
+    if v.strip().lower() not in genres:
+        return SEV_FAIL, rule.get(
+            "message",
+            "primary_genre must be one of the values in the row's own genre "
+            "column (genre lists: %s)." % ", ".join(sorted(genres)))
+    return None, ""
+
+
+# handles are stored bare -- no URL, no leading '@'. An attribution window
+# ('|YYYY-MM-DD') is legitimate and is stripped before the shape is judged.
+_HANDLE_BAD_RE = re.compile(r"https?://|\bwww\.|[/@]", re.I)
+
+
+def _chk_bare_handle(val, row, rule):
+    v = _s(val)
+    if v == "":
+        return None, ""
+    for ln in AW.lines(AW.strip_window(v)):
+        if _HANDLE_BAD_RE.search(ln):
+            return SEV_FAIL, rule.get(
+                "message",
+                "Handle must be bare -- no URL, no '@'. Offending line: %s" % ln)
+    return None, ""
+
+
+def _chk_not_fanpage(val, row, rule):
+    v = _s(val)
+    if v and IR._FANPAGE_RE.search(v):
+        return SEV_FAIL, rule.get(
+            "message", "Fan pages / fan clubs are not the title's own account.")
+    return None, ""
+
+
+def _chk_companies_present(val, row, rule):
+    """A DAR row must be 'Pristine Brand' (dar_company_rule covers that); a
+    non-DAR row must still name a company -- the literal 'Unknown' counts."""
+    if _is_dar(row):
+        return None, ""
+    if _s(val) == "":
+        return SEV_WARN, rule.get(
+            "message",
+            "companies is blank; a non-DAR row names its distributor / company "
+            "(or the literal 'Unknown').")
+    return None, ""
+
+
+def _chk_verified_shape(val, row, rule):
+    """facebook_verified / twitter_verified are 'TRUE|<url>' / 'FALSE|<url>'
+    lines, one per account -- the Review's publisher rule, applied everywhere."""
+    v = _s(val)
+    if v == "":
+        return None, ""
+    for ln in [x.strip() for x in v.splitlines() if x.strip()]:
+        if not IR._PUB_VERIFIED_RE.match(ln):
+            return SEV_FAIL, rule.get(
+                "message",
+                "Verified cells are 'TRUE|<url>' / 'FALSE|<url>', one per "
+                "account. Offending line: %s" % ln)
+    return None, ""
+
+
 CHECKS = {
     "not_blank_and_not_placeholder": _chk_not_blank_and_not_placeholder,
     "approved_category": _chk_approved_category,
@@ -643,7 +811,64 @@ CHECKS = {
     "twitter_search_term_keywords_query": _chk_twitter_search_term_keywords,
     "attribution_window": _chk_attribution_window,
     "attribution_window_format": _chk_attribution_window_format,
+    "sub_category_shape": _chk_sub_category_shape,
+    "primary_genre_in_genre": _chk_primary_genre_in_genre,
+    "bare_handle": _chk_bare_handle,
+    "not_fanpage": _chk_not_fanpage,
+    "companies_present": _chk_companies_present,
+    "verified_shape": _chk_verified_shape,
 }
+
+
+# ----- whole-row rule packs (Sep 2026) -------------------------------------
+# The column-by-column CHECKS above cannot express a rule that reads several
+# columns at once, and the Review's Publisher / brand-schema rules are exactly
+# that. Those run here instead, once per row, and their findings are folded in
+# beside the per-column ones.
+#
+# Only the OFFLINE rules are shared. The Review's discovery-based comparisons
+# (is this really the title's IMDb id / network / handle?) stay in the Review;
+# this stays a deterministic, no-network pass.
+
+def _sev_of(status):
+    """Review status -> validator severity."""
+    return SEV_FAIL if str(status).lower() == "mismatch" else SEV_WARN
+
+
+def _row_rules(row, headers, sheet_title):
+    """Deterministic whole-row rules. Yields (column, severity, message)."""
+    lower_cols = {h: h for h in headers}          # row keys are already lowered
+    title = _s(_row_get(row, "title"))
+    cat = _s(_row_get(row, "title_category"))
+    if not title:
+        return
+
+    # ---- Publishers: the 40-column BrandDefinitionReport rule set ----
+    if IR._row_is_publisher(row, cat, lower_cols):
+        for fd in IR.publisher_review_findings(row, lower_cols, title, cat, {}):
+            yield fd["column"], _sev_of(fd["status"]), (
+                "%s (ingest template expects: %s)"
+                % (fd["status"], fd["suggested"] or "<blank>"))
+        return
+
+    # ---- Beauty / Beverages / Sports Teams / General ----
+    if TFX_OK:
+        try:
+            key = _tfx_detect(row)
+        except Exception:
+            key = None
+        if key and _norm(cat) not in ("movies", "tv shows", "talent") \
+                and "game" not in _norm(cat):
+            try:
+                for fd in _tfx_validate(row, key, _TFX_RULES) or []:
+                    col = str(fd.get("field") or "")
+                    if col not in headers:
+                        continue
+                    sev = SEV_WARN if str(fd.get("status")) == "gap" else SEV_FAIL
+                    yield col, sev, "%s schema: expected %s" % (
+                        key, fd.get("expected") or "<blank>")
+            except Exception:
+                return
 
 
 # ----- workbook loading ----------------------------------------------------
@@ -691,6 +916,19 @@ def validate_workbook(file_storage, rules=None):
             row = {}
             for hlow, c in headers.items():
                 row[hlow] = ws.cell(r, c).value
+            flagged = set()
+            for col, sev, msg in _row_rules(row, headers, ws.title):
+                c = (col or "").lower()
+                if c not in headers or (c, sev) in flagged:
+                    continue
+                flagged.add((c, sev))
+                cell = ws.cell(r, headers[c])
+                cell.fill = FILL_FAIL if sev == SEV_FAIL else FILL_WARN
+                failures.append({
+                    "sheet": ws.title, "row": r, "column": col,
+                    "value": _s(cell.value), "severity": sev,
+                    "rule": "ingest_template_rule", "message": msg,
+                })
             for rule in rules:
                 if not _sheet_matches(rule.get("sheet"), ws.title):
                     continue
