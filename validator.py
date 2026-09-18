@@ -31,6 +31,13 @@ FILL_FAIL = PatternFill("solid", fgColor="FFF4C7C3")   # soft red
 FILL_WARN = PatternFill("solid", fgColor="FFFFE8A3")   # soft amber
 FILL_HEAD = PatternFill("solid", fgColor="FF7C5CFF")   # brand violet
 
+# the attribution-window rule, shared verbatim with the Generator and the
+# Review so the three sections cannot drift apart (stdlib-only module)
+try:
+    import attribution_window as AW
+except Exception:  # fail soft: the attribution rules simply do not run
+    AW = None
+
 APPROVED_CATEGORIES = {"movies", "tv shows"}
 # extend with the master Title Category list from the General ingest template
 # (Health & Beauty, Beverages, Sports Franchise, Talent, Video Game, + 44 more)
@@ -100,6 +107,30 @@ DEFAULT_RULES = {
          "check": "twitter_search_term_keywords_query",
          "message": "twitter_search_term_keywords must be boolean (\"title\") (...) queries; "
                     "a bare #hashtag/@handle belongs in twitter_search_terms, not here."},
+        {"sheet": "*", "column": "facebook_page", "check": "attribution_window",
+         "applies_to": ["Movies"],
+         "message": "facebook_page on a Movies DAR row must end in '|YYYY-MM-DD' -- one "
+                    "calendar month before the official trailer release."},
+        {"sheet": "*", "column": "facebook_page", "check": "attribution_window_format",
+         "message": "An attribution window on facebook_page must be written '|YYYY-MM-DD'."},
+        {"sheet": "*", "column": "twitter_handle", "check": "attribution_window",
+         "applies_to": ["Movies"],
+         "message": "twitter_handle on a Movies DAR row must end in '|YYYY-MM-DD' -- one "
+                    "calendar month before the official trailer release."},
+        {"sheet": "*", "column": "twitter_handle", "check": "attribution_window_format",
+         "message": "An attribution window on twitter_handle must be written '|YYYY-MM-DD'."},
+        {"sheet": "*", "column": "instagram_user", "check": "attribution_window",
+         "applies_to": ["Movies"],
+         "message": "instagram_user on a Movies DAR row must end in '|YYYY-MM-DD' -- one "
+                    "calendar month before the official trailer release."},
+        {"sheet": "*", "column": "instagram_user", "check": "attribution_window_format",
+         "message": "An attribution window on instagram_user must be written '|YYYY-MM-DD'."},
+        {"sheet": "*", "column": "tiktok_user", "check": "attribution_window",
+         "applies_to": ["Movies"],
+         "message": "tiktok_user on a Movies DAR row must end in '|YYYY-MM-DD' -- one "
+                    "calendar month before the official trailer release."},
+        {"sheet": "*", "column": "tiktok_user", "check": "attribution_window_format",
+         "message": "An attribution window on tiktok_user must be written '|YYYY-MM-DD'."},
     ]
 }
 
@@ -114,7 +145,16 @@ def _norm(v):
 
 
 def _is_dar(row):
-    return " - dar" in _norm(row.get("title"))
+    """True when the row's title carries a '- DAR' suffix.
+
+    Uses the shared lenient matcher, so ' -DAR', '  -  DAR', ' - Dar' and en/em
+    dashes are recognised exactly as the Generator recognises them. The old
+    literal '" - dar" in title' test missed all of those and quietly treated
+    such rows as non-DAR."""
+    title = _s(_row_get(row, "title"))
+    if AW is not None:
+        return AW.is_dar_title(title)
+    return " - dar" in title.lower()
 
 
 def _row_get(row, col):
@@ -507,6 +547,76 @@ def _chk_twitter_search_term_keywords(val, row, rule):
     return None, ""
 
 
+# ----- Attribution window (Sep 2026) ---------------------------------------
+# On a Movies DAR row, facebook_page / twitter_handle / instagram_user /
+# tiktok_user must end in '|YYYY-MM-DD' -- one calendar month before the
+# official trailer. The Validator runs fully offline, so it cannot discover the
+# trailer date itself:
+#
+#   * with a trailer_release_date column on the sheet, the expected window is
+#     computed and a missing/wrong/malformed date is a hard FAIL;
+#   * without one, a missing date is a WARN ("cannot be confirmed here") and a
+#     well-formed date passes -- exactly the "presence + format now, real
+#     lookup later" posture the imdb / metacritic checks already take.
+#
+# A blank cell is a gap, not a bad value, so it passes (mirrors facebook_page).
+
+def _chk_attribution_window(val, row, rule):
+    if AW is None or not AW.ENABLED:
+        return None, ""
+    applies = [a.lower() for a in rule.get("applies_to", [])]
+    if applies and _norm(_row_get(row, "title_category")) not in applies:
+        return None, ""
+    if not _is_dar(row):
+        return None, ""          # base rows never carry the window
+    v = _s(val)
+    if v == "":
+        return None, ""          # blank is a gap, not a bad value
+
+    trailer = AW.trailer_date_from(row)
+    expected = AW.window_date(trailer) if trailer else ""
+    missing = AW.unstamped_lines(v)
+    carried = AW.date_of(v)
+
+    if missing:
+        if expected:
+            return SEV_FAIL, (
+                "Attribution window missing: a Movies DAR row must end in "
+                "'|%s' (one month before the %s trailer). Offending line: %s"
+                % (expected, trailer, missing[0]))
+        return SEV_WARN, rule.get(
+            "message",
+            "Attribution window missing: a Movies DAR row's social accounts "
+            "should end in '|YYYY-MM-DD', one month before the official "
+            "trailer. Add a trailer_release_date column to check the date.")
+
+    if not carried:
+        # every line has a suffix, but they disagree with each other
+        return SEV_FAIL, ("Attribution window is inconsistent across lines: "
+                          "every account in this cell must carry the same date.")
+
+    if expected and carried != expected:
+        return SEV_FAIL, ("Attribution window is %s but the %s trailer puts it "
+                          "at %s (one calendar month before)."
+                          % (carried, trailer, expected))
+    return None, ""
+
+
+# a '|<digits>' tail that is not a well-formed ISO date is always wrong, even
+# with no trailer date to check it against
+def _chk_attribution_window_format(val, row, rule):
+    if AW is None or not AW.ENABLED:
+        return None, ""
+    for ln in AW.lines(val):
+        if AW.SUFFIX_RE.search(ln):
+            continue
+        if AW.MALFORMED_SUFFIX_RE.search(ln):
+            return SEV_FAIL, rule.get(
+                "message",
+                "Attribution window must be '|YYYY-MM-DD'. Offending line: %s" % ln)
+    return None, ""
+
+
 CHECKS = {
     "not_blank_and_not_placeholder": _chk_not_blank_and_not_placeholder,
     "approved_category": _chk_approved_category,
@@ -530,6 +640,8 @@ CHECKS = {
     "network_checkpoint": _chk_network_checkpoint,  # alias
     "twitter_search_terms_structure": _chk_twitter_search_terms,
     "twitter_search_term_keywords_query": _chk_twitter_search_term_keywords,
+    "attribution_window": _chk_attribution_window,
+    "attribution_window_format": _chk_attribution_window_format,
 }
 
 
