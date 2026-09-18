@@ -130,6 +130,16 @@
                 </label>
             </div>
 
+            <div class="form-group">
+                <span class="hint"><b>Attribution window</b> — on <b>Movies</b> DAR rows the
+                <b>facebook_page</b>, <b>twitter_handle</b>, <b>instagram_user</b> and
+                <b>tiktok_user</b> cells must end in <b>|YYYY-MM-DD</b>, one calendar month
+                before the official trailer (trailer 2026-04-13 → <b>|2026-03-13</b>). A missing
+                or wrong date is flagged as a Mismatch and the suggestion keeps your handle,
+                fixing only the date. The trailer date is discovered from TMDB — add a
+                <b>trailer_release_date</b> column to the sheet to supply it yourself.</span>
+            </div>
+
             <button onclick="runReview()">🔎 Run Review</button>
             <div id="progress"></div>
             <div id="stats" class="stats" style="display:none">
