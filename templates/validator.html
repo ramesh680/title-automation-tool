@@ -209,9 +209,12 @@
         </div>
 
         <div class="card" style="margin-top:24px">
-            <div class="card-head"><span class="ic">📘</span><div><h2>Active validation rules</h2><div class="sub">What the default rule set checks</div></div></div>
+            <div class="card-head"><span class="ic">📘</span><div><h2>Active validation rules</h2><div class="sub">What the default rule set checks — offline, no lookups</div></div></div>
             <div class="rule-ref">
-                <div class="r"><h4>Required &amp; placeholders</h4><p>title must not be blank / #NA / N/A. title_category must be Movies or TV Shows.</p></div>
+                <div class="r"><h4>Required &amp; placeholders</h4><p>title must not be blank / #NA / N/A. title_category must be one of the approved categories.</p></div>
+                <div class="r"><h4>Every schema, not just Movies</h4><p>Publishers, Talent, Video Games and the Beauty / Beverages / Sports Teams / General brand templates are checked against their own ingest rules — the same deterministic rules the <b>Review</b> applies, shared from one module.</p></div>
+                <div class="r"><h4>Sub-categories &amp; genres</h4><p>title_sub_category lines must be <b>Label - Value</b> using the labels that schema defines (a Movie never carries <b>Language Type</b>). primary_genre must be one of the row’s own genre values.</p></div>
+                <div class="r"><h4>Handles &amp; verified cells</h4><p>twitter_handle / instagram_user / tiktok_user are bare handles — no URL, no <b>@</b> — and never fan pages. facebook_verified / twitter_verified are <b>TRUE|&lt;url&gt;</b> lines.</p></div>
                 <div class="r"><h4>DAR / Competitive</h4><p>DAR titles need companies = Pristine Brand and brand_set with Pristine DAR Brands; others need Competitive View.</p></div>
                 <div class="r"><h4>IMDb &amp; Metacritic</h4><p>imdb_id must be a ttNNNNNNN / IMDb title URL; metacritic must be a metacritic.com movie/tv URL.</p></div>
                 <div class="r"><h4>Wikipedia</h4><p>wikipedia_page must be en.wikipedia.org/wiki/… and the article should match the title.</p></div>
