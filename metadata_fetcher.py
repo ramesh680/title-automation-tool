@@ -898,6 +898,30 @@ def _us_theatrical_date(details):
     return None
 
 
+def _tmdb_trailer_date(details):
+    """Publish date (YYYY-MM-DD) of the movie's OFFICIAL trailer.
+
+    Feeds the attribution window (app.attribution_window_date): the DAR row's
+    social accounts carry a date one month before the official trailer drop.
+    TMDB returns every video attached to the title; we keep YouTube trailers,
+    prefer the ones flagged ``official`` and take the EARLIEST of those -- a
+    later "Trailer 2" / "Final Trailer" must not move the window.
+    """
+    vids = ((details.get("videos") or {}).get("results")) or []
+
+    def published(v):
+        return str(v.get("published_at") or "")[:10]
+
+    trailers = [v for v in vids
+                if str(v.get("type") or "").strip().lower() == "trailer"
+                and str(v.get("site") or "YouTube").strip().lower() == "youtube"
+                and re.match(r"^\d{4}-\d{2}-\d{2}$", published(v))]
+    if not trailers:
+        return None
+    official = [v for v in trailers if v.get("official")]
+    return min(published(v) for v in (official or trailers))
+
+
 def _tmdb_details_meta(details, kind):
     meta = {}
     genres = [g.get("name") for g in details.get("genres", []) if g.get("name")]
@@ -908,6 +932,10 @@ def _tmdb_details_meta(details, kind):
         us = _us_theatrical_date(details)
         if us:
             meta["released_on_us"] = us
+        # official trailer date -> attribution window on the DAR row's socials
+        trailer = _tmdb_trailer_date(details)
+        if trailer:
+            meta["trailer_released_on"] = trailer
     rel = details.get("release_date") or details.get("first_air_date")
     if rel:
         meta["released_on"] = rel
@@ -938,7 +966,7 @@ def _tmdb_details_meta(details, kind):
     return meta, ext.get("wikidata_id")
 
 
-_TMDB_APPEND = "external_ids,release_dates"
+_TMDB_APPEND = "external_ids,release_dates,videos"
 
 
 def tmdb_lookup(title, is_movie, want_year=None):

@@ -2,7 +2,8 @@ from flask import Flask, render_template, request, jsonify, send_file
 import pandas as pd
 import csv
 from io import BytesIO, StringIO
-from datetime import datetime
+from datetime import datetime, date
+import calendar
 import re
 import time
 import uuid
@@ -402,6 +403,151 @@ def _norm_bool(v):
     if sv in ("false", "0", "no", "n", ""):
         return "false"
     return "true"
+
+
+# ================= Attribution window (Movies, DAR rows) =================
+# Ops rule (Sep 2026): when a movie drops a SECOND version of its trailer on
+# the same Facebook / Instagram / TikTok / X accounts the first one ran on, the
+# DAR row's social cells carry an "attribution window" -- the date from which
+# that account's activity is attributed to the title. The window opens ONE
+# CALENDAR MONTH before the OFFICIAL trailer's release and is written as a
+# '|YYYY-MM-DD' suffix on the handle / URL:
+#
+#     The Hunger Games: Sunrise on the Reaping   released 2026-11-20
+#     official trailer                           2026-04-13
+#
+#     facebook_page     http://www.facebook.com/TheHungerGamesMovie|2026-03-13
+#     twitter_handle    TheHungerGames|2026-03-13
+#     instagram_user    thehungergames|2026-03-13
+#     tiktok_user       hungergamesofficial|2026-03-13
+#
+# Scope: Movies only, DAR rows only, and ONLY the four columns above. TV,
+# Talent, Video Games, Publishers and the brand schemas never carry it, and
+# neither do url_managers / twitter_search_terms -- those keep the bare handle,
+# which is why the stamp is applied last in create_row().
+#
+# The trailer date comes from TMDB (earliest OFFICIAL trailer, so a later
+# "Trailer 2" never moves the window); a trailer_release_date column on the
+# uploaded sheet always wins over discovery. Set ATTRIBUTION_WINDOW=0 to switch
+# the whole rule off without touching the code.
+
+ATTRIBUTION_WINDOW_ENABLED = os.getenv('ATTRIBUTION_WINDOW', '1').strip().lower() \
+    not in ('0', 'false', 'no', 'off')
+# how far before the official trailer the window opens, in calendar months
+ATTRIBUTION_WINDOW_MONTHS = 1
+# the only columns that ever carry the '|date' suffix
+ATTRIBUTION_WINDOW_COLUMNS = ('facebook_page', 'twitter_handle',
+                              'instagram_user', 'tiktok_user')
+# accepted spellings of the trailer-date field (metadata key or sheet column)
+TRAILER_DATE_KEYS = ('trailer_released_on', 'trailer_release_date',
+                     'trailer_date', 'official_trailer_date')
+
+_ATTR_SUFFIX_RE = re.compile(r'\|\s*(\d{4}-\d{2}-\d{2})\s*$')
+_ATTR_ISO_RE = re.compile(r'\s*(\d{4})-(\d{1,2})-(\d{1,2})')
+
+
+def _attr_iso(v):
+    """'YYYY-MM-DD' from a date cell/string, '' when it is not a real date.
+    Accepts the datetime objects pandas/openpyxl hand back ('2026-04-13
+    00:00:00') as well as plain ISO text."""
+    s = str(v if v is not None else '').strip()
+    if not s or s.lower() in ('nan', 'none', 'nat'):
+        return ''
+    m = _ATTR_ISO_RE.match(s)
+    if not m:
+        return ''
+    try:
+        return date(*(int(x) for x in m.groups())).strftime('%Y-%m-%d')
+    except ValueError:
+        return ''
+
+
+def trailer_date_from(meta):
+    """The official trailer date carried by a metadata dict or an uploaded row,
+    under any of TRAILER_DATE_KEYS (column names are matched case-insensitively
+    and ' '/'-' are treated as '_'). '' when none is present."""
+    try:
+        items = list(meta.items())
+    except AttributeError:
+        return ''
+    found = {}
+    for k, v in items:
+        lk = re.sub(r'[\s-]+', '_', str(k).strip().lower())
+        if lk in TRAILER_DATE_KEYS and lk not in found:
+            found[lk] = v
+    for k in TRAILER_DATE_KEYS:          # first key in preference order wins
+        d = _attr_iso(found.get(k))
+        if d:
+            return d
+    return ''
+
+
+def attribution_window_date(trailer_date):
+    """Attribution-window date for a trailer release: ONE CALENDAR MONTH
+    earlier, same day of month -- 2026-04-13 -> 2026-03-13. A day the earlier
+    month does not have clamps to its last day (2026-03-31 -> 2026-02-28)."""
+    iso = _attr_iso(trailer_date)
+    if not iso:
+        return ''
+    y, mo, d = int(iso[:4]), int(iso[5:7]), int(iso[8:10])
+    mo -= ATTRIBUTION_WINDOW_MONTHS
+    while mo < 1:
+        mo += 12
+        y -= 1
+    return '%04d-%02d-%02d' % (y, mo, min(d, calendar.monthrange(y, mo)[1]))
+
+
+def _attr_lines(v):
+    """Non-empty trimmed lines of a social cell."""
+    return [ln.strip() for ln in
+            str(v if v is not None else '').replace('\r\n', '\n').split('\n')
+            if ln.strip() and ln.strip().lower() not in ('nan', 'none')]
+
+
+def attribution_strip(value):
+    """The value with any trailing '|YYYY-MM-DD' attribution date removed."""
+    return '\n'.join(_ATTR_SUFFIX_RE.sub('', ln).strip()
+                     for ln in _attr_lines(value))
+
+
+def attribution_stamp(value, window):
+    """Every line of a social cell re-stamped with `window` (existing dates are
+    replaced, not doubled). Curated handles are preserved as-is."""
+    if not window:
+        return str(value if value is not None else '')
+    return '\n'.join('%s|%s' % (ln, window)
+                     for ln in _attr_lines(attribution_strip(value)))
+
+
+def attribution_date_of(value):
+    """The attribution date a social cell already carries. '' when a line has
+    none or the lines disagree -- either way the cell needs re-stamping."""
+    dates = set()
+    for ln in _attr_lines(value):
+        m = _ATTR_SUFFIX_RE.search(ln)
+        if not m:
+            return ''
+        dates.add(m.group(1))
+    return dates.pop() if len(dates) == 1 else ''
+
+
+def apply_attribution_window(row, window, columns=ATTRIBUTION_WINDOW_COLUMNS):
+    """Stamp the window onto a row's social columns, in place. Empty cells are
+    left empty -- the rule adds a date, never a handle."""
+    if not window:
+        return row
+    for col in columns:
+        if str(row.get(col) or '').strip():
+            row[col] = attribution_stamp(row.get(col), window)
+    return row
+
+
+def attribution_window_for(metadata, is_movie, is_dar):
+    """The window a row should carry, '' when the rule does not apply (not a
+    Movies DAR row, no trailer date known, or the rule is switched off)."""
+    if not (ATTRIBUTION_WINDOW_ENABLED and is_movie and is_dar):
+        return ''
+    return attribution_window_date(trailer_date_from(metadata))
 
 
 # ======================= TV Shows (BrandIngest schema) =======================
@@ -1640,6 +1786,23 @@ def create_row(title, is_movie, network="", metadata=None):
     if not row.get('url_managers'):
         row['url_managers'] = generate_url_managers(row)
 
+    # Attribution window (Sep 2026) -- Movies DAR rows only. Stamped LAST, so
+    # url_managers and twitter_search_terms above keep the bare handle.
+    _attr_window = attribution_window_for(metadata, is_movie, is_dar)
+    if _attr_window:
+        apply_attribution_window(row, _attr_window)
+        row['_attribution_window'] = _attr_window
+    elif (ATTRIBUTION_WINDOW_ENABLED and is_movie and is_dar
+            and any(str(row.get(c) or '').strip()
+                    for c in ATTRIBUTION_WINDOW_COLUMNS)):
+        # the row has accounts to stamp but no trailer date was found -- say so
+        # rather than shipping an un-windowed DAR row in silence
+        row['_needs_review'] = True
+        _ar = ('No official trailer date found -- attribution window not '
+               'applied. Add a trailer_release_date column to set it manually.')
+        _prev_ar = str(row.get('_review_reason') or '').strip()
+        row['_review_reason'] = (_prev_ar + '; ' + _ar) if _prev_ar else _ar
+
     # Rule 1 (Aug 2026): Movies & TV Shows must carry genre, primary_genre and
     # released_on. If auto-discovery could not fill one, surface the row in
     # "Needs Review" rather than shipping a blank mandatory column.
@@ -1990,9 +2153,12 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
                 profession = ''
             if not profession:
                 profession = default_profession
-            specs.append((title, kind, network, profession))
+            # a trailer_release_date column on a simple title list still drives
+            # the attribution window, and still beats TMDB discovery
+            trailer = trailer_date_from(r)
+            specs.append((title, kind, network, profession, trailer))
         def _one_spec(i, spec):
-            title, kind, network, profession = spec
+            title, kind, network, profession, trailer = spec
             out = []
             if kind in TFX_KINDS and TFX_OK:
                 seed = dict(fetch_brand(title) or {}) if auto_fetch else None
@@ -2014,7 +2180,8 @@ def build_rows_from_upload(src, include_dar, auto_fetch=False, max_titles=None,
                     out.append(make_row(f"{title} - DAR", False, '', meta, game=True))
             else:
                 is_movie = kind == 'movie'
-                meta = _merge_meta({}, title, auto_fetch, is_movie=is_movie)
+                seed = {'trailer_released_on': trailer} if trailer else {}
+                meta = _merge_meta(seed, title, auto_fetch, is_movie=is_movie)
                 out.append(make_row(title, is_movie, network, meta))
                 if include_dar and ' - DAR' not in title:
                     out.append(make_row(f"{title} - DAR", is_movie, network, meta))
@@ -3606,7 +3773,7 @@ def _merge_brand_set(manual_raw, expected_raw):
 
 
 def _review_compare(col, manual_raw, expected_raw, title='', cat='',
-                    manual_genre='', sub_raw=''):
+                    manual_genre='', sub_raw='', attr_window=''):
     """Column-aware comparison. Returns (ok, suggested_str).
 
     Rules from the reviewed-file feedback:
@@ -3666,6 +3833,22 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
     if c in ('genre', 'primary_genre', 'released_on') and not mval \
             and _cat_is_movie_or_tv(cat):
         return False, sugg
+
+    # Attribution window (Sep 2026): on a Movies DAR row the four social cells
+    # carry a '|YYYY-MM-DD' suffix -- one calendar month before the official
+    # trailer. Checked BEFORE the generic short-circuits below, because the
+    # facebook_page / instagram_user rules accept any non-blank curated value
+    # and would otherwise wave a missing window through. The suggestion keeps
+    # the reviewer's own handles and only fixes the date.
+    if c in ATTRIBUTION_WINDOW_COLUMNS:
+        # `attr_window` is the window the row should carry, computed by the
+        # caller from the trailer date. Falling back to the expected value's
+        # own suffix keeps the rule working when it is not supplied -- but the
+        # caller's value is what catches a manual row whose accounts discovery
+        # never found (expected cell blank, manual cell populated).
+        _want = attr_window or attribution_date_of(expected_raw)
+        if _want and mval and attribution_date_of(manual_raw) != _want:
+            return False, attribution_stamp(manual_raw, _want)
 
     if not eval_ or mval == eval_:
         return True, sugg
@@ -4021,6 +4204,8 @@ def build_review(src, auto_fetch=True, progress=None):
         rel = str(r.get(lower_cols.get('released_on', ''), '') or '').strip()
         if rel and rel.lower() != 'nan':
             hints['released_on'] = rel[:10]
+        # an explicit trailer_release_date column always beats discovery
+        _sheet_trailer = trailer_date_from(r)
 
         meta = {}
         if auto_fetch:
@@ -4033,6 +4218,8 @@ def build_review(src, auto_fetch=True, progress=None):
         for k, v in hints.items():
             if meta.get(k) in (None, ''):
                 meta[k] = v
+        if _sheet_trailer:
+            meta['trailer_released_on'] = _sheet_trailer
         # date-first IMDb: surface the resolver's year note as a review finding
         _imdb_note = meta.pop('_imdb_year_note', '')
         if _imdb_note:
@@ -4057,16 +4244,41 @@ def build_review(src, auto_fetch=True, progress=None):
             meta['network'] = exp_net
         expected = make_row(t, is_movie, exp_net, meta)
 
+        # Attribution window for this row (Movies DAR only). Computed here
+        # rather than read off `expected`, because discovery may not have found
+        # the accounts the manual file already carries -- in which case the
+        # expected cells are blank and carry no suffix to compare against.
+        _attr_win = attribution_window_for(meta, is_movie, _is_dar_title(t))
+
+        # Movies DAR row with accounts but no trailer date: the attribution
+        # window cannot be computed, so flag it instead of passing it silently.
+        if (ATTRIBUTION_WINDOW_ENABLED and is_movie and _is_dar_title(t)
+                and not _attr_win):
+            _acc_col = next(
+                (lower_cols[c] for c in ATTRIBUTION_WINDOW_COLUMNS
+                 if c in lower_cols and _review_norm(r.get(lower_cols[c]))), '')
+            if _acc_col:
+                findings.append(dict(
+                    row=i + 2, title=t, column=_acc_col, status='Mismatch',
+                    current=str(r.get(_acc_col) if r.get(_acc_col) is not None else ''),
+                    suggested='No official trailer date found -- attribution '
+                              'window (one month before the trailer) could not be '
+                              'checked. Add a trailer_release_date column to set it.'))
+                fills[(i, _acc_col)] = 'Mismatch'
+
         for col in (COLUMNS if is_movie else TV_COLUMNS):
             if col in REVIEW_SKIP_COLS or col.lower() not in lower_cols:
                 continue
             src_col = lower_cols[col.lower()]
             mval = _review_norm(r.get(src_col))
             cells_checked += 1
+            if fills.get((i, src_col)):
+                continue            # already flagged above (attribution note)
             ok, sugg = _review_compare(
                 col, r.get(src_col), expected.get(col), title=t, cat=cat,
                 manual_genre=r.get(lower_cols.get('genre', ''), ''),
-                sub_raw=r.get(lower_cols.get('title_sub_category', ''), ''))
+                sub_raw=r.get(lower_cols.get('title_sub_category', ''), ''),
+                attr_window=_attr_win)
             if ok:
                 continue
             status = 'Gap' if not mval else 'Mismatch'
