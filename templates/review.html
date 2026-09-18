@@ -131,13 +131,15 @@
             </div>
 
             <div class="form-group">
-                <span class="hint"><b>Attribution window</b> — on <b>Movies</b> DAR rows the
-                <b>facebook_page</b>, <b>twitter_handle</b>, <b>instagram_user</b> and
-                <b>tiktok_user</b> cells must end in <b>|YYYY-MM-DD</b>, one calendar month
-                before the official trailer (trailer 2026-04-13 → <b>|2026-03-13</b>). A missing
-                or wrong date is flagged as a Mismatch and the suggestion keeps your handle,
-                fixing only the date. The trailer date is discovered from TMDB — add a
-                <b>trailer_release_date</b> column to the sheet to supply it yourself.</span>
+                <span class="hint"><b>Attribution window</b> — checked only on a <b>Movies</b> DAR
+                row whose accounts an <b>earlier title already used</b> (a franchise reusing its
+                handles). Those rows' <b>facebook_page</b>, <b>twitter_handle</b>,
+                <b>instagram_user</b> and <b>tiktok_user</b> must end in <b>|YYYY-MM-DD</b>, one
+                calendar month before that instalment's official trailer. A missing or wrong date
+                is a Mismatch and the suggestion keeps your handle, fixing only the date. A
+                standalone film is never asked for one. Qualification comes from TMDB, from other
+                rows in the sheet, or from an <b>is_sequel</b> column; the trailer date from TMDB
+                or a <b>trailer_release_date</b> column.</span>
             </div>
 
             <button onclick="runReview()">🔎 Run Review</button>

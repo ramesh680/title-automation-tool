@@ -208,13 +208,16 @@
                     <label class="toggle">
                         <input type="checkbox" id="includeDar" checked><span class="slider"></span>
                         <span class="t-txt">Create both regular and DAR versions
-                            <span class="t-sub"><b>Attribution window</b> — a Movies DAR row's
+                            <span class="t-sub"><b>Attribution window</b> — only for a Movies DAR
+                            title whose accounts an <b>earlier title already used</b> (a franchise
+                            reusing its handles: Avengers, Hunger Games). Its
                             <b>facebook_page</b>, <b>twitter_handle</b>, <b>instagram_user</b> and
-                            <b>tiktok_user</b> are stamped <b>|YYYY-MM-DD</b>: one calendar month
-                            before the official trailer (trailer 2026-04-13 → 2026-03-13, e.g.
-                            <b>thehungergames|2026-03-13</b>). The trailer date comes from TMDB;
-                            add a <b>trailer_release_date</b> column to your upload to set it
-                            yourself. Movies only — TV, Talent, Games and brands never carry it.</span>
+                            <b>tiktok_user</b> are stamped <b>|YYYY-MM-DD</b> — one calendar month
+                            before <i>that instalment's</i> official trailer (trailer 2026-04-13 →
+                            <b>thehungergames|2026-03-13</b>). A standalone film, and the first film
+                            of a franchise, carry none. Detected from TMDB, from other rows in your
+                            upload, or from an <b>is_sequel</b> column; the trailer date comes from
+                            TMDB or a <b>trailer_release_date</b> column.</span>
                         </span>
                     </label>
                 </div>
