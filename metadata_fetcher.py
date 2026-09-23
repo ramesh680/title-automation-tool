@@ -69,6 +69,16 @@ except Exception:
 
 log = logging.getLogger(__name__)
 
+# ---- cross-source page parsing (Sep 2026) ----------------------------------
+# Rotten Tomatoes / Metacritic / distributor-site / trailer-description parsing
+# lives in source_pages.py (network-free, unit-tested). Imported defensively so
+# a partial deploy never takes the tool down.
+try:
+    import source_pages as SP
+except Exception as _e:  # noqa: BLE001
+    SP = None
+    logging.getLogger(__name__).warning("source_pages unavailable (%s)", _e)
+
 # ---- official-YouTube-channel filter (v3.1) --------------------------------
 # Imported defensively: if youtube_validator.py has not been deployed yet the
 # module still loads and the extra filtering is simply skipped, so a partial
@@ -353,7 +363,8 @@ def resolve_metacritic(title, is_movie=True, candidate=None, curated=False, year
                                          and abs(cyear - year) <= IMDB_YEAR_TOLERANCE)
     if candidate and candidate_fits_year:
         alive = _mc_alive(candidate)
-        if alive or (curated and alive is None):
+        if (alive or (curated and alive is None)) \
+                and not _page_year_conflict(candidate, year, "mc"):
             return candidate
     slug = _mc_slug(title)
     slugs = ([f"{slug}-{year}", slug] if year else [slug]) if slug else []
@@ -364,12 +375,13 @@ def resolve_metacritic(title, is_movie=True, candidate=None, curated=False, year
             if candidate and url.rstrip("/") == str(candidate).replace(
                     "http://", "https://").rstrip("/"):
                 continue  # already tried above
-            if _mc_alive(url):
+            if _mc_alive(url) and not _page_year_conflict(url, year, "mc"):
                 return "http://www.metacritic.com/%s/%s/" % (sec, sl)
     # No page for the known release year. A curated candidate is still the best
     # value we have -- keep it, but tell the reviewer it is unverified for the
     # year in the release-date column rather than shipping it silently.
-    if candidate and not candidate_fits_year:
+    if candidate and not candidate_fits_year \
+            and not _page_year_conflict(candidate, year, "mc"):
         alive = _mc_alive(candidate)
         if alive or (curated and alive is None):
             _note(notes, "Metacritic %s could not be confirmed as the %s title%s "
@@ -435,7 +447,8 @@ def resolve_rottentomatoes(title, is_movie=True, candidate=None, curated=False,
                                     and abs(cyear - year) <= IMDB_YEAR_TOLERANCE)
     if cand and cand_fits_year:
         alive = _rt_alive(cand)
-        if alive or (curated and alive is None):
+        if (alive or (curated and alive is None)) \
+                and not _page_year_conflict(cand, year, "rt"):
             return cand
     if not is_movie:
         return ""  # only movie /m/ RT URLs are shipped
@@ -446,9 +459,9 @@ def resolve_rottentomatoes(title, is_movie=True, candidate=None, curated=False,
         if cand and url.rstrip("/") == str(cand).replace(
                 "http://", "https://").rstrip("/"):
             continue
-        if _rt_alive(url):
+        if _rt_alive(url) and not _page_year_conflict(url, year, "rt"):
             return "http://www.rottentomatoes.com/m/%s" % sl
-    if cand and not cand_fits_year:
+    if cand and not cand_fits_year and not _page_year_conflict(cand, year, "rt"):
         alive = _rt_alive(cand)
         if alive or (curated and alive is None):
             _note(notes, "Rotten Tomatoes %s could not be confirmed as the %s "
@@ -637,10 +650,7 @@ def imdb_suggest_item(title, is_movie=True, year_hint="", require_year=False):
     has a year that disagrees with year_hint by more than the tolerance, None is
     returned rather than attaching the wrong title. A candidate with no year (an
     upcoming title) is never rejected on year."""
-    q = urllib.parse.quote(title.strip().lower())
-    data = _get_json(IMDB_SUGGEST.format(q=q), headers=HTML_HEADERS)
-    items = [it for it in (data or {}).get("d", [])
-             if str(it.get("id", "")).startswith("tt")]
+    items = _imdb_suggest_raw(title)
     if not items:
         return None
     tl = _norm(title)
@@ -680,6 +690,70 @@ def imdb_suggest_item(title, is_movie=True, year_hint="", require_year=False):
                  title, best.get("id"), best.get("y"), want_year)
         return None
     return best
+
+
+_SUGGEST_CACHE = {}
+
+
+def _imdb_suggest_raw(title):
+    """tt items from IMDb's suggestion API for `title` (cached per process)."""
+    q = urllib.parse.quote(str(title or "").strip().lower())
+    if not q:
+        return []
+    if q in _SUGGEST_CACHE:
+        return list(_SUGGEST_CACHE[q])
+    data = _get_json(IMDB_SUGGEST.format(q=q), headers=HTML_HEADERS)
+    items = [it for it in (data or {}).get("d", [])
+             if str(it.get("id", "")).startswith("tt")]
+    if data is not None:
+        _SUGGEST_CACHE[q] = list(items)
+    return items
+
+
+_IMDB_KIND_LABEL = {"movie": "Movie", "tvmovie": "TV Movie", "tvseries": "TV Series",
+                    "tvminiseries": "TV Mini-Series", "tvspecial": "TV Special",
+                    "short": "Short", "tvshort": "TV Short", "video": "Video",
+                    "documentary": "Documentary"}
+
+
+def title_candidates(title, is_movie=True):
+    """EVERY same-named title IMDb knows, newest first.
+
+    The stakeholder rule (Sep 2026): when several movies / shows share a name
+    ('The Rescue' 2027 Paramount western vs the 2021 National Geographic
+    documentary vs ...), the user decides which one they mean. Each candidate
+    carries enough to tell them apart -- year, kind, top-billed names -- and
+    the tt code that then drives Wikipedia, IMDb, Rotten Tomatoes, Metacritic
+    and the social handles for THAT title only.
+
+    A trailing '(2027)' on `title` narrows the list to that year."""
+    clean = re.sub(r"\s*-\s*DAR\s*$", "", str(title or ""), flags=re.IGNORECASE).strip()
+    lookup, hint = _split_disambiguator(clean)
+    want_year = int(hint) if (hint.isdigit() and len(hint) == 4) else None
+    tl = _norm(lookup)
+    out = []
+    for it in _imdb_suggest_raw(lookup):
+        if _norm(it.get("l")) != tl:
+            continue
+        qid = str(it.get("qid") or "").lower()
+        is_tv_item = qid.startswith("tv") and qid != "tvmovie"
+        if qid and is_tv_item == is_movie:
+            continue
+        y = it.get("y")
+        if want_year and y and abs(int(y) - want_year) > 0:
+            continue
+        out.append({
+            "tt": it.get("id"),
+            "title": it.get("l") or lookup,
+            "year": int(y) if y else None,
+            "kind": _IMDB_KIND_LABEL.get(qid, qid.title() if qid else ""),
+            "stars": it.get("s") or "",
+            "image": ((it.get("i") or {}).get("imageUrl") or ""),
+            "imdb_url": "https://www.imdb.com/title/%s/" % it.get("id"),
+        })
+    # upcoming / undated titles first, then newest
+    out.sort(key=lambda c: -(c["year"] or 9999))
+    return out
 
 
 def imdb_suggest(title, is_movie=True):
@@ -833,6 +907,17 @@ def imdb_scrape(tt):
         names = re.findall(r'href="/company/[^"]*"[^>]*>([^<]+)</a>', block.group(1))
         if names:
             meta["production_company"] = names[0].strip()
+    # 'Official sites' -> the title's own social accounts + official homepage
+    if SP is not None:
+        try:
+            links = SP.imdb_official_socials(html)
+            if links:
+                meta["_imdb_socials"] = links
+            home = SP.homepage_from_imdb(html)
+            if home:
+                meta["_homepage_imdb"] = home
+        except Exception as e:  # noqa: BLE001
+            log.info("imdb official sites parse failed for %s: %s", tt, e)
     return meta
 
 
@@ -1007,6 +1092,25 @@ def _tmdb_details_meta(details, kind):
             meta["attribution_shared_handle"] = shared
             if shared and sibling:
                 meta["attribution_shared_with"] = sibling
+    # cross-check inputs (private keys, never exported): the official
+    # homepage, every YouTube trailer/teaser (their descriptions list the
+    # title's socials) and the US release types (2 = limited theatrical)
+    if details.get("homepage"):
+        meta["_homepage"] = str(details["homepage"])
+    vids = ((details.get("videos") or {}).get("results")) or []
+    keys = [v for v in vids
+            if str(v.get("site") or "").lower() == "youtube" and v.get("key")
+            and str(v.get("type") or "").lower() in ("trailer", "teaser")]
+    keys.sort(key=lambda v: (not v.get("official"),
+                             str(v.get("type") or "").lower() != "trailer",
+                             str(v.get("published_at") or "")))
+    if keys:
+        meta["_trailer_keys"] = [v["key"] for v in keys][:4]
+    us = next((r for r in ((details.get("release_dates") or {}).get("results") or [])
+               if r.get("iso_3166_1") == "US"), None)
+    if us:
+        meta["_us_release_types"] = sorted({d.get("type") for d in us.get("release_dates") or []
+                                            if isinstance(d.get("type"), int)})
     rel = details.get("release_date") or details.get("first_air_date")
     if rel:
         meta["released_on"] = rel
@@ -2852,6 +2956,348 @@ def youtube_channel(title, limit=5):
 
 
 # ---------------- merge / entry ----------------
+# ======================= cross-source verification (Sep 2026) ==============
+# Stakeholder feedback on 'The Rescue' (2027, Paramount):
+#   * release scale came from Box Office Mojo alone and said Limited, while
+#     Rotten Tomatoes and the distributor show Wide  -> release_scale is now a
+#     consensus of RT, Metacritic, the distributor/official site, BOM and TMDB
+#   * RT / Metacritic pointed at a same-named title from another year -> every
+#     RT / MC page is now opened and its release year compared to the title's
+#   * no social handles were found although the studio lists them on the
+#     trailer ('#TheRescueMovie / Instagram: instagram.com/therescuemovie ...')
+#     -> _discover_socials() reads the trailer descriptions, IMDb 'Official
+#     sites' and the official homepage, then probes the same handle on any
+#     platform still missing.
+VERIFY_PAGE_CONTENT = os.getenv("VERIFY_PAGE_CONTENT", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+SOCIAL_DISCOVERY = os.getenv("SOCIAL_DISCOVERY", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+SOCIAL_GUESSING = os.getenv("SOCIAL_GUESSING", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+try:
+    MAX_SOCIAL_PROBES = max(0, int(os.getenv("MAX_SOCIAL_PROBES", "5")))
+except ValueError:
+    MAX_SOCIAL_PROBES = 5
+
+_PAGE_CACHE = {}
+_PAGE_LOCK = threading.Lock()
+
+
+def _fetch(url, params=None, headers=None):
+    """(status, text) with the polite session; (None, '') on network failure."""
+    if _SESSION is None or not url:
+        return None, ""
+    try:
+        r = _polite_get(url, params=params, headers=headers or HTML_HEADERS,
+                        timeout=VALIDATE_TIMEOUT, allow_redirects=True)
+        return r.status_code, (r.text or "")
+    except Exception as e:  # noqa: BLE001
+        log.info("fetch failed (%s): %s", url, e)
+        return None, ""
+
+
+def _page(url):
+    """HTML of a page (cached for the process), '' when unavailable."""
+    if not (VALIDATE_URLS and VERIFY_PAGE_CONTENT and url):
+        return ""
+    u = str(url).replace("http://", "https://")
+    with _PAGE_LOCK:
+        if u in _PAGE_CACHE:
+            return _PAGE_CACHE[u]
+    status, text = _fetch(u)
+    html = text if status == 200 else ""
+    with _PAGE_LOCK:
+        _PAGE_CACHE[u] = html
+    return html
+
+
+def rt_info(url):
+    return SP.parse_rottentomatoes(_page(url)) if (SP and url) else {}
+
+
+def mc_info(url):
+    return SP.parse_metacritic(_page(url)) if (SP and url) else {}
+
+
+def _page_year_conflict(url, year, kind):
+    """True when the RT / MC page at `url` is dated to a different year than
+    the title's (a same-named title). False/None when it fits or can't tell."""
+    if not (year and url and SP):
+        return None
+    info = rt_info(url) if kind == "rt" else mc_info(url)
+    py = info.get("year")
+    if not py:
+        return None
+    return abs(int(py) - int(year)) > IMDB_YEAR_TOLERANCE
+
+
+def _same_studio(a, b):
+    try:
+        import network_resolver as NR
+        ca, cb = NR._core(a), NR._core(b)
+    except Exception:  # noqa: BLE001
+        ca, cb = _norm(a), _norm(b)
+    return bool(ca and cb) and (ca == cb or ca.startswith(cb) or cb.startswith(ca))
+
+
+def _cross_check(meta, is_movie, year, notes):
+    """Confirm network + Wide/Limited against Rotten Tomatoes, Metacritic and
+    the distributor / official site instead of trusting one source."""
+    rt = rt_info(meta.get("rottentomatoes")) if is_movie else {}
+    mc = mc_info(meta.get("metacritic"))
+    # -- network ----------------------------------------------------------
+    rt_dist = rt.get("distributor") or ""
+    mc_dist = mc.get("distributor") or ""
+    if is_movie:
+        if not meta.get("network") and (rt_dist or mc_dist):
+            meta["network"] = rt_dist or mc_dist
+            meta["_network_source"] = "Rotten Tomatoes" if rt_dist else "Metacritic"
+        elif meta.get("network"):
+            for label, d in (("Rotten Tomatoes", rt_dist), ("Metacritic", mc_dist)):
+                if d and not _same_studio(meta["network"], d):
+                    _note(notes, "Network: %r was found but %s lists the distributor as "
+                                 "%r -- verify." % (meta["network"], label, d))
+    # -- release date gap-fill ---------------------------------------------
+    if not meta.get("released_on"):
+        for d in (rt.get("release_date"), mc.get("release_date")):
+            if d:
+                meta["released_on"] = d
+                break
+    # -- Wide / Limited (movies) ----------------------------------------------
+    if is_movie and SP is not None:
+        homes = [h for h in (meta.get("_homepage"), meta.get("_homepage_imdb")) if h]
+        dist_scale = ""
+        for h in homes[:2]:
+            dist_scale = SP.parse_official_site_scale(_page(h))
+            if dist_scale:
+                break
+        votes = {
+            "rottentomatoes": rt.get("scale", ""),
+            "metacritic": mc.get("scale", ""),
+            "distributor": dist_scale,
+            "boxofficemojo": meta.get("release_scale", ""),
+            "tmdb": SP.tmdb_us_scale(meta.get("_us_release_types")),
+        }
+        scale, conflict = SP.release_scale_consensus(votes)
+        if scale:
+            meta["release_scale"] = scale
+            meta["release_scale_sources"] = ", ".join(
+                "%s=%s" % (k, v) for k, v in votes.items() if v)
+        if conflict:
+            _note(notes, conflict)
+    return meta
+
+
+# ---------------- social accounts from the studio's own material ----------
+_SOCIAL_FIELD = {"instagram": "instagram_user", "facebook": "facebook_page",
+                 "twitter": "twitter_handle", "tiktok": "tiktok_user"}
+_SOCIAL_LABEL = {"instagram": "Instagram", "facebook": "Facebook",
+                 "twitter": "X/Twitter", "tiktok": "TikTok"}
+
+
+def _social_value(plat, handle):
+    h = str(handle or "").strip().lstrip("@").strip("/")
+    if plat == "facebook":
+        return "http://www.facebook.com/" + h
+    return h
+
+
+def _existing_handle(meta, plat):
+    v = str(meta.get(_SOCIAL_FIELD[plat]) or "").strip()
+    if not v:
+        return ""
+    if plat == "facebook":
+        v = re.sub(r"^https?://(?:www\.|m\.)?facebook\.com/", "", v, flags=re.I)
+    return v.strip("/").lstrip("@").split("?")[0]
+
+
+def youtube_descriptions(video_ids):
+    """[(video_id, title, description)] for YouTube videos (API when a key
+    is configured, the public watch page otherwise)."""
+    ids = [v for v in (video_ids or []) if v][:4]
+    if not ids:
+        return []
+    out = []
+    if YOUTUBE_API_KEY:
+        data = _get_json("https://www.googleapis.com/youtube/v3/videos",
+                         {"part": "snippet", "id": ",".join(ids), "key": YOUTUBE_API_KEY})
+        for it in (data or {}).get("items") or []:
+            sn = it.get("snippet") or {}
+            out.append((it.get("id"), sn.get("title") or "", sn.get("description") or ""))
+        if out:
+            return out
+    if SP is None:
+        return out
+    for vid in ids:
+        status, html = _fetch("https://www.youtube.com/watch", params={"v": vid})
+        if status == 200 and html:
+            t = re.search(r"<title>(.*?)</title>", html, re.S)
+            out.append((vid, (t.group(1) if t else ""), SP.youtube_description_from_watch_html(html)))
+    return out
+
+
+def youtube_trailer_ids(title, year=None, limit=3):
+    """Official-trailer video ids from a YouTube search, used when TMDB lists
+    no trailer (common for upcoming titles)."""
+    q = "%s %s official trailer" % (title, year or "")
+    ids = []
+    if YOUTUBE_API_KEY:
+        data = _get_json(YT_SEARCH, {"part": "snippet", "q": q.strip(), "type": "video",
+                                     "maxResults": 8, "key": YOUTUBE_API_KEY})
+        for it in (data or {}).get("items") or []:
+            vt = (it.get("snippet") or {}).get("title") or ""
+            vid = (it.get("id") or {}).get("videoId")
+            if vid and SP and SP.is_trailer_for(vt, title) and re.search(r"official", vt, re.I):
+                ids.append(vid)
+        return ids[:limit]
+    if SP is None:
+        return ids
+    status, html = _fetch("https://www.youtube.com/results", params={"search_query": q.strip()})
+    if status == 200:
+        for vid, vt in SP.youtube_search_results(html, limit=8):
+            # search results include fan 'first look' uploads: official only
+            if SP.is_trailer_for(vt, title) and re.search(r"official", vt, re.I):
+                ids.append(vid)
+    return ids[:limit]
+
+
+def probe_handle(plat, handle):
+    """(exists, display_name) for a handle on a platform, keyless.
+    exists: True (the account page answered as that account), False (a
+    definitive 'no such account'), None (login wall / throttled -- unknown)."""
+    h = str(handle or "").strip().lstrip("@")
+    if not h:
+        return False, ""
+    try:
+        if plat == "twitter":
+            status, text = _fetch("https://publish.twitter.com/oembed",
+                                  params={"url": "https://twitter.com/" + h})
+            if status == 404:
+                return False, ""
+            if status == 200:
+                try:
+                    return True, str((json.loads(text) or {}).get("author_name") or "")
+                except Exception:  # noqa: BLE001
+                    return None, ""
+            return None, ""
+        if plat == "instagram":
+            status, text = _fetch("https://www.instagram.com/%s/" % h)
+            if status in (404, 410):
+                return False, ""
+            m = re.search(r'property="og:title"\s+content="([^"]*)"', text or "")
+            if m:
+                t = SP.page_text(m.group(1)) if SP else m.group(1)
+                if ("@" + h).lower() in t.lower():
+                    return True, t.split("(@")[0].strip()
+            return None, ""
+        if plat == "tiktok":
+            status, text = _fetch("https://www.tiktok.com/@%s" % h)
+            if status in (404, 410):
+                return False, ""
+            if re.search(r'"uniqueId"\s*:\s*"%s"' % re.escape(h), text or "", re.I):
+                n = re.search(r'"nickname"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+                return True, (n.group(1) if n else "")
+            if re.search(r'"statusCode"\s*:\s*10221|Couldn.t find this account', text or ""):
+                return False, ""
+            return None, ""
+        if plat == "facebook":
+            status, text = _fetch("https://www.facebook.com/%s" % h)
+            if status in (404, 410):
+                return False, ""
+            m = re.search(r'property="og:title"\s+content="([^"]*)"', text or "")
+            if m:
+                t = SP.page_text(m.group(1)) if SP else m.group(1)
+                if t and not re.search(r"^(facebook|log in|log into)", t, re.I):
+                    return True, t
+            return None, ""
+    except Exception as e:  # noqa: BLE001
+        log.info("probe %s %s failed: %s", plat, h, e)
+    return None, ""
+
+
+def _name_fits(display_name, title):
+    dn = _norm(display_name)
+    return bool(dn) and any(k in dn for k in (SP.title_keys(title) if SP else {_norm(title)})
+                            if len(k) >= 3)
+
+
+def _discover_socials(meta, title, year, notes, network=""):
+    """Fill / correct the title's social handles from the studio's OWN
+    material, then probe the same handle on any platform still missing."""
+    if not (SP and SOCIAL_DISCOVERY and title):
+        return meta
+    exclude = []
+    if network:
+        exclude.append(network)
+    found, hashtags = {}, []
+
+    def take(links, source):
+        for plat, h in SP.pick_title_handles(links, title, year, exclude=exclude).items():
+            if plat in _SOCIAL_FIELD:
+                found.setdefault(plat, (h, source))
+
+    # 1) IMDb 'Official sites'
+    take(meta.get("_imdb_socials") or {}, "IMDb official sites")
+    # 2) official trailer / teaser descriptions (TMDB's list, else a search)
+    vids = list(meta.get("_trailer_keys") or [])
+    if VALIDATE_URLS and len(found) < len(_SOCIAL_FIELD):
+        if not vids:
+            vids = youtube_trailer_ids(title, year)
+        for vid, vt, desc in youtube_descriptions(vids):
+            take(SP.extract_social_links(desc), "official trailer")
+            hashtags += [t for t in SP.extract_hashtags(desc) if t not in hashtags]
+    # 3) official homepage(s)
+    if VALIDATE_URLS and len(found) < len(_SOCIAL_FIELD):
+        for home in [h for h in (meta.get("_homepage"), meta.get("_homepage_imdb")) if h][:2]:
+            html = _page(home)
+            if html:
+                take(SP.extract_social_links(html), "official site")
+                hashtags += [t for t in SP.extract_hashtags(SP.page_text(html))
+                             if t not in hashtags][:5]
+
+    for plat, (h, source) in found.items():
+        field = _SOCIAL_FIELD[plat]
+        cur = _existing_handle(meta, plat)
+        if not cur:
+            meta[field] = _social_value(plat, h)
+        elif _norm(cur) != _norm(h):
+            _note(notes, "Social handles: %s %r replaced by %r listed on the %s "
+                         "-- verify." % (_SOCIAL_LABEL[plat], cur, h, source))
+            meta[field] = _social_value(plat, h)
+
+    # 4) platforms still missing -> probe the handle the studio uses elsewhere
+    missing = [p for p in _SOCIAL_FIELD if not _existing_handle(meta, p)]
+    if not (missing and SOCIAL_GUESSING and VALIDATE_URLS):
+        return meta
+    known = [_existing_handle(meta, p) for p in _SOCIAL_FIELD]
+    known = [k for k in known if k and SP.handle_matches_title(k, title, year)]
+    guesses = SP.handle_guesses(title, year, known=known, hashtags=hashtags)
+    for plat in missing:
+        for h, strength in guesses[:MAX_SOCIAL_PROBES]:
+            exists, name = probe_handle(plat, h)
+            accept = (exists is True and (strength == "strong" or _name_fits(name, title))) \
+                or (exists is None and strength == "strong")
+            if not accept:
+                continue
+            meta[_SOCIAL_FIELD[plat]] = _social_value(plat, h)
+            _note(notes, "Social handles: %s %r was not listed by any source; it "
+                         "matches the title's handle on other platforms%s -- verify."
+                  % (_SOCIAL_LABEL[plat], h,
+                     "" if exists else " (the account page could not be opened)"))
+            break
+    return meta
+
+
+_PRIVATE_KEYS = ("_trailer_keys", "_homepage", "_homepage_imdb", "_us_release_types",
+                 "_imdb_socials", "_network_source")
+
+
+def _drop_private(meta):
+    for k in _PRIVATE_KEYS:
+        meta.pop(k, None)
+    return meta
+
+
 def _fill(dst, src):
     for k, v in (src or {}).items():
         if v not in (None, "") and dst.get(k) in (None, ""):
@@ -2969,10 +3415,18 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None, want_year=None):
     else:
         meta.pop("rottentomatoes", None)
 
+    # confirm network + Wide/Limited on RT / Metacritic / the distributor's
+    # site, then find the socials the studio itself publishes for the title
+    try:
+        _cross_check(meta, is_movie, _yr, notes)
+        _discover_socials(meta, title_hint, _yr, notes, network=meta.get("network", ""))
+    except Exception as e:  # noqa: BLE001
+        log.warning("cross-check failed for %s: %s", tt, e)
+
     # drop wrong-owner (band/artist) handles first, then dead ones
     verify_socials(meta, title_hint, reject_foreign=True)
     _carry_year_notes(meta, notes)
-    return meta
+    return _drop_private(meta)
 
 
 def _carry_year_notes(meta, notes):
@@ -2996,6 +3450,12 @@ def fetch_metadata_by_tt(tt, is_movie=True, title="", year_hint=""):
     if not tt:
         return {}
     want_year = _year_from(year_hint)
+    if not want_year:
+        # 'The Rescue (2027)' -> 2027 (the bracket year the user typed)
+        _, _br = _split_disambiguator(
+            re.sub(r"\s*-\s*DAR\s*$", "", title or "", flags=re.IGNORECASE).strip())
+        if _br.isdigit() and len(_br) == 4:
+            want_year = int(_br)
     key = ("tt:" + tt, bool(is_movie), want_year or 0)
     if key in _CACHE:
         return dict(_CACHE[key])
@@ -3061,11 +3521,35 @@ def fetch_metadata(title, is_movie=True, year_hint=""):
         if not tt:
             tmdb_meta, wid = tmdb_lookup(lookup, is_movie, want_year)
             tt = _tt(tmdb_meta.get("imdb_id")) or _tt(omdb_lookup(lookup, want_year).get("imdb_id"))
+        # No year given: the chosen IMDb entry's own year becomes the year
+        # every other source (Wikipedia, RT, Metacritic, socials) must match,
+        # so they all describe the SAME title (Sep 2026 'The Rescue' fix: RT /
+        # MC used to fall back to the bare slug -- another same-named film).
+        eff_year = want_year
+        if not eff_year:
+            eff_year = _year_from((um or {}).get("release_date")) \
+                or (int(sug["y"]) if (sug and str(sug.get("y") or "").isdigit()) else None)
+        # several same-named titles and the user did not say which -> tell them
+        same_named = [] if want_year else title_candidates(lookup, is_movie)
         if tt:
-            meta = _enrich_by_tt(tt, is_movie, lookup, wikidata_id=wid, want_year=want_year)
+            meta = _enrich_by_tt(tt, is_movie, lookup, wikidata_id=wid, want_year=eff_year)
+            _drop_private(tmdb_meta)
             tmdb_meta.pop("production_company", None)
             tmdb_meta.pop("released_on_us", None)
             _fill(meta, tmdb_meta)
+            if len(same_named) > 1:
+                others = [c for c in same_named if c["tt"] != tt]
+                chosen = next((c for c in same_named if c["tt"] == tt), None)
+                meta["_same_named"] = same_named
+                meta.setdefault("_year_notes", []).append(
+                    "IMDb: %d titles are named %r -- used %s%s. Others: %s. Add the "
+                    "year in brackets, e.g. '%s (%s)', to pick another."
+                    % (len(same_named), lookup,
+                       ("the %s one" % chosen["year"]) if chosen and chosen["year"] else tt,
+                       (" (%s)" % tt),
+                       "; ".join("%s %s (%s)" % (c["year"] or "undated", c["kind"], c["tt"])
+                                 for c in others[:6]),
+                       lookup, (others[0]["year"] or "YYYY")))
         else:
             notes = []
             tmdb_meta.pop("production_company", None)
@@ -3082,7 +3566,7 @@ def fetch_metadata(title, is_movie=True, year_hint=""):
             _fill(meta, wikidata_meta(lookup, qid=(wqid or wid), is_movie=is_movie,
                                       verify=True, year=want_year))
             _fill(meta, omdb_lookup(lookup, want_year))
-            _yr = want_year or _year_from(meta.get("released_on"))
+            _yr = eff_year or _year_from(meta.get("released_on"))
             mc = resolve_metacritic(lookup, is_movie,
                                     candidate=meta.get("metacritic"),
                                     curated=bool(meta.get("metacritic")),
@@ -3099,8 +3583,14 @@ def fetch_metadata(title, is_movie=True, year_hint=""):
                 meta["rottentomatoes"] = rt
             else:
                 meta.pop("rottentomatoes", None)
+            try:
+                _cross_check(meta, is_movie, _yr, notes)
+                _discover_socials(meta, lookup, _yr, notes, network=meta.get("network", ""))
+            except Exception as e:  # noqa: BLE001
+                log.warning("cross-check failed for %r: %s", lookup, e)
             verify_socials(meta, lookup, reject_foreign=True)
             _carry_year_notes(meta, notes)
+            _drop_private(meta)
         if sug_ptype:
             meta["program_type"] = sug_ptype  # IMDb's own type beats TMDB's
         # date is authoritative: if we still hold an IMDb id whose year disagrees
