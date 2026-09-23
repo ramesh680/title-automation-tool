@@ -468,7 +468,7 @@
                 .then(r => r.json())
                 .then(j => {
                     if (j.error && j.status !== 'running') {
-                        showMessage('previewMessage', j.error, 'error');
+                        showMessage('previewMessage', (j.lost ? j.hint : j.error), 'error');
                         showLoading('previewContent', false);
                         return;
                     }
@@ -977,7 +977,7 @@
                 .then(r => r.json())
                 .then(j => {
                     if (j.error && j.status !== 'running') {
-                        showMessage('previewMessage', j.error, 'error');
+                        showMessage('previewMessage', (j.lost ? j.hint : j.error), 'error');
                         showLoading('previewContent', false);
                         return;
                     }
