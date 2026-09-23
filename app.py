@@ -34,6 +34,12 @@ except Exception:  # keep the app running even if the module is missing
     def warm_upcoming():
         pass
 
+try:
+    from metadata_fetcher import title_candidates
+except Exception:  # pragma: no cover
+    def title_candidates(title, is_movie=True):
+        return []
+
 import json
 import base64
 
@@ -196,10 +202,46 @@ def _ref_ci_get(mapping, key):
     return None
 
 
-def _ref_normalize_network(raw):
+try:
+    import network_resolver as _NR
+except Exception as _e:  # pragma: no cover - fail soft, old behaviour
+    _NR = None
+    logging.warning(f"network_resolver unavailable: {_e}")
+
+
+def _db_network_labels(is_movie=True):
+    """Every network/studio label our database (the Ops ingest templates +
+    the inline fallback tables) knows, in its exact spelling."""
+    if is_movie:
+        extra = (list(_NETWORK_TO_YOUTUBE) + list(_NETWORK_TO_COMPANIES)
+                 + list(_NETWORK_TO_SUBCATEGORY) + list(_NETWORK_LABEL.values()))
+        return _NR.movie_labels(_tref(), extra) if (_NR and _tref()) else extra
+    extra = list(_TV_NETWORK) if '_TV_NETWORK' in globals() else []
+    return _NR.tv_labels(_tref(), extra) if (_NR and _tref()) else extra
+
+
+def resolve_network(raw, is_movie=True):
+    """(database label, matched) for a raw distributor/network spelling.
+    'Paramount Pictures' -> ('Paramount', True). An unknown studio comes back
+    unchanged with matched=False so the row can be flagged for review."""
+    raw_s = str(raw or '').strip()
+    if not raw_s:
+        return '', True
+    first = _ref_ci_get(_NETWORK_LABEL, raw_s) if is_movie else None
+    if first:
+        return first, True
+    if _NR is None:
+        return raw_s, True
+    aliases = dict(_NR.ALIASES_MOVIE if is_movie else _NR.ALIASES_TV)
+    if is_movie:
+        aliases.update({k: v for k, v in _NETWORK_LABEL.items()})
+    return _NR.canonical_network(raw_s, _db_network_labels(is_movie), aliases)
+
+
+def _ref_normalize_network(raw, is_movie=True):
     if not raw:
         return raw
-    return _ref_ci_get(_NETWORK_LABEL, raw) or str(raw).strip()
+    return resolve_network(raw, is_movie)[0] or str(raw).strip()
 
 
 def _ref_normalize_genres(genre_multiline):
@@ -232,8 +274,22 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 logging.basicConfig(level=logging.INFO)
 
-# Define ALL 42 columns in EXACT order (matches Test_Run.xlsx: A -> AP)
-COLUMNS = [
+# Columns that the ingestion system generates itself (stakeholder request,
+# Sep 2026): record_type, title_created_date and youtube_channel_company are
+# stamped at ingest time, so the generator no longer exports them. Rows still
+# carry the values internally (youtube_channel_company feeds the
+# youtube_channel_username variants), they are just not written to the file.
+INGEST_GENERATED_COLUMNS = ('record_type', 'title_created_date',
+                            'youtube_channel_company')
+
+
+def _export_cols(cols):
+    return [c for c in cols if c not in INGEST_GENERATED_COLUMNS]
+
+
+# Movie columns in EXACT order (Test_Run.xlsx order, minus the three
+# ingest-generated columns above -> 39 columns)
+COLUMNS = _export_cols([
     'record_type', 'brand_id', 'title', 'title_created_date', 'title_category',
     'title_sub_category', 'genre', 'primary_genre', 'iso_mic', 'stock_exchange',
     'ticker_symbol', 'companies', 'brand_set', 'composite_brand_set', 'active',
@@ -245,7 +301,7 @@ COLUMNS = [
     'rottentomatoes', 'imdb_id', 'metacritic',
     'twitter_search_terms', 'instagram_business_hashtags', 'twitter_search_term_keywords',
     'url_managers', 'last_reviewed'
-]
+])
 
 # Social-media / metadata columns that identify a "full schema" upload
 SOCIAL_COLUMNS = [
@@ -448,7 +504,7 @@ def attribution_window_for(metadata, is_movie, is_dar, qualified=None):
 # ======================= TV Shows (BrandIngest schema) =======================
 # TV rows export in the 39-column ApplyBrandDefinitionReport / BrandIngest
 # format (learned from the manual Ops file), NOT the movie schema.
-TV_COLUMNS = [
+TV_COLUMNS = _export_cols([
     'record_type', 'brand_id', 'title', 'title_category', 'title_sub_category',
     'genre', 'primary_genre', 'rovi_id', 'ticker_symbol', 'title_content_windows',
     'companies', 'brand_set', 'active', 'released_on', 'box_office', 'street_date',
@@ -459,7 +515,7 @@ TV_COLUMNS = [
     'facebook_search_terms', 'twitter_search_terms', 'instagram_search_terms',
     'tumblr_search_terms', 'twitter_search_term_keywords', 'youtube_search_terms',
     'reddit_search_terms',
-]
+])
 
 # corporate roll-up brand_set blocks (appended to DAR rows)
 _DISNEY_TV = ("The Walt Disney Company > Overall Roll-up\n"
@@ -685,6 +741,9 @@ def create_tv_row(title, network="", metadata=None):
     clean_title = re.sub(r"\s*-\s*DAR\s*$", "", title, flags=re.IGNORECASE).strip()
 
     eff_network = (str(metadata.get('network') or network or '')).strip()
+    _net_raw, _net_known = eff_network, True
+    if eff_network:
+        eff_network, _net_known = resolve_network(eff_network, is_movie=False)
     info = _tv_net(eff_network)
     # network record from the Ops ingest template (authoritative when present)
     tinfo = _tref().tv_network(eff_network) if (_tref() and eff_network) else None
@@ -800,6 +859,10 @@ def create_tv_row(title, network="", metadata=None):
         'youtube_search_terms': metadata.get('youtube_search_terms', ''),
         'reddit_search_terms': mv('reddit_search_terms', gen_reddit),
     }
+    if eff_network and not _net_known:
+        _add_review(row, f"Network '{_net_raw}' is not in the TV network database "
+                         f"-- map it to an existing network before ingest")
+    _surface_discovery_notes(row, metadata)
     return row
 
 
@@ -1131,7 +1194,7 @@ def create_talent_row(title, metadata=None, respect_title_dar=False):
 # an optional 'Publication Type - X' sub-category, and '#name|DAR|DAR' twitter
 # search terms. genre / box-office / ratings (RT, IMDb, Metacritic) stay blank --
 # publishing brands are not rated titles. network carries the parent publisher.
-PUBLISHER_COLUMNS = [
+PUBLISHER_COLUMNS = _export_cols([
     'brand_id', 'title', 'title_created_date', 'title_category',
     'title_sub_category', 'genre', 'primary_genre', 'iso_mic', 'stock_exchange',
     'ticker_symbol', 'companies', 'brand_set', 'composite_brand_set', 'active',
@@ -1144,7 +1207,7 @@ PUBLISHER_COLUMNS = [
     'pinterest_board', 'wikipedia_page', 'rottentomatoes', 'imdb_id',
     'metacritic', 'twitter_search_terms', 'instagram_business_hashtags',
     'twitter_search_term_keywords', 'last_reviewed',
-]
+])
 
 PUBLISHER_DEFAULT_BRAND_SET = "LF // Publishing\nPristine DAR Brands"
 PUBLISHER_BASE_BRAND_SET = "LF // Publishing\nCompetitive View"
@@ -1513,7 +1576,7 @@ def _strip_language_subcategory(sub):
 
 
 def create_row(title, is_movie, network="", metadata=None):
-    """Create a data row for a title - ALL 42 COLUMNS POPULATED.
+    """Create a data row for a title - every movie column populated.
 
     Any value present in `metadata` overrides the computed default, so an
     uploaded row's channels (and every other field) are preserved.
@@ -1529,8 +1592,10 @@ def create_row(title, is_movie, network="", metadata=None):
     # Effective network = discovered/explicit network, else the passed arg;
     # normalise raw distributor -> LF network label (e.g. "Lionsgate" -> "Lionsgate / Summit").
     eff_network = (str(metadata.get('network') or network or '')).strip()
+    _net_raw = eff_network
+    _net_known = True
     if REF is not None and eff_network:
-        eff_network = REF.normalize_network(eff_network)
+        eff_network, _net_known = resolve_network(eff_network, is_movie=True)
 
     # studio record from the Ops ingest template (authoritative when present)
     sinfo = _tref().film_studio(eff_network) if (_tref() and eff_network) else None
@@ -1542,8 +1607,11 @@ def create_row(title, is_movie, network="", metadata=None):
     if not _sub and sinfo:
         # template-driven: Release scale + Studio Type. Movies deliberately omit
         # Language Type from title_sub_category.
-        scale = _scale if _scale in ('Wide', 'Limited') else 'Limited'
         stype = sinfo.get('studio_type') or 'Studio - Independent'
+        # no source said Wide/Limited: a major studio's theatrical release is
+        # Wide, everyone else defaults to Limited (as before)
+        scale = _scale if _scale in ('Wide', 'Limited') else (
+            'Wide' if stype.strip().lower() == 'studio - major' else 'Limited')
         _sub = f"Release - {scale}\n{stype}"
     if not _sub and REF is not None:
         _sub = REF.subcategory_for(eff_network)
@@ -1715,7 +1783,38 @@ def create_row(title, is_movie, network="", metadata=None):
         _prev = str(row.get('_review_reason') or '').strip()
         row['_review_reason'] = (_prev + '; ' + _reason) if _prev else _reason
 
+    # network must exist in our database (Sep 2026: 'Paramount Pictures' was
+    # shipped for 'The Rescue' although the database label is 'Paramount')
+    if eff_network and not _net_known:
+        _add_review(row, f"Network '{_net_raw}' is not in the studio database "
+                         f"-- map it to an existing network before ingest")
+    _surface_discovery_notes(row, metadata)
     return row
+
+
+def _add_review(row, reason):
+    """Flag a row for the Needs Review sheet, appending (never replacing)."""
+    reason = str(reason or '').strip()
+    if not reason:
+        return
+    row['_needs_review'] = True
+    prev = str(row.get('_review_reason') or '').strip()
+    if reason in prev:
+        return
+    row['_review_reason'] = (prev + '; ' + reason) if prev else reason
+
+
+def _surface_discovery_notes(row, metadata):
+    """Carry auto-discovery warnings (release-year mismatches, conflicting
+    release scale / network between sources, same-named titles, unconfirmed
+    social handles) onto the Needs Review sheet so nothing is silent."""
+    notes = []
+    if metadata.get('_imdb_year_note'):
+        notes.append(metadata['_imdb_year_note'])
+    notes += list(metadata.get('_year_notes') or [])
+    notes += list(metadata.get('_review_notes') or [])
+    for n in notes:
+        _add_review(row, n)
 
 
 def _read_upload(src):
@@ -2693,6 +2792,40 @@ def api_lookup():
         meta = fetch_metadata(title, is_movie, year_hint=yr)
     row = make_row(title or tt, is_movie, '', dict(meta))
     return jsonify({'discovered': meta, 'row': row})
+
+
+@app.route('/api/candidates', methods=['POST'])
+def api_candidates():
+    """Same-named titles for each Movie / TV title in the payload, so the user
+    can pick the one they mean before generating.
+
+    Body: {"titles": [...], "titles_type": {title: kind}}
+    Returns {"candidates": {title: [{tt, title, year, kind, stars, imdb_url}]}}
+    -- only titles with MORE than one match and no '(YYYY)' already typed."""
+    data = request.get_json(silent=True) or {}
+    titles = [str(t).strip() for t in data.get('titles', []) if str(t or '').strip()]
+    types = data.get('titles_type', {}) or {}
+    out = {}
+
+    def one(t):
+        kind = _norm_kind(types.get(t, 'movie'))
+        if kind not in ('movie', 'tv'):
+            return t, []
+        clean = re.sub(r"\s*-\s*DAR\s*$", "", t, flags=re.IGNORECASE).strip()
+        if re.search(r"\((?:19|20)\d{2}\)\s*$", clean):
+            return t, []          # the user already said which year
+        try:
+            return t, title_candidates(clean, kind == 'movie')
+        except Exception as e:  # noqa: BLE001
+            logging.warning(f"candidates failed for {t!r}: {e}")
+            return t, []
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for t, cands in ex.map(one, titles[:200]):
+            if len(cands) > 1:
+                out[t] = cands
+    return jsonify({'candidates': out})
 
 
 def _preview_payload(rows, preview_limited):
