@@ -4428,15 +4428,22 @@ _JOB_TTL = 1800  # seconds to keep a finished job's file in memory
 
 
 def _job_set(jid, **kw):
+    if kw.get('status') in ('done', 'error'):
+        kw.setdefault('finished', time.time())
     with _JOBS_LOCK:
         if jid in _JOBS:
             _JOBS[jid].update(kw)
 
 
 def _prune_jobs():
+    """Drop FINISHED jobs older than _JOB_TTL. A job that is still running is
+    never pruned -- a long review used to be deleted mid-run after 30 min and
+    the page then showed 'Unknown or expired job'."""
     now = time.time()
     with _JOBS_LOCK:
-        for k in [k for k, v in _JOBS.items() if now - v.get('created', now) > _JOB_TTL]:
+        for k in [k for k, v in _JOBS.items()
+                  if v.get('status') != 'running'
+                  and now - v.get('finished', v.get('created', now)) > _JOB_TTL]:
             _JOBS.pop(k, None)
 
 
@@ -4559,7 +4566,9 @@ def job_status(jid):
     with _JOBS_LOCK:
         j = _JOBS.get(jid)
         if not j:
-            return jsonify({'error': 'Unknown or expired job'}), 404
+            return jsonify({'error': 'Unknown or expired job', 'lost': True,
+                            'hint': ('The server restarted while this job was running, so '
+                                     'its progress was lost. Please run it again.')}), 404
         eta = None
         if j['status'] == 'running' and j.get('done') and j.get('total'):
             elapsed = time.time() - j.get('created', time.time())
