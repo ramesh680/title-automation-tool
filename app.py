@@ -40,6 +40,15 @@ except Exception:  # pragma: no cover
     def title_candidates(title, is_movie=True):
         return []
 
+try:
+    from metadata_fetcher import game_candidates, talent_candidates
+except Exception:  # pragma: no cover
+    def game_candidates(name):
+        return []
+
+    def talent_candidates(name):
+        return []
+
 import json
 import base64
 
@@ -1817,9 +1826,24 @@ def _surface_discovery_notes(row, metadata):
         _add_review(row, n)
 
 
-def _read_upload(src):
-    """Read an uploaded CSV/XLSX into a DataFrame.
-    `src` is a Werkzeug FileStorage OR a (bytes, filename) tuple (used by jobs)."""
+_NON_INGEST_SHEETS = ('needs review', 'summary', 'findings')
+
+
+def _is_ingest_sheet(name, df):
+    n = str(name or '').strip().lower()
+    if n in _NON_INGEST_SHEETS or n.startswith('gemini') or n.startswith('reviewed'):
+        return False
+    return any(str(c).strip().lower() == 'title' for c in df.columns)
+
+
+def _read_upload_frames(src):
+    """[(sheet_name, DataFrame)] for every INGEST sheet of an upload.
+
+    A mixed TitleForge export has one sheet per template (Movies, TV Shows,
+    Talent, Video Games, ...). Only the first sheet used to be read, so every
+    other template in the file was silently skipped by Review and by
+    Generate-from-file. Helper sheets (Needs Review, Gemini *, a Review's own
+    Summary / Findings / Reviewed) are ignored. A CSV is one frame."""
     if isinstance(src, tuple):
         data, filename = src
         stream = BytesIO(data)
@@ -1828,12 +1852,27 @@ def _read_upload(src):
         stream = src
     fn = (filename or '').lower()
     if fn.endswith('.csv'):
-        df = pd.read_csv(stream)
+        frames = [('Sheet1', pd.read_csv(stream))]
     else:
-        df = pd.read_excel(stream, engine='openpyxl')
-    df.columns = [str(c).strip() for c in df.columns]
-    df = df.where(pd.notnull(df), '')
-    return df
+        book = pd.read_excel(stream, engine='openpyxl', sheet_name=None)
+        frames = [(n, d) for n, d in book.items() if _is_ingest_sheet(n, d)] \
+            or list(book.items())[:1]
+    out = []
+    for n, df in frames:
+        df.columns = [str(c).strip() for c in df.columns]
+        out.append((n, df.where(pd.notnull(df), '')))
+    return out
+
+
+def _read_upload(src):
+    """Read an uploaded CSV/XLSX into ONE DataFrame (every ingest sheet,
+    stacked; columns a sheet lacks are blank for its rows).
+    `src` is a Werkzeug FileStorage OR a (bytes, filename) tuple (used by jobs)."""
+    frames = _read_upload_frames(src)
+    if len(frames) == 1:
+        return frames[0][1]
+    df = pd.concat([d for _n, d in frames], ignore_index=True, sort=False)
+    return df.where(pd.notnull(df), '')
 
 
 def _release_hint(src, lower_cols=None):
@@ -1855,12 +1894,18 @@ _YEAR_NOTE_COLUMNS = (
     ('Metacritic', 'metacritic'),
     ('Rotten Tomatoes', 'rottentomatoes'),
     ('IMDb', 'imdb_id'),
+    ('Network', 'network'),
+    ('Release scale', 'title_sub_category'),
+    ('Social handles: Instagram', 'instagram_user'),
+    ('Social handles: Facebook', 'facebook_page'),
+    ('Social handles: X/Twitter', 'twitter_handle'),
+    ('Social handles: TikTok', 'tiktok_user'),
     ('Social handles', 'instagram_user'),
 )
 
 
 def _YEAR_NOTE_COLUMN(note):
-    """Which column a release-year warning belongs against."""
+    """Which column a discovery warning belongs against."""
     for prefix, col in _YEAR_NOTE_COLUMNS:
         if str(note or '').startswith(prefix):
             return col
@@ -2236,10 +2281,19 @@ def build_rows_from_titles(data, max_titles=None, progress=None):
         titles = titles[:max_titles]
     include_dar = data.get('includeDar', True)
     auto_fetch = bool(data.get('autoFetch', False))
+    # exact ids chosen in the same-name picker: {title: {tt?, qid?}}
+    picks = data.get('picks', {}) or {}
     def _one_title(i, title):
         kind = _norm_kind(data.get('titles_type', {}).get(title, 'movie'))
         network = data.get('networks', {}).get(title, '')
         base_meta = data.get('metadata', {}).get(title, {})
+        pick = picks.get(title) or {}
+        _pick_tt = str(pick.get('tt') or '').strip()
+        _pick_qid = str(pick.get('qid') or '').strip()
+        if not re.fullmatch(r"tt\d{5,}", _pick_tt):
+            _pick_tt = ''
+        if not re.fullmatch(r"Q\d+", _pick_qid):
+            _pick_qid = ''
         out = []
         if kind in TFX_KINDS and TFX_OK:
             seed = base_meta
@@ -2258,7 +2312,8 @@ def build_rows_from_titles(data, max_titles=None, progress=None):
             # the title's metadata payload (any accepted profession column name)
             profession = str(data.get('professions', {}).get(title, '')
                              or _row_profession(base_meta or {})).strip()
-            metadata = dict(fetch_person(title, profession=profession) or {}) if auto_fetch else {}
+            metadata = dict(fetch_person(title, qid=_pick_qid or None,
+                                         profession=profession) or {}) if auto_fetch else {}
             for k, v in (base_meta or {}).items():
                 if v not in (None, ''):
                     metadata[k] = v
@@ -2274,7 +2329,10 @@ def build_rows_from_titles(data, max_titles=None, progress=None):
             out.append(make_row(title, False, '', metadata, publisher=True))
         elif kind == 'game':
             metadata = dict(fetch_game(
-                title, year_hint=_release_hint(base_meta)) or {}) if auto_fetch else {}
+                title, qid=_pick_qid or None,
+                year_hint=_release_hint(base_meta)) or {}) if auto_fetch else {}
+            if auto_fetch and _pick_tt and not metadata.get('imdb_id'):
+                metadata['imdb_id'] = 'https://www.imdb.com/title/' + _pick_tt
             for k, v in (base_meta or {}).items():
                 if v not in (None, ''):
                     metadata[k] = v
@@ -2283,6 +2341,9 @@ def build_rows_from_titles(data, max_titles=None, progress=None):
                 out.append(make_row(f"{title} - DAR", False, '', metadata, game=True))
         else:
             is_movie = kind == 'movie'
+            if _pick_tt and not (base_meta or {}).get('imdb_id'):
+                # the picker's exact IMDb id -> resolution by tt, not by name
+                base_meta = dict(base_meta or {}, imdb_id='http://www.imdb.com/title/' + _pick_tt)
             metadata = _merge_meta(base_meta, title, auto_fetch, is_movie=is_movie)
             out.append(make_row(title, is_movie, network, metadata))
             if include_dar and ' - DAR' not in title:
@@ -2794,38 +2855,85 @@ def api_lookup():
     return jsonify({'discovered': meta, 'row': row})
 
 
+def _picker_items(kind, cands):
+    """Uniform picker rows for the UI, whatever the template.
+
+    headline/detail/link are what the user sees; `suffix` is appended to the
+    typed title for the chosen entry ('The Rescue' -> 'The Rescue (2027)');
+    `pick` is the exact id the backend pins ({tt} for Movies/TV, {qid, tt} for
+    Video Games, {qid} for Talent)."""
+    out = []
+    for c in cands:
+        if kind == 'talent':
+            bits = [c.get('description') or '']
+            if c.get('born'):
+                bits.append('born %s' % c['born'])
+            if c.get('occupations'):
+                bits.append(', '.join(c['occupations']))
+            out.append({'headline': c.get('title') or '',
+                        'detail': ' · '.join(b for b in bits if b),
+                        'link': c.get('imdb_url') or c.get('wikidata_url') or '',
+                        'link_text': c.get('nm') or c.get('qid') or '',
+                        'suffix': '', 'year': c.get('born'),
+                        'pick': {'qid': c.get('qid')}})
+            continue
+        y = c.get('year')
+        out.append({'headline': str(y) if y else 'undated',
+                    'detail': ' · '.join(b for b in (c.get('kind') or '', c.get('stars') or '') if b),
+                    'link': c.get('imdb_url') or c.get('wikidata_url') or '',
+                    'link_text': c.get('tt') or c.get('qid') or '',
+                    'suffix': (' (%s)' % y) if y else '', 'year': y,
+                    'pick': {k: c.get(k) for k in ('tt', 'qid') if c.get(k)},
+                    # legacy fields (Movies/TV picker, tests)
+                    'tt': c.get('tt'), 'kind': c.get('kind'), 'stars': c.get('stars'),
+                    'imdb_url': c.get('imdb_url')})
+    return out
+
+
 @app.route('/api/candidates', methods=['POST'])
 def api_candidates():
-    """Same-named titles for each Movie / TV title in the payload, so the user
-    can pick the one they mean before generating.
+    """Same-named titles for each Movie / TV / Video Game / Talent line in the
+    payload, so the user can pick the one they mean before generating.
 
-    Body: {"titles": [...], "titles_type": {title: kind}}
-    Returns {"candidates": {title: [{tt, title, year, kind, stars, imdb_url}]}}
-    -- only titles with MORE than one match and no '(YYYY)' already typed."""
+    Body: {"titles": [...], "titles_type": {title: kind}, "professions": {...}}
+    Returns {"candidates": {title: [item, ...]}, "modes": {title: "multi"|"single"}}
+    -- only titles with MORE than one match. Skipped when the user already
+    disambiguated: a '(YYYY)' on a movie/show/game, a {profession} on talent.
+    Talent is single-choice (one person per line); the others allow several."""
     data = request.get_json(silent=True) or {}
     titles = [str(t).strip() for t in data.get('titles', []) if str(t or '').strip()]
     types = data.get('titles_type', {}) or {}
-    out = {}
+    professions = data.get('professions', {}) or {}
+    out, modes = {}, {}
 
     def one(t):
         kind = _norm_kind(types.get(t, 'movie'))
-        if kind not in ('movie', 'tv'):
-            return t, []
+        if kind not in ('movie', 'tv', 'game', 'talent'):
+            return t, kind, []
         clean = re.sub(r"\s*-\s*DAR\s*$", "", t, flags=re.IGNORECASE).strip()
-        if re.search(r"\((?:19|20)\d{2}\)\s*$", clean):
-            return t, []          # the user already said which year
+        if kind != 'talent' and re.search(r"\((?:19|20)\d{2}\)\s*$", clean):
+            return t, kind, []          # the user already said which year
+        if kind == 'talent' and str(professions.get(t) or '').strip():
+            return t, kind, []          # the profession hint disambiguates
         try:
-            return t, title_candidates(clean, kind == 'movie')
+            if kind == 'game':
+                cands = game_candidates(clean)
+            elif kind == 'talent':
+                cands = talent_candidates(clean)
+            else:
+                cands = title_candidates(clean, kind == 'movie')
         except Exception as e:  # noqa: BLE001
             logging.warning(f"candidates failed for {t!r}: {e}")
-            return t, []
+            cands = []
+        return t, kind, _picker_items(kind, cands)
 
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=6) as ex:
-        for t, cands in ex.map(one, titles[:200]):
-            if len(cands) > 1:
-                out[t] = cands
-    return jsonify({'candidates': out})
+        for t, kind, items in ex.map(one, titles[:200]):
+            if len(items) > 1:
+                out[t] = items
+                modes[t] = 'single' if kind == 'talent' else 'multi'
+    return jsonify({'candidates': out, 'modes': modes})
 
 
 def _preview_payload(rows, preview_limited):
@@ -3603,8 +3711,18 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
         # A parent/umbrella that cannot resolve to the expected label stays flagged.
         if not mval:
             return True, sugg
-        mlabel = _review_norm(_ref_normalize_network(str(manual_raw or '').strip()))
-        return mlabel.lower() == eval_.lower(), sugg
+        _is_tv = 'tv' in str(cat or '').lower()
+        raw_net = str(manual_raw or '').strip()
+        mlabel = _review_norm(_ref_normalize_network(raw_net, is_movie=not _is_tv))
+        if mlabel.lower() != eval_.lower():
+            return False, sugg
+        # Sep 2026: the value must be the database's OWN spelling -- 'Paramount
+        # Pictures' resolves to the same studio as 'Paramount', but only
+        # 'Paramount' exists in the database, so the file has to carry that.
+        db_label, known = resolve_network(raw_net, is_movie=not _is_tv)
+        if known and db_label and db_label.strip().lower() != raw_net.lower():
+            return False, db_label
+        return True, sugg
 
     if c == 'companies':
         # DAR rows must be "Pristine Brand"; regular rows accept any non-blank
@@ -3695,9 +3813,70 @@ def _tfx_schema_for_row(r, cat):
     return None
 
 
-def build_review(src, auto_fetch=True, progress=None):
-    """Review an uploaded manual workbook. Returns (xlsx_bytes, summary)."""
-    df = _read_upload(src)
+def _review_lookup_call(r, lower_cols):
+    """The exact discovery call build_review makes for a row, as
+    (fn, args, kwargs) -- or None for rows that need no lookup."""
+    t = str(r.get(lower_cols.get('title', 'title'), '') or '').strip()
+    if not t:
+        return None
+    cat = str(r.get(lower_cols.get('title_category', ''), '') or '')
+    if _row_is_publisher(r, cat, lower_cols):
+        return (fetch_brand, (t,), {})
+    if _tfx_schema_for_row(r, cat):
+        return None
+    lc = cat.lower()
+    if 'game' in lc:
+        return (fetch_game, (t,), {'year_hint': _release_hint(r, lower_cols)})
+    if 'talent' in lc:
+        return (fetch_person, (t,), {})
+    is_movie = 'tv' not in lc
+    rel = str(r.get(lower_cols.get('released_on', ''), '') or '').strip()
+    rel = rel[:10] if rel and rel.lower() != 'nan' else ''
+    tt = re.search(r'tt\d{5,}', str(r.get(lower_cols.get('imdb_id', ''), '') or ''))
+    if tt:
+        return (fetch_metadata_by_tt, (tt.group(0), is_movie, t), {'year_hint': rel})
+    return (fetch_metadata, (t, is_movie), {'year_hint': rel})
+
+
+def _review_prefetch(records, lower_cols, progress=None):
+    calls, seen = [], set()
+    for r in records:
+        c = _review_lookup_call(r, lower_cols)
+        if not c:
+            continue
+        k = (id(c[0]), c[1], tuple(sorted(c[2].items())))
+        if k not in seen:
+            seen.add(k)
+            calls.append(c)
+    if not calls:
+        return
+    total = len(records)
+    state = {'n': 0}
+    lock = threading.Lock()
+
+    def run(c):
+        try:
+            c[0](*c[1], **c[2])
+        except Exception as e:  # noqa: BLE001 -- the compare loop retries it
+            logging.warning(f"review prefetch failed: {e}")
+        finally:
+            if progress:
+                with lock:
+                    state['n'] += 1
+                    # report lookups as ~90% of the job; compare is the rest
+                    progress(int(state['n'] * 0.9 * total / len(calls)), total)
+
+    if FETCH_WORKERS == 1 or len(calls) == 1:
+        for c in calls:
+            run(c)
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, len(calls))) as ex:
+        list(ex.map(run, calls))
+
+
+def _review_frame(df, auto_fetch=True, progress=None):
+    """Review ONE ingest sheet. Returns its records, findings and cell fills."""
     lower_cols = {c.lower(): c for c in df.columns}
     records = df.to_dict('records')
     # Attribution window: which rows in THIS file share an account with an
@@ -3708,6 +3887,11 @@ def build_review(src, auto_fetch=True, progress=None):
     findings, fills = [], {}
     rows_reviewed = cells_checked = 0
     total = len(records)
+    # Speed (Sep 2026): the per-row lookups used to run one row after another.
+    # Warm the discovery cache for EVERY row concurrently first (same calls,
+    # same arguments), so the compare loop below reads cached results.
+    if auto_fetch:
+        _review_prefetch(records, lower_cols, progress=progress)
 
     for i, r in enumerate(records):
         t = str(r.get(lower_cols.get('title', 'title'), '') or '').strip()
@@ -3931,20 +4115,21 @@ def build_review(src, auto_fetch=True, progress=None):
         if _sheet_trailer:
             meta['trailer_released_on'] = _sheet_trailer
         # date-first IMDb: surface the resolver's year note as a review finding
+        # Discovery warnings (date-first IMDb / Wikipedia / RT / Metacritic,
+        # same-named titles, network or Wide/Limited disagreements between
+        # sources, unconfirmed social handles) are 'Verify' findings: they
+        # tell the reviewer what to double-check but never replace a value on
+        # the INGESTED row -- the note is prose, not data.
+        _notes = []
         _imdb_note = meta.pop('_imdb_year_note', '')
         if _imdb_note:
-            findings.append(dict(
-                row=i + 2, title=t, column='imdb_id', status='Mismatch',
-                current=str(r.get(lower_cols.get('imdb_id', ''), '') or ''),
-                suggested=_imdb_note))
-        # date-first Wikipedia / Wikidata socials / Metacritic / RT: the value
-        # is kept (it is the best match we have) but the reviewer is told it
-        # could not be confirmed against the release-date column
+            _notes.append(('imdb_id', _imdb_note))
         for _note_txt in meta.pop('_year_notes', []) or []:
-            _col = _YEAR_NOTE_COLUMN(_note_txt)
+            _notes.append((_YEAR_NOTE_COLUMN(_note_txt), _note_txt))
+        for _col, _note_txt in _notes:
             findings.append(dict(
                 row=i + 2, title=t, column=lower_cols.get(_col, _col),
-                status='Mismatch',
+                status='Verify',
                 current=str(r.get(lower_cols.get(_col, ''), '') or ''),
                 suggested=_note_txt))
 
@@ -4009,6 +4194,34 @@ def build_review(src, auto_fetch=True, progress=None):
         if progress:
             progress(i + 1, total)
 
+    return dict(df=df, lower_cols=lower_cols, records=records, findings=findings,
+                fills=fills, rows_reviewed=rows_reviewed, cells_checked=cells_checked)
+
+
+def build_review(src, auto_fetch=True, progress=None):
+    """Review an uploaded manual workbook -- EVERY ingest sheet in it (a mixed
+    TitleForge export carries Movies, TV Shows, Talent, Video Games, ... on
+    separate sheets). Returns (xlsx_bytes, summary)."""
+    frames_in = _read_upload_frames(src)
+    grand = sum(len(d) for _n, d in frames_in) or 1
+    frames, base = [], 0
+    for name, df in frames_in:
+        n = len(df)
+
+        def _prog(done, total, _b=base):
+            if progress:
+                progress(min(grand, _b + done), grand)
+        fr = _review_frame(df, auto_fetch=auto_fetch, progress=_prog)
+        fr['name'] = name
+        for f in fr['findings']:
+            f['sheet'] = name
+        frames.append(fr)
+        base += n
+    multi = len(frames) > 1
+    findings = [f for fr in frames for f in fr['findings']]
+    rows_reviewed = sum(fr['rows_reviewed'] for fr in frames)
+    cells_checked = sum(fr['cells_checked'] for fr in frames)
+
     # ---------------- build the output workbook ----------------
     import openpyxl as _oxl
     from openpyxl.styles import PatternFill, Font, Alignment
@@ -4016,6 +4229,7 @@ def build_review(src, auto_fetch=True, progress=None):
 
     RED = PatternFill('solid', start_color='FFFFC7CE')      # mismatch
     AMBER = PatternFill('solid', start_color='FFFFEB9C')    # gap
+    BLUE = PatternFill('solid', start_color='FFDDEBF7')     # verify
     HDR = PatternFill('solid', start_color='FF1F2A44')
     HDR_FONT = Font(color='FFFFFFFF', bold=True)
 
@@ -4025,17 +4239,21 @@ def build_review(src, auto_fetch=True, progress=None):
     ws = wb.active
     ws.title = 'Summary'
     gaps = sum(1 for f in findings if f['status'] == 'Gap')
-    mism = len(findings) - gaps
+    verify = sum(1 for f in findings if f['status'] == 'Verify')
+    mism = len(findings) - gaps - verify
+    value_findings = [f for f in findings if f['status'] != 'Verify']
     ws.append(['Manual File Review — Findings Summary'])
     ws['A1'].font = Font(bold=True, size=14)
     ws.append([])
     for k, v in [('Reviewed at', datetime.now().strftime('%Y-%m-%d %H:%M')),
                  ('Auto-discovery', 'ON' if auto_fetch else 'OFF'),
+                 ('Sheets reviewed', ', '.join(str(fr['name']) for fr in frames)),
                  ('Rows reviewed', rows_reviewed),
                  ('Cells checked', cells_checked),
-                 ('Cells OK', cells_checked - len(findings)),
+                 ('Cells OK', cells_checked - len(value_findings)),
                  ('Gaps (empty, value suggested)', gaps),
-                 ('Mismatches (differs from expected)', mism)]:
+                 ('Mismatches (differs from expected)', mism),
+                 ('To verify (sources disagree / unconfirmed)', verify)]:
         ws.append([k, v])
         ws.cell(ws.max_row, 1).font = Font(bold=True)
     ws.append([])
@@ -4045,6 +4263,8 @@ def build_review(src, auto_fetch=True, progress=None):
     ws.cell(ws.max_row, 1).fill = AMBER
     ws.append(['Red cell', 'Mismatch — differs from template/discovered value (see Findings)'])
     ws.cell(ws.max_row, 1).fill = RED
+    ws.append(['Blue cell', 'Verify — value kept, but a source disagrees or it could not be confirmed (see Findings)'])
+    ws.cell(ws.max_row, 1).fill = BLUE
     ws.append(['Reviewed sheet', "Each record has two rows: 'INGESTED' (suggested corrections applied) "
                "and 'FROM DB' (original file values) for side-by-side comparison"])
     ws.cell(ws.max_row, 1).font = Font(bold=True)
@@ -4069,91 +4289,104 @@ def build_review(src, auto_fetch=True, progress=None):
     # INGESTED is written first, FROM DB directly below it. Existing red/amber
     # color coding is kept, applied to the flagged cells on both rows so the
     # difference is easy to spot.
-    ws2 = wb.create_sheet('Reviewed')
-    cols = list(df.columns)
+    for fr in frames:
+        df, lower_cols, records, fills = fr['df'], fr['lower_cols'], fr['records'], fr['fills']
+        ws2 = wb.create_sheet(('Reviewed - ' + str(fr['name']))[:31] if multi else 'Reviewed')
+        cols = list(df.columns)
 
-    # Per-cell original + suggested values, captured at compare time. Using the
-    # findings list (rather than the possibly-mutated `records`) guarantees the
-    # 'FROM DB' row shows the true original value even for backfilled gaps.
-    currents_by_cell, suggs_by_cell = {}, {}
-    for f in findings:
-        key = (f['row'] - 2, f['column'])
-        currents_by_cell[key] = f['current']
-        suggs_by_cell[key] = f['suggested']
+        # Per-cell original + suggested values, captured at compare time. Using the
+        # findings list (rather than the possibly-mutated `records`) guarantees the
+        # 'FROM DB' row shows the true original value even for backfilled gaps.
+        currents_by_cell, suggs_by_cell = {}, {}
+        verify_cells = {(f['row'] - 2, f['column']) for f in findings
+                        if f['status'] == 'Verify' and f.get('sheet') == fr['name']}
+        for f in [x for x in value_findings if x.get('sheet') == fr['name']]:
+            key = (f['row'] - 2, f['column'])
+            currents_by_cell[key] = f['current']
+            suggs_by_cell[key] = f['suggested']
 
-    # Ensure there is a record_type column to label the two rows.
-    rt_col = lower_cols.get('record_type')
-    if rt_col is None:
-        rt_col = 'record_type'
-        cols = [rt_col] + cols
+        # Ensure there is a record_type column to label the two rows.
+        rt_col = lower_cols.get('record_type')
+        if rt_col is None:
+            rt_col = 'record_type'
+            cols = [rt_col] + cols
 
-    def _clean(v):
-        return '' if (v is None or str(v) == 'nan') else v
+        def _clean(v):
+            return '' if (v is None or str(v) == 'nan') else v
 
-    ws2.append(cols)
-    for c in range(1, len(cols) + 1):
-        cell = ws2.cell(1, c)
-        cell.fill, cell.font = HDR, HDR_FONT
+        ws2.append(cols)
+        for c in range(1, len(cols) + 1):
+            cell = ws2.cell(1, c)
+            cell.fill, cell.font = HDR, HDR_FONT
 
-    out_row = 1
-    for i, r in enumerate(records):
-        # --- INGESTED row (first): original values + suggested corrections ---
-        out_row += 1
-        ing_vals = []
-        for c in cols:
-            if c == rt_col:
-                ing_vals.append('INGESTED')
-            elif (i, c) in suggs_by_cell and str(suggs_by_cell[(i, c)]) != '':
-                ing_vals.append(_clean(suggs_by_cell[(i, c)]))
-            elif (i, c) in currents_by_cell:
-                ing_vals.append(_clean(currents_by_cell[(i, c)]))
-            else:
-                ing_vals.append(_clean(r.get(c)))
-        ws2.append(ing_vals)
-        for j, c in enumerate(cols, start=1):
-            st = fills.get((i, c))
-            if st:
-                ws2.cell(out_row, j).fill = RED if st == 'Mismatch' else AMBER
+        out_row = 1
+        for i, r in enumerate(records):
+            # --- INGESTED row (first): original values + suggested corrections ---
+            out_row += 1
+            ing_vals = []
+            for c in cols:
+                if c == rt_col:
+                    ing_vals.append('INGESTED')
+                elif (i, c) in suggs_by_cell and str(suggs_by_cell[(i, c)]) != '':
+                    ing_vals.append(_clean(suggs_by_cell[(i, c)]))
+                elif (i, c) in currents_by_cell:
+                    ing_vals.append(_clean(currents_by_cell[(i, c)]))
+                else:
+                    ing_vals.append(_clean(r.get(c)))
+            ws2.append(ing_vals)
+            for j, c in enumerate(cols, start=1):
+                st = fills.get((i, c))
+                if st:
+                    ws2.cell(out_row, j).fill = RED if st == 'Mismatch' else AMBER
+                elif (i, c) in verify_cells:
+                    ws2.cell(out_row, j).fill = BLUE
 
-        # --- FROM DB row (second): exact original file values ---
-        out_row += 1
-        db_vals = []
-        for c in cols:
-            if c == rt_col:
-                db_vals.append('FROM DB')
-            elif (i, c) in currents_by_cell:
-                db_vals.append(_clean(currents_by_cell[(i, c)]))
-            else:
-                db_vals.append(_clean(r.get(c)))
-        ws2.append(db_vals)
-        for j, c in enumerate(cols, start=1):
-            st = fills.get((i, c))
-            if st:
-                ws2.cell(out_row, j).fill = RED if st == 'Mismatch' else AMBER
-    ws2.freeze_panes = 'A2'
+            # --- FROM DB row (second): exact original file values ---
+            out_row += 1
+            db_vals = []
+            for c in cols:
+                if c == rt_col:
+                    db_vals.append('FROM DB')
+                elif (i, c) in currents_by_cell:
+                    db_vals.append(_clean(currents_by_cell[(i, c)]))
+                else:
+                    db_vals.append(_clean(r.get(c)))
+            ws2.append(db_vals)
+            for j, c in enumerate(cols, start=1):
+                st = fills.get((i, c))
+                if st:
+                    ws2.cell(out_row, j).fill = RED if st == 'Mismatch' else AMBER
+                elif (i, c) in verify_cells:
+                    ws2.cell(out_row, j).fill = BLUE
+        ws2.freeze_panes = 'A2'
 
     # Findings detail
     ws3 = wb.create_sheet('Findings')
-    ws3.append(['Row', 'Title', 'Column', 'Type', 'Current Value', 'Suggested Value'])
-    for c in range(1, 7):
+    hdr = (['Sheet'] if multi else []) + ['Row', 'Title', 'Column', 'Type',
+                                          'Current Value', 'Suggested Value']
+    ws3.append(hdr)
+    off = 1 if multi else 0
+    for c in range(1, len(hdr) + 1):
         cell = ws3.cell(1, c)
         cell.fill, cell.font = HDR, HDR_FONT
     for f in findings:
-        ws3.append([f['row'], f['title'], f['column'], f['status'],
-                    f['current'], f['suggested']])
-        ws3.cell(ws3.max_row, 4).fill = RED if f['status'] == 'Mismatch' else AMBER
-        for c in (5, 6):
+        ws3.append(([f.get('sheet', '')] if multi else [])
+                   + [f['row'], f['title'], f['column'], f['status'],
+                      f['current'], f['suggested']])
+        ws3.cell(ws3.max_row, 4 + off).fill = {'Mismatch': RED, 'Verify': BLUE}.get(f['status'], AMBER)
+        for c in (5 + off, 6 + off):
             ws3.cell(ws3.max_row, c).alignment = Alignment(wrap_text=True, vertical='top')
-    widths = [6, 34, 26, 11, 60, 60]
+    widths = ([16] if multi else []) + [6, 34, 26, 11, 60, 60]
     for c, w in enumerate(widths, start=1):
         ws3.column_dimensions[get_column_letter(c)].width = w
     ws3.freeze_panes = 'A2'
-    ws3.auto_filter.ref = f"A1:F{max(ws3.max_row, 1)}"
+    ws3.auto_filter.ref = f"A1:{get_column_letter(len(hdr))}{max(ws3.max_row, 1)}"
 
     out = BytesIO()
     wb.save(out)
     summary = {'rows': rows_reviewed, 'cells_checked': cells_checked,
-               'gaps': gaps, 'mismatches': mism, 'ok': cells_checked - len(findings)}
+               'gaps': gaps, 'mismatches': mism, 'verify': verify,
+               'ok': cells_checked - len(value_findings)}
     return out.getvalue(), summary
 
 
