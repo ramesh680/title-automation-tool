@@ -118,6 +118,15 @@
         @keyframes spin{to{transform:rotate(360deg)}}
         .footer{text-align:center;color:var(--faint);margin-top:46px;padding:22px;font-size:.85rem}
         .footer .grad{background:linear-gradient(100deg,var(--brand1),var(--brand3));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;font-weight:600}
+        /* same-named title picker */
+        #sameNamePanel{display:none;margin-top:16px;background:rgba(124,92,255,.08);border:1px solid rgba(124,92,255,.35);border-radius:var(--radius-sm);padding:14px 16px;font-size:.84rem}
+        #sameNamePanel h4{margin:0 0 6px;font-size:.92rem}
+        #sameNamePanel .sn-title{margin-top:12px;font-weight:600}
+        #sameNamePanel label.sn-opt{display:flex;gap:8px;align-items:flex-start;padding:5px 2px;cursor:pointer;color:var(--muted)}
+        #sameNamePanel label.sn-opt input{margin-top:3px}
+        #sameNamePanel a{color:var(--brand2)}
+        .review-list{margin-top:12px;background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.3);border-radius:var(--radius-sm);padding:10px 14px;font-size:.78rem;color:var(--muted);max-height:220px;overflow:auto}
+        .review-list li{margin:4px 0}
         @media(max-width:900px){.main-content{grid-template-columns:1fr}.nav-links{display:none}}
     </style>
 </head>
@@ -277,10 +286,11 @@
                 </div>
 
                 <div class="button-group">
-                    <button class="btn-primary" onclick="previewData()">👁️ Preview</button>
+                    <button class="btn-primary" onclick="withSameNameCheck(previewData)">👁️ Preview</button>
                     <button class="btn-secondary" onclick="resetForm()">↻ Reset</button>
                 </div>
                 <div id="inputMessage" class="message"></div>
+                <div id="sameNamePanel"></div>
             </div>
 
             <!-- Preview Section -->
@@ -297,7 +307,7 @@
                     <div class="stat-item"><div class="stat-value" id="totalTitles">0</div><div class="stat-label">Unique Titles</div></div>
                 </div>
                 <div class="button-group">
-                    <button class="btn-download" onclick="generateExcel()" style="display:none" id="generateBtn">⬇️ Download Excel</button>
+                    <button class="btn-download" onclick="withSameNameCheck(generateExcel)" style="display:none" id="generateBtn">⬇️ Download Excel</button>
                 </div>
                 <div id="previewMessage" class="message"></div>
             </div>
@@ -488,7 +498,7 @@
 
         function displayPreview(data) {
             const preview = data.preview || [];
-            // Render ALL columns returned by the server (42 for the full schema).
+            // Render ALL columns returned by the server (39 for the movie schema).
             const columns = data.columns || [];
 
             let html = `<p style="color:#666;font-size:12px;margin-bottom:8px;">`
@@ -514,12 +524,128 @@
             });
 
             html += '</tbody></table></div>';
+            html += renderNeedsReview(data.needs_review);
             html += renderGeminiCompare(data.gemini);
             document.getElementById('previewContent').innerHTML = html;
 
             document.getElementById('totalRows').textContent = data.total_rows;
             document.getElementById('totalTitles').textContent = Math.floor(data.total_rows / (document.getElementById('includeDar').checked ? 2 : 1));
             document.getElementById('previewStats').style.display = 'block';
+        }
+
+        // ---- same-named titles (Sep 2026) ------------------------------------
+        // Several movies / shows can share a name ('The Rescue' 2027 western vs
+        // the 2021 documentary ...). Before Preview / Download, manual Movie & TV
+        // titles without a '(YYYY)' are checked; when more than one title
+        // matches, the user picks which one(s) they mean and the line becomes
+        // 'The Rescue (2027)', so Wikipedia, IMDb, Rotten Tomatoes, Metacritic
+        // and every social handle come from THAT title.
+        let sameNameCheckedText = null;
+        let sameNamePending = null;
+
+        async function withSameNameCheck(action) {
+            const method = document.getElementById('inputMethod').value;
+            const autoFetch = document.getElementById('autoFetch').checked;
+            const text = document.getElementById('titlesList').value;
+            if (method !== 'manual' || !autoFetch || sameNameCheckedText === text) {
+                action();
+                return;
+            }
+            const parsed = getTitlesAndTypes();
+            if (!parsed.titles.length) { action(); return; }
+            showMessage('inputMessage', 'Checking for titles that share a name…', 'success');
+            let cands = {};
+            try {
+                const r = await fetch('/api/candidates', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ titles: parsed.titles, titles_type: parsed.types })
+                });
+                cands = ((await r.json()) || {}).candidates || {};
+            } catch (e) {
+                cands = {};        // lookup failed -> never block the user
+            }
+            document.getElementById('inputMessage').style.display = 'none';
+            if (!Object.keys(cands).length) {
+                sameNameCheckedText = text;
+                action();
+                return;
+            }
+            sameNamePending = action;
+            renderSameNamePicker(cands);
+        }
+
+        function renderSameNamePicker(cands) {
+            const panel = document.getElementById('sameNamePanel');
+            let html = '<h4>⚠️ Some titles match more than one movie / show</h4>'
+                + '<div style="color:var(--faint)">Tick the one(s) you mean. Each ticked title is generated '
+                + 'with its release year, e.g. <em>The Rescue (2027)</em>, so every link and handle is for that title.</div>';
+            let i = 0;
+            Object.keys(cands).forEach(title => {
+                html += `<div class="sn-title">“${escapeHtml(title)}” — ${cands[title].length} matches</div>`;
+                cands[title].forEach((c, j) => {
+                    const id = 'sn_' + (i++);
+                    const yr = c.year ? c.year : 'undated';
+                    html += `<label class="sn-opt" for="${id}"><input type="checkbox" id="${id}"`
+                        + ` data-title="${escapeHtml(title)}" data-year="${c.year || ''}" data-tt="${escapeHtml(c.tt)}"`
+                        + (j === 0 ? ' checked' : '') + '>'
+                        + `<span><strong>${escapeHtml(String(yr))}</strong> · ${escapeHtml(c.kind || '')}`
+                        + (c.stars ? ` · ${escapeHtml(c.stars)}` : '')
+                        + ` · <a href="${escapeHtml(c.imdb_url)}" target="_blank" rel="noopener">${escapeHtml(c.tt)}</a></span></label>`;
+                });
+            });
+            html += '<div class="button-group" style="margin-top:12px">'
+                + '<button class="btn-primary" onclick="applySameNamePicks()">Use selected &amp; continue</button>'
+                + '<button class="btn-secondary" onclick="closeSameNamePicker()">Cancel</button></div>';
+            panel.innerHTML = html;
+            panel.style.display = 'block';
+            panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+
+        function closeSameNamePicker() {
+            const panel = document.getElementById('sameNamePanel');
+            panel.style.display = 'none';
+            panel.innerHTML = '';
+            sameNamePending = null;
+        }
+
+        function applySameNamePicks() {
+            const picks = {};
+            document.querySelectorAll('#sameNamePanel input[type=checkbox]').forEach(cb => {
+                const t = cb.getAttribute('data-title');
+                picks[t] = picks[t] || [];
+                if (cb.checked) picks[t].push(cb.getAttribute('data-year'));
+            });
+            for (const t in picks) {
+                if (!picks[t].length) {
+                    showMessage('inputMessage', `Pick at least one match for “${t}”.`, 'error');
+                    return;
+                }
+            }
+            const ta = document.getElementById('titlesList');
+            const out = [];
+            ta.value.split('\n').forEach(line => {
+                const trimmed = line.trim();
+                const t = Object.keys(picks).find(k => trimmed === k || trimmed.startsWith(k + ' ')
+                    && /^\s*(\[[^\]]*\]|\{[^}]*\})/.test(trimmed.slice(k.length)));
+                if (!t) { out.push(line); return; }
+                const rest = trimmed.slice(t.length);        // keeps a [tv] / {tag}
+                // an undated (upcoming) pick keeps the plain title
+                picks[t].forEach(y => out.push(y ? `${t} (${y})${rest}` : `${t}${rest}`));
+            });
+            ta.value = out.join('\n');
+            sameNameCheckedText = ta.value;
+            const action = sameNamePending;
+            closeSameNamePicker();
+            if (action) action();
+        }
+
+        function renderNeedsReview(items) {
+            if (!items || !items.length) return '';
+            let html = '<div class="review-list"><strong>Needs review (' + items.length + ')</strong><ul>';
+            items.forEach(it => {
+                html += `<li><strong>${escapeHtml(it.title || '')}</strong>: ${escapeHtml(it.reason || '')}</li>`;
+            });
+            return html + '</ul></div>';
         }
 
         // ---- comparison-sheet flow (GEMINI_SOURCE=sheet) --------------------
