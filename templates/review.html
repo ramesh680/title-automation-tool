@@ -224,7 +224,7 @@
                         document.body.appendChild(a); a.click(); a.remove();
                         msg('✓ Review complete — the highlighted workbook has downloaded (Summary, Reviewed, Findings sheets).', 'success');
                     } else {
-                        msg(j.error || 'Review failed', 'error');
+                        msg((j.lost ? j.hint : '') || j.error || 'Review failed', 'error');
                         document.getElementById('progress').innerHTML = '';
                     }
                 })
