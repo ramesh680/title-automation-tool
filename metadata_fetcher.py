@@ -2975,12 +2975,44 @@ SOCIAL_DISCOVERY = os.getenv("SOCIAL_DISCOVERY", "1").strip().lower() \
 SOCIAL_GUESSING = os.getenv("SOCIAL_GUESSING", "1").strip().lower() \
     not in ("0", "false", "no", "off")
 try:
-    MAX_SOCIAL_PROBES = max(0, int(os.getenv("MAX_SOCIAL_PROBES", "5")))
+    MAX_SOCIAL_PROBES = max(0, int(os.getenv("MAX_SOCIAL_PROBES", "3")))
 except ValueError:
-    MAX_SOCIAL_PROBES = 5
+    MAX_SOCIAL_PROBES = 3
 
 _PAGE_CACHE = {}
 _PAGE_LOCK = threading.Lock()
+
+try:
+    PARALLEL_SOURCES = max(1, int(os.getenv("PARALLEL_SOURCES", "6")))
+except ValueError:
+    PARALLEL_SOURCES = 6
+
+
+def _parallel_calls(calls, defaults=None):
+    """Run independent lookups concurrently: {name: (fn, args, kwargs) | None}
+    -> {name: result}. A failing / skipped call yields defaults[name]; results
+    are identical to calling each one in turn, only faster."""
+    defaults = defaults or {}
+    jobs = {k: v for k, v in calls.items() if v}
+    out = {k: defaults.get(k) for k in calls}
+    if not jobs:
+        return out
+    if PARALLEL_SOURCES == 1 or len(jobs) == 1:
+        for k, (fn, a, kw) in jobs.items():
+            try:
+                out[k] = fn(*a, **kw)
+            except Exception as e:  # noqa: BLE001
+                log.warning("lookup %s failed: %s", k, e)
+        return out
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(PARALLEL_SOURCES, len(jobs))) as ex:
+        futs = {k: ex.submit(fn, *a, **kw) for k, (fn, a, kw) in jobs.items()}
+        for k, f in futs.items():
+            try:
+                out[k] = f.result()
+            except Exception as e:  # noqa: BLE001
+                log.warning("lookup %s failed: %s", k, e)
+    return out
 
 
 def _fetch(url, params=None, headers=None):
@@ -2988,8 +3020,12 @@ def _fetch(url, params=None, headers=None):
     if _SESSION is None or not url:
         return None, ""
     try:
-        r = _polite_get(url, params=params, headers=headers or HTML_HEADERS,
-                        timeout=VALIDATE_TIMEOUT, allow_redirects=True)
+        # ONE attempt under the per-host cap -- these are best-effort reads
+        # (account pages, trailer pages). The polite 4x retry/backoff used for
+        # the core APIs turned a single login-walled site into ~30 s per title.
+        with _host_sem(url):
+            r = _SESSION.get(url, params=params, headers=headers or HTML_HEADERS,
+                             timeout=VALIDATE_TIMEOUT, allow_redirects=True)
         return r.status_code, (r.text or "")
     except Exception as e:  # noqa: BLE001
         log.info("fetch failed (%s): %s", url, e)
@@ -3043,6 +3079,11 @@ def _same_studio(a, b):
 def _cross_check(meta, is_movie, year, notes):
     """Confirm network + Wide/Limited against Rotten Tomatoes, Metacritic and
     the distributor / official site instead of trusting one source."""
+    homes = [h for h in (meta.get("_homepage"), meta.get("_homepage_imdb")) if h][:2]
+    # warm the page cache for every page this check reads, all at once
+    _parallel_calls({u: (_page, (u,), {}) for u in
+                     [meta.get("rottentomatoes") if is_movie else None,
+                      meta.get("metacritic")] + homes if u})
     rt = rt_info(meta.get("rottentomatoes")) if is_movie else {}
     mc = mc_info(meta.get("metacritic"))
     # -- network ----------------------------------------------------------
@@ -3128,8 +3169,11 @@ def youtube_descriptions(video_ids):
             return out
     if SP is None:
         return out
+    pages = _parallel_calls(
+        {vid: (_fetch, ("https://www.youtube.com/watch",), {"params": {"v": vid}}) for vid in ids},
+        defaults={vid: (None, "") for vid in ids})
     for vid in ids:
-        status, html = _fetch("https://www.youtube.com/watch", params={"v": vid})
+        status, html = pages.get(vid) or (None, "")
         if status == 200 and html:
             t = re.search(r"<title>(.*?)</title>", html, re.S)
             out.append((vid, (t.group(1) if t else ""), SP.youtube_description_from_watch_html(html)))
@@ -3161,7 +3205,20 @@ def youtube_trailer_ids(title, year=None, limit=3):
     return ids[:limit]
 
 
+_PROBE_CACHE = {}
+
+
 def probe_handle(plat, handle):
+    """Cached wrapper -- the same handle is probed once per process."""
+    key = (plat, str(handle or "").strip().lstrip("@").lower())
+    if key in _PROBE_CACHE:
+        return _PROBE_CACHE[key]
+    res = _probe_handle(plat, handle)
+    _PROBE_CACHE[key] = res
+    return res
+
+
+def _probe_handle(plat, handle):
     """(exists, display_name) for a handle on a platform, keyless.
     exists: True (the account page answered as that account), False (a
     definitive 'no such account'), None (login wall / throttled -- unknown)."""
@@ -3272,9 +3329,18 @@ def _discover_socials(meta, title, year, notes, network=""):
     known = [_existing_handle(meta, p) for p in _SOCIAL_FIELD]
     known = [k for k in known if k and SP.handle_matches_title(k, title, year)]
     guesses = SP.handle_guesses(title, year, known=known, hashtags=hashtags)
+    # Speed: a handle the title already uses elsewhere (or its hashtag) is the
+    # only thing worth probing when we have one; bare naming-pattern guesses
+    # are tried only when nothing is known at all, and only the top two.
+    strong = [g for g in guesses if g[1] == "strong"]
+    guesses = (strong or guesses[:2])[:MAX_SOCIAL_PROBES]
+    # every (platform, handle) probe runs concurrently
+    results = _parallel_calls(
+        {(plat, h): (probe_handle, (plat, h), {}) for plat in missing for h, _s in guesses},
+        defaults={(plat, h): (None, "") for plat in missing for h, _s in guesses})
     for plat in missing:
-        for h, strength in guesses[:MAX_SOCIAL_PROBES]:
-            exists, name = probe_handle(plat, h)
+        for h, strength in guesses:
+            exists, name = results.get((plat, h)) or (None, "")
             accept = (exists is True and (strength == "strong" or _name_fits(name, title))) \
                 or (exists is None and strength == "strong")
             if not accept:
@@ -3319,16 +3385,30 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None, want_year=None):
     meta = {}
     notes = []
 
+    # Speed (Sep 2026): every source below that is keyed only by the tt / title
+    # is independent of the others, so they are fetched CONCURRENTLY up front
+    # and then merged in exactly the old priority order. Same answers, one
+    # round-trip of wall time instead of six.
+    pre = _parallel_calls({
+        "bom": (bom_scrape, (tt,), {}),
+        "wiki": (wiki_lookup, (title_hint, is_movie), {"tt": tt, "year": want_year}),
+        "omdb": (omdb_by_id, (tt,), {}),
+        "tmdb": (tmdb_find_by_imdb, (tt,), {}),
+        "imdb": (imdb_scrape, (tt,), {}),
+        "yt": (youtube_channel, (title_hint,), {}) if YOUTUBE_OWN_CHANNEL_ALWAYS else None,
+    }, defaults={"bom": {}, "wiki": (None, None, None, True), "omdb": {},
+                 "tmdb": ({}, None), "imdb": {}, "yt": {}})
+
     # 0) upcoming-release-movies service (BOM calendar): distributor, genres,
     #    release date + Wide/Limited scale -- authoritative when present
     if is_movie:
         _fill(meta, _upcoming_meta(_upcoming_index()["by_tt"].get(tt)))
 
     # 1) Box Office Mojo -- US Domestic Distributor (released titles only)
-    _fill(meta, bom_scrape(tt))
+    _fill(meta, pre["bom"])
 
     # 2) Wikipedia article, verified against the IMDb id and the release year
-    wurl, wtitle, wqid, wyear_ok = wiki_lookup(title_hint, is_movie, tt=tt, year=want_year)
+    wurl, wtitle, wqid, wyear_ok = pre["wiki"]
     if wurl:
         meta.setdefault("wikipedia_page", wurl)
         if not wyear_ok:
@@ -3344,10 +3424,11 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None, want_year=None):
                               tt=tt, verify=True, year=want_year))
 
     # 4) OMDb by exact id -> genre / release fallback (reliable API)
-    _fill(meta, omdb_by_id(tt))
+    _fill(meta, pre["omdb"])
 
     # 5) TMDB by exact id -> socials, genres, US theatrical date, wikidata id
-    tmeta, wid = tmdb_find_by_imdb(tt)
+    tmeta, wid = pre["tmdb"]
+    tmeta = dict(tmeta or {})
     us_rel = tmeta.pop("released_on_us", None)
     if us_rel:
         meta["released_on"] = us_rel  # US theatrical beats festival/first dates
@@ -3358,7 +3439,7 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None, want_year=None):
                                   verify=True, year=want_year))
 
     # 6) IMDb page scrape -- genre + datePublished as last resort
-    imeta = imdb_scrape(tt)
+    imeta = dict(pre["imdb"] or {})
     imdb_prod_co = imeta.pop("production_company", None)
     _fill(meta, imeta)
 
@@ -3378,7 +3459,8 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None, want_year=None):
     # every verified one so they share the cell, one per line
     if YOUTUBE_OWN_CHANNEL_ALWAYS or not meta.get("youtube_own_channel"):
         own = [u.strip() for u in str(meta.get("youtube_own_channel") or "").splitlines() if u.strip()]
-        for u in str(youtube_channel(title_hint).get("youtube_own_channel") or "").splitlines():
+        _yt = pre["yt"] if YOUTUBE_OWN_CHANNEL_ALWAYS else youtube_channel(title_hint)
+        for u in str((_yt or {}).get("youtube_own_channel") or "").splitlines():
             if u.strip() and u.strip() not in own:
                 own.append(u.strip())
         if own:
@@ -3396,9 +3478,16 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None, want_year=None):
     # page really exists; otherwise a year-suffixed slug fallback is tried.
     guess = meta.pop("_metacritic_guess", None)
     curated = bool(meta.get("metacritic"))
-    mc = resolve_metacritic(title_hint, is_movie,
-                            candidate=meta.get("metacritic") or guess,
-                            curated=curated, year=_yr, notes=notes)
+    # Metacritic and Rotten Tomatoes are independent -> resolve both at once
+    _mcrt = _parallel_calls({
+        "mc": (resolve_metacritic, (title_hint, is_movie),
+               {"candidate": meta.get("metacritic") or guess, "curated": curated,
+                "year": _yr, "notes": notes}),
+        "rt": (resolve_rottentomatoes, (title_hint, is_movie),
+               {"candidate": meta.get("rottentomatoes"),
+                "curated": bool(meta.get("rottentomatoes")), "year": _yr, "notes": notes}),
+    }, defaults={"mc": "", "rt": ""})
+    mc = _mcrt["mc"]
     if mc:
         meta["metacritic"] = mc
     else:
@@ -3406,10 +3495,7 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None, want_year=None):
 
     # rotten tomatoes: same treatment -- trust a curated Wikidata URL, else try
     # the year-suffixed /m/ slug; keep a generated URL only if it verifies.
-    rt = resolve_rottentomatoes(title_hint, is_movie,
-                                candidate=meta.get("rottentomatoes"),
-                                curated=bool(meta.get("rottentomatoes")),
-                                year=_yr, notes=notes)
+    rt = _mcrt["rt"]
     if rt:
         meta["rottentomatoes"] = rt
     else:
@@ -3612,6 +3698,128 @@ def fetch_metadata(title, is_movie=True, year_hint=""):
 
     _CACHE[key] = dict(meta)
     return meta
+
+
+# ============ same-name candidates for Video Games and Talent (Sep 2026) ====
+# Extends the Movies / TV same-name picker (title_candidates above) to the two
+# other templates where one name routinely means several entities:
+#   * Video Games -- reboots share a name ('Doom' 1993 vs 2016): candidates are
+#     keyed by release year; picking one writes 'Doom (2016)', which fetch_game
+#     already honours, and pins the chosen Wikidata item.
+#   * Talent -- people share names (two Michael B. Jordans, several Chris
+#     Evanses): candidates are the same-name HUMANS on Wikidata with their
+#     description, birth year, occupations and IMDb nm code; picking one pins
+#     that Wikidata item, so fetch_person skips name matching entirely.
+def _first_year(ent, props=("P577",)):
+    claims = (ent or {}).get("claims", {}) or {}
+    ys = []
+    for p in props:
+        for v in _claim_values(claims, p, prefer_us=True):
+            y = _year_from(_parse_time(v))
+            if y:
+                ys.append(y)
+    return min(ys) if ys else None
+
+
+def _en_desc(ent):
+    return (((ent or {}).get("descriptions", {}) or {}).get("en", {}) or {}).get("value", "")
+
+
+def game_candidates(name):
+    """Every same-named VIDEO GAME (IMDb + Wikidata), newest first.
+    A trailing '(2016)' on `name` narrows the list to that year."""
+    clean = re.sub(r"\s*-\s*DAR\s*$", "", str(name or ""), flags=re.IGNORECASE).strip()
+    clean, hint = _split_disambiguator(clean)
+    want_year = int(hint) if (hint.isdigit() and len(hint) == 4) else None
+    tl = _norm(clean)
+    if not tl:
+        return []
+    by_year = {}      # year (or 'u<n>' when undated) -> candidate
+
+    def slot(year, key):
+        return year if year else key
+
+    # 1) Wikidata game items (developer / publisher live here)
+    qids = []
+    for q in (clean + " video game", clean):
+        for c in _search_candidates(q, limit=8):
+            if c not in qids:
+                qids.append(c)
+    for q in qids[:10]:
+        ent = _entity(q)
+        if not (ent and _ent_is_gamey(ent)) or _game_name_match(ent, clean) != 2:
+            continue
+        y = _first_year(ent)
+        k = slot(y, "u" + q)
+        if k in by_year:
+            continue
+        by_year[k] = {"qid": q, "tt": "", "year": y, "title": clean,
+                      "kind": "Video Game", "stars": _en_desc(ent),
+                      "imdb_url": "", "wikidata_url": "https://www.wikidata.org/wiki/" + q}
+    # 2) IMDb videoGame entries (tt code; fills games Wikidata lacks)
+    for it in _imdb_suggest_raw(clean):
+        if str(it.get("qid") or "").lower() != "videogame" or _norm(it.get("l")) != tl:
+            continue
+        y = int(it["y"]) if str(it.get("y") or "").isdigit() else None
+        k = slot(y, "t" + str(it.get("id")))
+        c = by_year.setdefault(k, {"qid": "", "tt": "", "year": y, "title": clean,
+                                   "kind": "Video Game", "stars": "", "imdb_url": "",
+                                   "wikidata_url": ""})
+        if not c["tt"]:
+            c["tt"] = it.get("id") or ""
+            c["imdb_url"] = "https://www.imdb.com/title/%s/" % c["tt"]
+        if not c["stars"] and it.get("s"):
+            c["stars"] = it["s"]
+    out = [c for c in by_year.values()
+           if not want_year or (c["year"] and c["year"] == want_year)]
+    out.sort(key=lambda c: -(c["year"] or 9999))
+    return out
+
+
+def talent_candidates(name):
+    """Every same-named PERSON on Wikidata, most notable first, with what tells
+    them apart: description, birth year, occupations, IMDb nm code."""
+    clean = re.sub(r"\s*-\s*DAR\s*$", "", str(name or ""), flags=re.IGNORECASE).strip()
+    clean = _clean_person_name(clean)
+    clean, _ = _split_disambiguator(clean)
+    clean = _clean_person_name(clean)
+    want = _norm(clean)
+    if not want:
+        return []
+    people = []
+    for q in _search_candidates(clean, limit=10)[:10]:
+        ent = _entity(q)
+        if not ent:
+            continue
+        claims = ent.get("claims", {}) or {}
+        if "Q5" not in set(_claim_values(claims, "P31")):
+            continue
+        lbl = ((ent.get("labels", {}) or {}).get("en", {}) or {}).get("value", "")
+        names = [lbl] + [a.get("value") for a in (ent.get("aliases", {}) or {}).get("en", [])
+                         if isinstance(a, dict)]
+        if not any(_norm(n) == want for n in names if n):
+            continue
+        people.append((ent, q, lbl or clean))
+    if len(people) < 2:
+        return [{"qid": q, "title": l} for _e, q, l in people]
+    occ = {}
+    for ent, q, _l in people:
+        occ[q] = _claim_values(ent.get("claims", {}) or {}, "P106")[:3]
+    labels = _labels([o for v in occ.values() for o in v][:50])
+    out = []
+    for ent, q, lbl in sorted(people, key=lambda p: _person_prominence(p[0]), reverse=True):
+        nm = (_claim_values(ent.get("claims", {}) or {}, "P345") or [""])[0]
+        nm = nm if str(nm).startswith("nm") else ""
+        out.append({
+            "qid": q, "title": lbl,
+            "born": _first_year(ent, ("P569",)),
+            "description": _en_desc(ent),
+            "occupations": [labels[o] for o in occ.get(q, []) if labels.get(o)],
+            "nm": nm,
+            "imdb_url": ("https://www.imdb.com/name/%s/" % nm) if nm else "",
+            "wikidata_url": "https://www.wikidata.org/wiki/" + q,
+        })
+    return out
 
 
 if __name__ == "__main__":
