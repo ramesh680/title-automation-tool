@@ -326,3 +326,191 @@ class SameNamedTitles(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Same-name picker extended to Video Games and Talent (Sep 2026)
+# ---------------------------------------------------------------------------
+def _ent(qid, label, p31, desc="", props=None, aliases=(), sitelinks=None):
+    claims = {"P31": [{"mainsnak": {"snaktype": "value", "datavalue": {"value": {"id": q}}}} for q in p31]}
+    for p, vals in (props or {}).items():
+        claims[p] = []
+        for v in vals:
+            if isinstance(v, str) and v.startswith("+"):
+                dv = {"time": v}
+            elif isinstance(v, str) and v.startswith("Q"):
+                dv = {"id": v}
+            else:
+                dv = v
+            claims[p].append({"mainsnak": {"snaktype": "value", "datavalue": {"value": dv}}})
+    return {"id": qid, "labels": {"en": {"value": label}},
+            "aliases": {"en": [{"value": a} for a in aliases]},
+            "descriptions": {"en": {"value": desc}}, "claims": claims,
+            "sitelinks": sitelinks or {}}
+
+
+GAMES = {
+    "Q1": _ent("Q1", "Doom", ["Q7889"], "1993 video game", {"P577": ["+1993-12-10T00:00:00Z"]}),
+    "Q2": _ent("Q2", "Doom", ["Q7889"], "2016 video game", {"P577": ["+2016-05-13T00:00:00Z"]}),
+    "Q3": _ent("Q3", "Doom", ["Q11424"], "2005 film", {"P577": ["+2005-10-21T00:00:00Z"]}),
+    "Q4": _ent("Q4", "Doom Eternal", ["Q7889"], "2020 video game", {"P577": ["+2020-03-20T00:00:00Z"]}),
+}
+GAME_SUGGEST = [
+    {"id": "tt0286598", "l": "Doom", "y": 1993, "qid": "videoGame"},
+    {"id": "tt4978540", "l": "Doom", "y": 2016, "qid": "videoGame"},
+    {"id": "tt0419706", "l": "Doom", "y": 2005, "qid": "movie"},
+]
+PEOPLE = {
+    "Q10": _ent("Q10", "Michael B. Jordan", ["Q5"], "American actor",
+                {"P569": ["+1987-02-09T00:00:00Z"], "P106": ["Q33999"], "P345": ["nm0430107"]},
+                sitelinks={"enwiki": {}, "frwiki": {}}),
+    "Q11": _ent("Q11", "Michael B. Jordan", ["Q5"], "American basketball player",
+                {"P569": ["+1990-01-01T00:00:00Z"], "P106": ["Q3665646"]}),
+    "Q12": _ent("Q12", "Michael Jordan", ["Q5"], "basketball player"),
+    "Q13": _ent("Q13", "Michael B. Jordan", ["Q515"], "a city"),
+}
+
+
+class GameAndTalentCandidates(unittest.TestCase):
+    def test_game_candidates_by_year(self):
+        with mock.patch.object(mf, "_search_candidates", return_value=list(GAMES)), \
+                mock.patch.object(mf, "_entity", side_effect=GAMES.get), \
+                mock.patch.object(mf, "_imdb_suggest_raw", return_value=GAME_SUGGEST):
+            c = mf.game_candidates("Doom")
+            one = mf.game_candidates("Doom (2016)")
+        self.assertEqual([(x["year"], x["qid"], x["tt"]) for x in c],
+                         [(2016, "Q2", "tt4978540"), (1993, "Q1", "tt0286598")])
+        self.assertEqual([x["qid"] for x in one], ["Q2"])
+
+    def test_talent_candidates(self):
+        with mock.patch.object(mf, "_search_candidates", return_value=list(PEOPLE)), \
+                mock.patch.object(mf, "_entity", side_effect=PEOPLE.get), \
+                mock.patch.object(mf, "_labels", return_value={"Q33999": "actor",
+                                                               "Q3665646": "basketball player"}):
+            c = mf.talent_candidates("Michael B. Jordan")
+        self.assertEqual([x["qid"] for x in c], ["Q10", "Q11"])   # most notable first
+        self.assertEqual(c[0]["nm"], "nm0430107")
+        self.assertEqual(c[0]["born"], 1987)
+        self.assertEqual(c[1]["occupations"], ["basketball player"])
+
+    def test_endpoint_games_multi_talent_single(self):
+        client = app.app.test_client()
+        with mock.patch.object(app, "game_candidates", return_value=[
+                    {"qid": "Q2", "tt": "tt4978540", "year": 2016, "kind": "Video Game", "stars": ""},
+                    {"qid": "Q1", "tt": "tt0286598", "year": 1993, "kind": "Video Game", "stars": ""}]), \
+                mock.patch.object(app, "talent_candidates", return_value=[
+                    {"qid": "Q10", "title": "Michael B. Jordan", "born": 1987, "description": "American actor",
+                     "occupations": ["actor"], "nm": "nm0430107",
+                     "imdb_url": "https://www.imdb.com/name/nm0430107/"},
+                    {"qid": "Q11", "title": "Michael B. Jordan", "born": 1990,
+                     "description": "American basketball player", "occupations": [], "nm": "",
+                     "imdb_url": "", "wikidata_url": "https://www.wikidata.org/wiki/Q11"}]):
+            r = client.post("/api/candidates", json={
+                "titles": ["Doom", "Michael B. Jordan", "Chris Evans", "Doom 2 (1994)"],
+                "titles_type": {"Doom": "game", "Michael B. Jordan": "talent",
+                                "Chris Evans": "talent", "Doom 2 (1994)": "game"},
+                "professions": {"Chris Evans": "actor"}})
+        j = r.get_json()
+        self.assertEqual(set(j["candidates"]), {"Doom", "Michael B. Jordan"})
+        self.assertEqual(j["modes"], {"Doom": "multi", "Michael B. Jordan": "single"})
+        doom = j["candidates"]["Doom"][0]
+        self.assertEqual((doom["suffix"], doom["pick"]), (" (2016)", {"tt": "tt4978540", "qid": "Q2"}))
+        mbj = j["candidates"]["Michael B. Jordan"][0]
+        self.assertEqual((mbj["suffix"], mbj["pick"]), ("", {"qid": "Q10"}))
+        self.assertIn("born 1987", mbj["detail"])
+
+    def test_picks_pin_the_entity(self):
+        with mock.patch.object(app, "fetch_person", return_value={"imdb_id": "x"}) as fp, \
+                mock.patch.object(app, "fetch_game", return_value={}) as fg:
+            rows = app.build_rows_from_titles({
+                "titles": ["Michael B. Jordan", "Doom (2016)"], "autoFetch": True,
+                "titles_type": {"Michael B. Jordan": "talent", "Doom (2016)": "game"},
+                "picks": {"Michael B. Jordan": {"qid": "Q10"},
+                          "Doom (2016)": {"qid": "Q2", "tt": "tt4978540"}}})
+        self.assertEqual(fp.call_args.kwargs["qid"], "Q10")
+        self.assertEqual(fg.call_args.kwargs["qid"], "Q2")
+        game_rows = [r for r in rows if "Doom" in r.get("title", "")]
+        self.assertTrue(all("tt4978540" in str(r.get("imdb_id")) for r in game_rows))
+
+    def test_bad_pick_ids_ignored(self):
+        with mock.patch.object(app, "fetch_person", return_value={}) as fp:
+            app.build_rows_from_titles({"titles": ["X Y"], "autoFetch": True,
+                                        "titles_type": {"X Y": "talent"},
+                                        "picks": {"X Y": {"qid": "DROP TABLE"}}})
+        self.assertIsNone(fp.call_args.kwargs["qid"])
+
+
+# ---------------------------------------------------------------------------
+# Review page brought up to date (Sep 2026)
+# ---------------------------------------------------------------------------
+def _xlsx(sheets):
+    b = io.BytesIO()
+    with pd.ExcelWriter(b) as w:
+        for n, d in sheets.items():
+            pd.DataFrame(d).to_excel(w, sheet_name=n, index=False)
+    return b.getvalue()
+
+
+class ReviewUpdated(unittest.TestCase):
+    MOVIE = {"title": "The Rescue", "title_category": "Movies", "network": "Paramount Pictures",
+             "released_on": "2027-01-29", "genre": "Drama", "primary_genre": "Drama",
+             "imdb_id": "http://www.imdb.com/title/tt35606013"}
+
+    def _review(self, sheets, meta=None, auto=True):
+        with mock.patch.object(app, "fetch_metadata_by_tt", return_value=dict(meta or {})), \
+                mock.patch.object(app, "fetch_metadata", return_value=dict(meta or {})), \
+                mock.patch.object(app, "fetch_game", return_value={}), \
+                mock.patch.object(app, "fetch_person", return_value={}), \
+                mock.patch.object(app, "fetch_brand", return_value={}):
+            out, summ = app.build_review((_xlsx(sheets), "f.xlsx"), auto_fetch=auto)
+        return pd.read_excel(io.BytesIO(out), sheet_name=None), summ
+
+    def test_every_sheet_is_reviewed(self):
+        book, summ = self._review({
+            "Movies": [self.MOVIE],
+            "Video Games": [{"title": "Doom", "title_category": "Video Games"}],
+            "Needs Review": [{"title": "x", "why_flagged": "y"}]}, auto=False)
+        self.assertIn("Reviewed - Movies", book)
+        self.assertIn("Reviewed - Video Games", book)
+        self.assertNotIn("Reviewed - Needs Review", book)
+        self.assertEqual(summ["rows"], 2)
+        self.assertIn("Sheet", book["Findings"].columns)
+
+    def test_non_database_network_is_flagged(self):
+        book, _ = self._review({"Movies": [self.MOVIE]}, meta={"network": "Paramount Pictures"})
+        f = book["Findings"]
+        row = f[f["Column"] == "network"].iloc[0]
+        self.assertEqual((row["Type"], row["Suggested Value"]), ("Mismatch", "Paramount"))
+
+    def test_discovery_notes_are_verify_and_keep_values(self):
+        meta = {"network": "Paramount", "imdb_id": "http://www.imdb.com/title/tt35606013",
+                "_year_notes": ["Release scale: sources disagree (Wide: Rotten Tomatoes; "
+                                "Limited: Box Office Mojo) -- used Wide, verify.",
+                                "Social handles: TikTok 'therescuemovie' was not listed by any source"],
+                "_imdb_year_note": "IMDb: 4 titles are named 'The Rescue'"}
+        m = dict(self.MOVIE, network="Paramount")
+        book, summ = self._review({"Movies": [m]}, meta=meta)
+        f = book["Findings"]
+        v = f[f["Type"] == "Verify"]
+        self.assertEqual(set(v["Column"]), {"title_sub_category", "tiktok_user", "imdb_id"})
+        self.assertEqual(summ["verify"], 3)
+        ing = book["Reviewed"].iloc[0]           # the INGESTED row
+        self.assertEqual(ing["imdb_id"], "http://www.imdb.com/title/tt35606013")
+
+    def test_lookups_run_concurrently_once_per_title(self):
+        import threading, time as _t
+        seen, lock, live, peak = [], threading.Lock(), [0], [0]
+
+        def slow(title, is_movie=True, year_hint=""):
+            with lock:
+                seen.append(title); live[0] += 1; peak[0] = max(peak[0], live[0])
+            _t.sleep(0.2)
+            with lock:
+                live[0] -= 1
+            return {}
+        mf._CACHE.clear()
+        rows = [dict(self.MOVIE, title="T%d" % k, imdb_id="") for k in range(6)]
+        with mock.patch.object(app, "fetch_metadata", side_effect=slow):
+            app._review_prefetch(rows, {c: c for c in rows[0]})
+        self.assertEqual(sorted(seen), ["T%d" % k for k in range(6)])
+        self.assertGreater(peak[0], 1)
