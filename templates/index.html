@@ -423,7 +423,8 @@
 
             // every title always gets an explicit type (fixes mixed runs
             // silently defaulting to movies)
-            const payload = { titles: titles, includeDar: includeDar, autoFetch: autoFetch, geminiCompare: geminiCompare, titles_type: parsed.types, professions: parsed.professions };
+            const payload = { titles: titles, includeDar: includeDar, autoFetch: autoFetch, geminiCompare: geminiCompare, titles_type: parsed.types, professions: parsed.professions,
+                              picks: (typeof sameNamePicks === 'object' ? sameNamePicks : {}) };
             return {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -534,14 +535,19 @@
         }
 
         // ---- same-named titles (Sep 2026) ------------------------------------
-        // Several movies / shows can share a name ('The Rescue' 2027 western vs
-        // the 2021 documentary ...). Before Preview / Download, manual Movie & TV
-        // titles without a '(YYYY)' are checked; when more than one title
-        // matches, the user picks which one(s) they mean and the line becomes
-        // 'The Rescue (2027)', so Wikipedia, IMDb, Rotten Tomatoes, Metacritic
-        // and every social handle come from THAT title.
+        // One name can mean several entities: 'The Rescue' (2027 western vs 2021
+        // documentary), 'Doom' (1993 vs 2016 game), 'Michael B. Jordan' (actor vs
+        // basketball player). Before Preview / Download, manual Movie, TV Show,
+        // Video Game and Talent lines are checked; when more than one entity
+        // matches, the user picks which one(s) they mean.
+        //   * Movies / TV / Games: several may be ticked; each becomes
+        //     'Title (YYYY)' and is pinned to its exact IMDb / Wikidata id.
+        //   * Talent: exactly one person per line; the line stays as typed and
+        //     is pinned to that person's Wikidata item.
         let sameNameCheckedText = null;
         let sameNamePending = null;
+        let sameNameItems = [];      // [{title, item}] indexed by checkbox id
+        let sameNamePicks = {};      // final title -> {tt?, qid?}, sent as payload.picks
 
         async function withSameNameCheck(action) {
             const method = document.getElementById('inputMethod').value;
@@ -553,14 +559,17 @@
             }
             const parsed = getTitlesAndTypes();
             if (!parsed.titles.length) { action(); return; }
-            showMessage('inputMessage', 'Checking for titles that share a name…', 'success');
-            let cands = {};
+            showMessage('inputMessage', 'Checking for names that match more than one title / person…', 'success');
+            let cands = {}, modes = {};
             try {
                 const r = await fetch('/api/candidates', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ titles: parsed.titles, titles_type: parsed.types })
+                    body: JSON.stringify({ titles: parsed.titles, titles_type: parsed.types,
+                                           professions: parsed.professions })
                 });
-                cands = ((await r.json()) || {}).candidates || {};
+                const j = (await r.json()) || {};
+                cands = j.candidates || {};
+                modes = j.modes || {};
             } catch (e) {
                 cands = {};        // lookup failed -> never block the user
             }
@@ -571,26 +580,34 @@
                 return;
             }
             sameNamePending = action;
-            renderSameNamePicker(cands);
+            renderSameNamePicker(cands, modes, parsed.types);
         }
 
-        function renderSameNamePicker(cands) {
+        function renderSameNamePicker(cands, modes, types) {
             const panel = document.getElementById('sameNamePanel');
-            let html = '<h4>⚠️ Some titles match more than one movie / show</h4>'
-                + '<div style="color:var(--faint)">Tick the one(s) you mean. Each ticked title is generated '
-                + 'with its release year, e.g. <em>The Rescue (2027)</em>, so every link and handle is for that title.</div>';
-            let i = 0;
+            let html = '<h4>⚠️ Some names match more than one title / person</h4>'
+                + '<div style="color:var(--faint)">Choose the one(s) you mean. Movies, TV shows and games are '
+                + 'generated with their release year, e.g. <em>The Rescue (2027)</em>; for talent pick one person. '
+                + 'Every link and handle then comes from exactly that entry.</div>';
+            sameNameItems = [];
+            let g = 0;
             Object.keys(cands).forEach(title => {
-                html += `<div class="sn-title">“${escapeHtml(title)}” — ${cands[title].length} matches</div>`;
+                const single = modes[title] === 'single';
+                const kindLabel = (/talent/.test(types[title] || '') ? 'people'
+                                   : /game/.test(types[title] || '') ? 'games' : 'matches');
+                html += `<div class="sn-title">“${escapeHtml(title)}” — ${cands[title].length} ${kindLabel}`
+                    + (single ? ' <span style="color:var(--faint);font-weight:400">(pick one)</span>' : '') + '</div>';
+                const group = 'sng_' + (g++);
                 cands[title].forEach((c, j) => {
-                    const id = 'sn_' + (i++);
-                    const yr = c.year ? c.year : 'undated';
-                    html += `<label class="sn-opt" for="${id}"><input type="checkbox" id="${id}"`
-                        + ` data-title="${escapeHtml(title)}" data-year="${c.year || ''}" data-tt="${escapeHtml(c.tt)}"`
+                    const id = 'sn_' + sameNameItems.length;
+                    sameNameItems.push({ title, item: c });
+                    html += `<label class="sn-opt" for="${id}"><input type="${single ? 'radio' : 'checkbox'}"`
+                        + ` id="${id}" name="${group}" data-idx="${sameNameItems.length - 1}"`
                         + (j === 0 ? ' checked' : '') + '>'
-                        + `<span><strong>${escapeHtml(String(yr))}</strong> · ${escapeHtml(c.kind || '')}`
-                        + (c.stars ? ` · ${escapeHtml(c.stars)}` : '')
-                        + ` · <a href="${escapeHtml(c.imdb_url)}" target="_blank" rel="noopener">${escapeHtml(c.tt)}</a></span></label>`;
+                        + `<span><strong>${escapeHtml(String(c.headline || ''))}</strong>`
+                        + (c.detail ? ` · ${escapeHtml(c.detail)}` : '')
+                        + (c.link ? ` · <a href="${escapeHtml(c.link)}" target="_blank" rel="noopener">${escapeHtml(c.link_text || 'link')}</a>` : '')
+                        + '</span></label>';
                 });
             });
             html += '<div class="button-group" style="margin-top:12px">'
@@ -609,14 +626,15 @@
         }
 
         function applySameNamePicks() {
-            const picks = {};
-            document.querySelectorAll('#sameNamePanel input[type=checkbox]').forEach(cb => {
-                const t = cb.getAttribute('data-title');
-                picks[t] = picks[t] || [];
-                if (cb.checked) picks[t].push(cb.getAttribute('data-year'));
+            const chosen = {};       // typed title -> [item, ...]
+            sameNameItems.forEach(x => { chosen[x.title] = chosen[x.title] || []; });
+            document.querySelectorAll('#sameNamePanel input[data-idx]').forEach(cb => {
+                if (!cb.checked) return;
+                const x = sameNameItems[Number(cb.getAttribute('data-idx'))];
+                if (x) chosen[x.title].push(x.item);
             });
-            for (const t in picks) {
-                if (!picks[t].length) {
+            for (const t in chosen) {
+                if (!chosen[t].length) {
                     showMessage('inputMessage', `Pick at least one match for “${t}”.`, 'error');
                     return;
                 }
@@ -625,12 +643,15 @@
             const out = [];
             ta.value.split('\n').forEach(line => {
                 const trimmed = line.trim();
-                const t = Object.keys(picks).find(k => trimmed === k || trimmed.startsWith(k + ' ')
+                const t = Object.keys(chosen).find(k => trimmed === k || trimmed.startsWith(k + ' ')
                     && /^\s*(\[[^\]]*\]|\{[^}]*\})/.test(trimmed.slice(k.length)));
                 if (!t) { out.push(line); return; }
                 const rest = trimmed.slice(t.length);        // keeps a [tv] / {tag}
-                // an undated (upcoming) pick keeps the plain title
-                picks[t].forEach(y => out.push(y ? `${t} (${y})${rest}` : `${t}${rest}`));
+                chosen[t].forEach(it => {
+                    const finalTitle = t + (it.suffix || '');  // undated / talent: as typed
+                    if (it.pick && Object.keys(it.pick).length) sameNamePicks[finalTitle] = it.pick;
+                    out.push(finalTitle + rest);
+                });
             });
             ta.value = out.join('\n');
             sameNameCheckedText = ta.value;
@@ -995,6 +1016,7 @@
 
         function resetForm() {
             document.getElementById('titlesList').value = '';
+            sameNamePicks = {}; sameNameCheckedText = null;
             document.getElementById('includeDar').checked = true;
             const _g = document.getElementById('geminiCompare');
             if (_g && !_g.disabled) _g.checked = false;
