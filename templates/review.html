@@ -104,19 +104,23 @@
         <div class="card">
             <div class="card-head">
                 <span class="ic">🔎</span>
-                <div><h2>Upload &amp; Review</h2><div class="sub">.xlsx or .csv — first sheet is reviewed</div></div>
+                <div><h2>Upload &amp; Review</h2><div class="sub">.xlsx or .csv — every ingest sheet is reviewed</div></div>
             </div>
 
             <div class="form-group file-upload">
                 <input type="file" id="fileUpload" accept=".csv,.xlsx,.xls">
                 <label for="fileUpload" class="file-upload-label">📁 Click to select or drag file here</label>
-                <span class="hint">Works with every schema: Movies export (42 cols), TV BrandIngest (39),
-                Talent BrandDef (38), Video Game BDR (39), Publishers BrandDefinitionReport (40)
+                <span class="hint">Works with every schema: Movies export (39 cols), TV BrandIngest (38),
+                Talent BrandDef (38), Video Game BDR (39), Publishers BrandDefinitionReport (38)
                 and the Beauty / Beverages / Sports Teams / General brand templates. The kind is
                 detected per row from <b>title_category</b> (Movies / TV Shows / Talent /
                 Video Game / Publishers / brand categories) — a publication is recognised even
                 when its category is Media or TV Network, from its
-                <b>Publication Type</b> sub-category or <b>LF // Publishing</b> brand set.</span>
+                <b>Publication Type</b> sub-category or <b>LF // Publishing</b> brand set.
+                A mixed TitleForge export is reviewed sheet by sheet (Movies, TV Shows, Talent, ...),
+                and the network must use the database spelling (e.g. <b>Paramount</b>, not
+                "Paramount Pictures"). <b>To verify</b> findings keep your value but point out
+                where sources disagree (Wide vs Limited, network, same-named titles, social handles).</span>
             </div>
 
             <div class="form-group">
@@ -149,6 +153,7 @@
                 <div class="stat-item"><div class="stat-value v-ok" id="sOk">0</div><div class="stat-label">Cells OK</div></div>
                 <div class="stat-item"><div class="stat-value v-gap" id="sGaps">0</div><div class="stat-label">Gaps</div></div>
                 <div class="stat-item"><div class="stat-value v-mis" id="sMis">0</div><div class="stat-label">Mismatches</div></div>
+                <div class="stat-item"><div class="stat-value" id="sVer" style="color:#7fb3ff">0</div><div class="stat-label">To verify</div></div>
             </div>
             <div class="legend" id="legend" style="display:none">
                 <span><span class="sw" style="background:#FFEB9C"></span>Gap — value found, cell empty</span>
@@ -211,6 +216,7 @@
                         document.getElementById('sOk').textContent = s.ok ?? '—';
                         document.getElementById('sGaps').textContent = s.gaps ?? '—';
                         document.getElementById('sMis').textContent = s.mismatches ?? '—';
+                        document.getElementById('sVer').textContent = s.verify ?? 0;
                         document.getElementById('stats').style.display = 'flex';
                         document.getElementById('legend').style.display = 'flex';
                         const a = document.createElement('a');
