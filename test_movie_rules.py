@@ -64,13 +64,19 @@ class ValidatorMovieChecks(unittest.TestCase):
 class ReviewComparatorMovieRules(unittest.TestCase):
     rc = staticmethod(app._review_compare)
 
+    # Sep 2026 rule: the file must carry the DATABASE spelling. A raw
+    # distributor name that resolves to the right studio is flagged with the
+    # database label as the fix (it used to be accepted silently).
     def test_network_umbrella_resolves_to_child(self):
-        self.assertTrue(self.rc("network", "Walt Disney Studios Motion Pictures",
-                                "Disney", title="Avengers")[0])
+        self.assertEqual(self.rc("network", "Walt Disney Studios Motion Pictures",
+                                 "Disney", title="Avengers"), (False, "Disney"))
 
     def test_network_sony_releasing_alias(self):
-        self.assertTrue(self.rc("network", "Sony Pictures Releasing",
-                                "Sony / Columbia", title="Klara")[0])
+        self.assertEqual(self.rc("network", "Sony Pictures Releasing",
+                                 "Sony / Columbia", title="Klara"), (False, "Sony / Columbia"))
+
+    def test_network_database_spelling_passes(self):
+        self.assertTrue(self.rc("network", "Disney", "Disney", title="Avengers")[0])
 
     def test_network_umbrella_vs_specific_flags(self):
         self.assertFalse(self.rc("network", "Walt Disney Studios Motion Pictures",
