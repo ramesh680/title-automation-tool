@@ -3032,27 +3032,77 @@ def _fetch(url, params=None, headers=None):
         return None, ""
 
 
+# MEMORY (Sep 2026 fix): full HTML pages (Rotten Tomatoes / Metacritic pages
+# are ~1 MB each) used to be kept for the life of the process. A few hundred
+# titles filled the 512 MB instance, Render restarted it, and the running job
+# vanished ("Unknown or expired job"). Raw HTML is now held in a SMALL LRU
+# only; what is kept long-term is the few fields parsed out of each page.
+try:
+    PAGE_CACHE_MAX = max(0, int(os.getenv("PAGE_CACHE_MAX", "24")))
+except ValueError:
+    PAGE_CACHE_MAX = 24
+_INFO_CACHE = {}
+_INFO_CACHE_MAX = 5000
+
+
 def _page(url):
-    """HTML of a page (cached for the process), '' when unavailable."""
+    """HTML of a page ('' when unavailable). Raw pages are cached in a small
+    LRU (PAGE_CACHE_MAX) so memory stays flat however many titles run."""
     if not (VALIDATE_URLS and VERIFY_PAGE_CONTENT and url):
         return ""
     u = str(url).replace("http://", "https://")
     with _PAGE_LOCK:
         if u in _PAGE_CACHE:
-            return _PAGE_CACHE[u]
+            html = _PAGE_CACHE.pop(u)
+            _PAGE_CACHE[u] = html            # move to the newest end
+            return html
     status, text = _fetch(u)
     html = text if status == 200 else ""
-    with _PAGE_LOCK:
-        _PAGE_CACHE[u] = html
+    if PAGE_CACHE_MAX:
+        with _PAGE_LOCK:
+            _PAGE_CACHE[u] = html
+            while len(_PAGE_CACHE) > PAGE_CACHE_MAX:
+                _PAGE_CACHE.pop(next(iter(_PAGE_CACHE)))
     return html
 
 
+def _parsed(kind, url, parse):
+    """Small parsed facts about a page, cached long-term (a few hundred bytes
+    per page instead of the page itself)."""
+    if not url:
+        return {}
+    key = (kind, str(url).replace("http://", "https://"))
+    with _PAGE_LOCK:
+        if key in _INFO_CACHE:
+            return dict(_INFO_CACHE[key])
+    info = parse(_page(url)) or {}
+    if info:
+        with _PAGE_LOCK:
+            if len(_INFO_CACHE) >= _INFO_CACHE_MAX:
+                _INFO_CACHE.clear()
+            _INFO_CACHE[key] = dict(info)
+    return info
+
+
 def rt_info(url):
-    return SP.parse_rottentomatoes(_page(url)) if (SP and url) else {}
+    return _parsed("rt", url, SP.parse_rottentomatoes) if (SP and url) else {}
 
 
 def mc_info(url):
-    return SP.parse_metacritic(_page(url)) if (SP and url) else {}
+    return _parsed("mc", url, SP.parse_metacritic) if (SP and url) else {}
+
+
+def _home_parse(html):
+    if not html:
+        return {}
+    return {"scale": SP.parse_official_site_scale(html),
+            "links": SP.extract_social_links(html),
+            "hashtags": SP.extract_hashtags(SP.page_text(html))[:5]}
+
+
+def home_info(url):
+    """Wide/Limited wording, social links and hashtags of an official site."""
+    return _parsed("home", url, _home_parse) if (SP and url) else {}
 
 
 def _page_year_conflict(url, year, kind):
@@ -3080,12 +3130,14 @@ def _cross_check(meta, is_movie, year, notes):
     """Confirm network + Wide/Limited against Rotten Tomatoes, Metacritic and
     the distributor / official site instead of trusting one source."""
     homes = [h for h in (meta.get("_homepage"), meta.get("_homepage_imdb")) if h][:2]
-    # warm the page cache for every page this check reads, all at once
-    _parallel_calls({u: (_page, (u,), {}) for u in
-                     [meta.get("rottentomatoes") if is_movie else None,
-                      meta.get("metacritic")] + homes if u})
-    rt = rt_info(meta.get("rottentomatoes")) if is_movie else {}
-    mc = mc_info(meta.get("metacritic"))
+    # read every page this check needs, all at once
+    got = _parallel_calls({
+        "rt": (rt_info, (meta.get("rottentomatoes"),), {}) if is_movie and meta.get("rottentomatoes") else None,
+        "mc": (mc_info, (meta.get("metacritic"),), {}) if meta.get("metacritic") else None,
+        **{("home", h): (home_info, (h,), {}) for h in homes},
+    }, defaults={"rt": {}, "mc": {}})
+    rt = got.get("rt") or {}
+    mc = got.get("mc") or {}
     # -- network ----------------------------------------------------------
     rt_dist = rt.get("distributor") or ""
     mc_dist = mc.get("distributor") or ""
@@ -3109,7 +3161,7 @@ def _cross_check(meta, is_movie, year, notes):
         homes = [h for h in (meta.get("_homepage"), meta.get("_homepage_imdb")) if h]
         dist_scale = ""
         for h in homes[:2]:
-            dist_scale = SP.parse_official_site_scale(_page(h))
+            dist_scale = (got.get(("home", h)) or home_info(h) or {}).get("scale", "")
             if dist_scale:
                 break
         votes = {
@@ -3306,11 +3358,10 @@ def _discover_socials(meta, title, year, notes, network=""):
     # 3) official homepage(s)
     if VALIDATE_URLS and len(found) < len(_SOCIAL_FIELD):
         for home in [h for h in (meta.get("_homepage"), meta.get("_homepage_imdb")) if h][:2]:
-            html = _page(home)
-            if html:
-                take(SP.extract_social_links(html), "official site")
-                hashtags += [t for t in SP.extract_hashtags(SP.page_text(html))
-                             if t not in hashtags][:5]
+            info = home_info(home)
+            if info:
+                take(info.get("links") or {}, "official site")
+                hashtags += [t for t in info.get("hashtags") or [] if t not in hashtags]
 
     for plat, (h, source) in found.items():
         field = _SOCIAL_FIELD[plat]
