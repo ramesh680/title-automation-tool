@@ -3344,8 +3344,11 @@ def _probe_facebook(h):
                 return False, ""
             return True, str(data["name"])
         err = (data.get("error") or {}) if isinstance(data, dict) else {}
-        # 803: no such alias; 100: not a public page / restricted; 190 = bad token
-        if err.get("code") in (803, 100) or status == 404:
+        # Only 803 ("no such alias") is a definitive "page does not exist".
+        # Code 100 / 10 are also returned when the app simply lacks Meta's
+        # "Page Public Content Access" feature, so they must NOT blank a page:
+        # they, bad tokens (190) and throttling fall through to the keyless probe.
+        if err.get("code") == 803:
             return False, ""
         # token problem / throttled -> fall through to the keyless probe
     for headers in (_FB_CRAWLER_HEADERS, None):
