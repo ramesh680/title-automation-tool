@@ -214,14 +214,43 @@ class SocialDiscovery(unittest.TestCase):
         self.assertNotIn("instagram_user", meta)
 
     def test_official_source_replaces_stale_handle_with_note(self):
+        # the studio-listed handle is confirmed live -> it replaces the stale one
+        meta = {"instagram_user": "rescuedocumentary", "_trailer_keys": ["k"]}
+        notes = []
+
+        def probe(plat, h):
+            return (True, "The Rescue") if h == "therescuemovie" else (None, "")
+        with mock.patch.object(mf, "youtube_descriptions", return_value=[("k", "t", TRAILER_DESC)]), \
+                mock.patch.object(mf, "_page", return_value=""), \
+                mock.patch.object(mf, "probe_handle", side_effect=probe):
+            mf._discover_socials(meta, "The Rescue", 2027, notes)
+        self.assertEqual(meta["instagram_user"], "therescuemovie")
+        self.assertTrue(any("replaced" in n for n in notes))
+
+    def test_unconfirmed_trailer_handle_does_not_overwrite_curated(self):
+        # regression (Sep 2026): a trailer-description handle that cannot be
+        # confirmed must not silently replace the Wikidata/TMDB handle
         meta = {"instagram_user": "rescuedocumentary", "_trailer_keys": ["k"]}
         notes = []
         with mock.patch.object(mf, "youtube_descriptions", return_value=[("k", "t", TRAILER_DESC)]), \
                 mock.patch.object(mf, "_page", return_value=""), \
                 mock.patch.object(mf, "probe_handle", return_value=(None, "")):
             mf._discover_socials(meta, "The Rescue", 2027, notes)
-        self.assertEqual(meta["instagram_user"], "therescuemovie")
-        self.assertTrue(any("replaced" in n for n in notes))
+        self.assertEqual(meta["instagram_user"], "rescuedocumentary")
+        self.assertTrue(any("was kept" in n for n in notes))
+
+    def test_unopenable_guess_is_not_accepted(self):
+        # regression: a login-walled / unknown page (probe None) used to be
+        # accepted for 'strong' guesses -> non-existent Facebook pages shipped
+        meta = {"instagram_user": "therescuemovie"}
+        with mock.patch.object(mf, "youtube_trailer_ids", return_value=[]), \
+                mock.patch.object(mf, "youtube_descriptions", return_value=[]), \
+                mock.patch.object(mf, "_page", return_value=""), \
+                mock.patch.object(mf, "probe_handle", return_value=(None, "")):
+            mf._discover_socials(meta, "The Rescue", 2027, [])
+        self.assertNotIn("facebook_page", meta)
+        self.assertNotIn("twitter_handle", meta)
+        self.assertNotIn("tiktok_user", meta)
 
     def test_imdb_official_sites(self):
         html = ('{"officialSites":{"edges":[{"node":{"url":"https:\\/\\/www.instagram.com\\/'
