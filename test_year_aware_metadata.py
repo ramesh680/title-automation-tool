@@ -179,7 +179,7 @@ class GameEntityPicking(unittest.TestCase):
 
     def _run(self, entities, order, year_hint=""):
         off = dict(youtube_channel=lambda n: {},
-                   verify_socials=lambda m, t=None, reject_foreign=False: None,
+                   verify_socials=lambda m, t=None, reject_foreign=False, **kw: None,
                    _resolve_metacritic_game=lambda t, candidate=None: "",
                    fetch_metacritic_game=lambda u: {},
                    wiki_lookup_game=lambda t, year=None: (None, None, None, True),
