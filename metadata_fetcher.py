@@ -524,7 +524,7 @@ _PLAT_LABEL = {"twitter": "X/Twitter", "instagram": "Instagram",
                "facebook": "Facebook", "tiktok": "TikTok"}
 
 
-def verify_socials(meta, title=None, reject_foreign=False, notes=None):
+def verify_socials(meta, title=None, reject_foreign=False, notes=None, kind=None):
     """Drop social handles that are wrong, dead or restricted.
 
     With reject_foreign set (movies/TV), a handle whose slug signals a different
@@ -536,7 +536,12 @@ def verify_socials(meta, title=None, reject_foreign=False, notes=None):
     Facebook pages) is dropped and a note says so. A profile the server could
     not open (login wall / throttling) is kept only when it came from a
     curated source (Wikidata / TMDB / IMDb / the studio's own page) and
-    SOCIAL_STRICT is off; a guessed one is dropped."""
+    SOCIAL_STRICT is off; a guessed one is dropped.
+
+    With `kind` ('movie' / 'tv' / 'game') the Facebook page's own category tag
+    must fit the title type ('Film'/'Movie', 'TV Show', 'Video Game'): a
+    same-named page tagged 'Musician/band', 'Public figure', 'Community' ...
+    is a different owner and is dropped."""
     if not meta:
         return meta
     if reject_foreign and title:
@@ -579,6 +584,20 @@ def verify_socials(meta, title=None, reject_foreign=False, notes=None):
             else:
                 _note(notes, "Social handles: %s %r could not be opened to confirm it "
                              "is live -- verify." % (_PLAT_LABEL[plat], val))
+    fb = meta.get("facebook_page")
+    if fb and kind in _FB_ALLOWED_CATEGORIES:
+        cats = facebook_category(fb)
+        verdict = facebook_category_verdict(cats, kind)
+        if verdict == "wrong":
+            log.info("dropping facebook %r - category %s is not %s", fb, cats, kind)
+            meta.pop("facebook_page", None)
+            _note(notes, "Social handles: Facebook %r was removed -- the page is tagged "
+                         "'%s', not '%s', so it is not the title's page."
+                  % (fb, ", ".join(cats), _FB_KIND_LABEL[kind]))
+        elif verdict == "soft":
+            _note(notes, "Social handles: Facebook %r is tagged '%s' rather than '%s' "
+                         "-- verify it is the title's official page."
+                  % (fb, ", ".join(cats), _FB_KIND_LABEL[kind]))
     return meta
 
 
@@ -2738,7 +2757,7 @@ def fetch_game(name, qid=None, year_hint=""):
 
     # the title is what tells a wrong-owner handle from the game's own, so pass
     # it -- the film/TV path has always done this, the game path never did
-    verify_socials(meta, clean, reject_foreign=True)
+    verify_socials(meta, clean, reject_foreign=True, kind="game")
     _carry_year_notes(meta, notes)
     _CACHE[key] = dict(meta)
     return meta
@@ -3296,7 +3315,11 @@ _PROBE_CACHE = {}
 
 def probe_handle(plat, handle):
     """Cached wrapper -- the same handle is probed once per process."""
-    key = (plat, str(handle or "").strip().lstrip("@").lower())
+    h = str(handle or "").strip().lstrip("@")
+    if plat == "facebook":  # a full page URL and its bare name are one page
+        h = re.sub(r"^https?://(?:www\.|m\.)?facebook\.com/", "", h, flags=re.I)
+        h = h.split("?")[0].strip("/")
+    key = (plat, h.lower())
     if key in _PROBE_CACHE:
         return _PROBE_CACHE[key]
     res = _probe_handle(plat, handle)
@@ -3329,10 +3352,62 @@ _IG_API_HEADERS = {"User-Agent": HTML_HEADERS.get("User-Agent", "Mozilla/5.0"),
                    "x-ig-app-id": "936619743392459", "Accept": "application/json"}
 
 
+# The page's own category tag ("Film", "TV Show", "Video Game" under the page
+# name). It is what tells the title's official page from a same-named band,
+# fan page, person or business. Graph API gives it reliably; Facebook's page
+# HTML only carries it as "category_name" for some viewers, so it may be blank.
+_FB_CATEGORY = {}
+_FB_ALLOWED_CATEGORIES = {
+    "movie": {"movie", "movies", "film", "films"},
+    "tv": {"tv show", "tv shows", "tv programme", "tv program", "tv series",
+           "television show", "television programme", "tv & movies", "show"},
+    "game": {"video game", "video games", "games/toys", "game"},
+}
+# Media-ish tags some official title pages carry: kept, but flagged to verify.
+_FB_SOFT_CATEGORIES = {"media", "entertainment", "entertainment website",
+                       "media/news company", "fictional character", "movie character",
+                       "tv/movie award", "digital creator"}
+_FB_KIND_LABEL = {"movie": "Film/Movie", "tv": "TV Show", "game": "Video Game"}
+
+
+def _fb_category_from_html(html, page_name):
+    """The category_name that sits next to THIS page's name in the embedded
+    JSON (other pages' categories appear on the same HTML, so an unanchored
+    first match is not trusted)."""
+    if not (html and page_name):
+        return ""
+    name = re.escape(json.dumps(page_name)[1:-1])
+    m = (re.search(r'"category_name"\s*:\s*"([^"]{1,60})"\s*,\s*"name"\s*:\s*"%s"' % name, html)
+         or re.search(r'"name"\s*:\s*"%s"\s*,\s*"category_name"\s*:\s*"([^"]{1,60})"' % name, html))
+    return m.group(1) if m else ""
+
+
+def facebook_category(page):
+    """Category tag(s) of a Facebook page, [] when unknown."""
+    h = re.sub(r"^https?://(?:www\.|m\.)?facebook\.com/", "", str(page or ""), flags=re.I)
+    h = h.split("?")[0].strip("/").lstrip("@")
+    if not h:
+        return []
+    probe_handle("facebook", h)
+    return list(_FB_CATEGORY.get(h.lower()) or [])
+
+
+def facebook_category_verdict(categories, kind):
+    """'ok' | 'soft' | 'wrong' | '' (unknown) for a page's categories."""
+    cats = [str(c).strip().lower() for c in (categories or []) if c]
+    if not (cats and kind in _FB_ALLOWED_CATEGORIES):
+        return ""
+    if any(c in _FB_ALLOWED_CATEGORIES[kind] for c in cats):
+        return "ok"
+    if any(c in _FB_SOFT_CATEGORIES for c in cats):
+        return "soft"
+    return "wrong"
+
+
 def _probe_facebook(h):
     if FB_ACCESS_TOKEN:
         status, text = _fetch(FB_GRAPH + urllib.parse.quote(h, safe="."),
-                              params={"fields": "name,link,is_published",
+                              params={"fields": "name,link,is_published,category,category_list",
                                       "access_token": FB_ACCESS_TOKEN},
                               headers=HEADERS)
         try:
@@ -3342,6 +3417,9 @@ def _probe_facebook(h):
         if status == 200 and data.get("name"):
             if data.get("is_published") is False:
                 return False, ""
+            cats = [data.get("category")] + [c.get("name") for c in (data.get("category_list") or [])
+                                             if isinstance(c, dict)]
+            _FB_CATEGORY[h.lower()] = [c for c in cats if c]
             return True, str(data["name"])
         err = (data.get("error") or {}) if isinstance(data, dict) else {}
         # Only 803 ("no such alias") is a definitive "page does not exist".
@@ -3360,6 +3438,9 @@ def _probe_facebook(h):
         m = re.search(r'property="og:title"\s+content="([^"]*)"', text)
         t = (SP.page_text(m.group(1)) if SP else m.group(1)).strip() if m else ""
         if t and not _FB_GENERIC_TITLE_RE.search(t):
+            cat = _fb_category_from_html(text, t)
+            if cat and h.lower() not in _FB_CATEGORY:
+                _FB_CATEGORY[h.lower()] = [cat]
             return True, t
         if _FB_UNAVAILABLE_RE.search(text[:200000]):
             return False, ""
@@ -3702,7 +3783,8 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None, want_year=None):
         log.warning("social discovery failed for %s: %s", tt, e)
 
     # drop wrong-owner (band/artist) handles first, then dead / restricted ones
-    verify_socials(meta, title_hint, reject_foreign=True, notes=notes)
+    verify_socials(meta, title_hint, reject_foreign=True, notes=notes,
+                   kind="movie" if is_movie else "tv")
     _carry_year_notes(meta, notes)
     return _drop_private(meta)
 
@@ -3869,7 +3951,8 @@ def fetch_metadata(title, is_movie=True, year_hint=""):
                 _discover_socials(meta, lookup, _yr, notes, network=meta.get("network", ""))
             except Exception as e:  # noqa: BLE001
                 log.warning("social discovery failed for %r: %s", lookup, e)
-            verify_socials(meta, lookup, reject_foreign=True, notes=notes)
+            verify_socials(meta, lookup, reject_foreign=True, notes=notes,
+                           kind="movie" if is_movie else "tv")
             _carry_year_notes(meta, notes)
             _drop_private(meta)
         if sug_ptype:
