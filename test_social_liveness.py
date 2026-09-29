@@ -106,5 +106,22 @@ class OtherProbes(unittest.TestCase):
             self.assertFalse(mf._probe_handle("tiktok", "abc")[0])
 
 
+
+class GraphPermissionErrorIsNotDead(unittest.TestCase):
+    """Code 100 / 10 mean 'app lacks Page Public Content Access', not 'gone'."""
+    def setUp(self):
+        self._tok = mf.FB_ACCESS_TOKEN
+        mf.FB_ACCESS_TOKEN = "app|secret"
+
+    def tearDown(self):
+        mf.FB_ACCESS_TOKEN = self._tok
+
+    def test_permission_error_falls_back_to_page_probe(self):
+        graph = (400, '{"error":{"code":100,"message":"Pages Public Content Access requires ..."}}')
+        page = (200, '<meta property="og:title" content="Superman" />')
+        with mock.patch.object(mf, "_fetch", side_effect=[graph, page]):
+            self.assertEqual(mf._probe_handle("facebook", "SupermanMovie"), (True, "Superman"))
+
+
 if __name__ == "__main__":
     unittest.main()
