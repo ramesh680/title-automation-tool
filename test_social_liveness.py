@@ -122,6 +122,70 @@ class GraphPermissionErrorIsNotDead(unittest.TestCase):
         with mock.patch.object(mf, "_fetch", side_effect=[graph, page]):
             self.assertEqual(mf._probe_handle("facebook", "SupermanMovie"), (True, "Superman"))
 
+class FacebookCategoryTag(unittest.TestCase):
+    """The page's category tag ('Film', 'TV Show', 'Video Game') must fit."""
+    def setUp(self):
+        self._v, self._tok = mf.VALIDATE_URLS, mf.FB_ACCESS_TOKEN
+        mf.VALIDATE_URLS, mf.FB_ACCESS_TOKEN = True, "app|secret"
+        mf._PROBE_CACHE.clear()
+        mf._FB_CATEGORY.clear()
+
+    def tearDown(self):
+        mf.VALIDATE_URLS, mf.FB_ACCESS_TOKEN = self._v, self._tok
+
+    def _graph(self, category):
+        return (200, '{"name":"Avengers","category":"%s","category_list":[{"name":"%s"}]}'
+                % (category, category))
+
+    def _run(self, category, kind):
+        meta, notes = {"facebook_page": "http://www.facebook.com/avengers"}, []
+        with mock.patch.object(mf, "_fetch", return_value=self._graph(category)):
+            mf.verify_socials(meta, "Avengers", notes=notes, kind=kind)
+        return meta, notes
+
+    def test_film_tag_kept_for_movie(self):
+        meta, notes = self._run("Film", "movie")
+        self.assertIn("facebook_page", meta)
+        self.assertFalse(notes)
+
+    def test_movie_tag_kept_for_movie(self):
+        self.assertIn("facebook_page", self._run("Movie", "movie")[0])
+
+    def test_band_page_dropped_for_movie(self):
+        meta, notes = self._run("Musician/band", "movie")
+        self.assertNotIn("facebook_page", meta)
+        self.assertTrue(any("Musician/band" in n and "removed" in n for n in notes))
+
+    def test_film_page_dropped_for_tv_show(self):
+        self.assertNotIn("facebook_page", self._run("Film", "tv")[0])
+
+    def test_tv_show_kept_for_tv(self):
+        self.assertIn("facebook_page", self._run("TV Show", "tv")[0])
+
+    def test_video_game_kept_for_game(self):
+        self.assertIn("facebook_page", self._run("Video game", "game")[0])
+
+    def test_media_tag_kept_but_flagged(self):
+        meta, notes = self._run("Media", "movie")
+        self.assertIn("facebook_page", meta)
+        self.assertTrue(any("verify" in n for n in notes))
+
+    def test_unknown_category_is_not_dropped(self):
+        mf.FB_ACCESS_TOKEN = ""
+        meta = {"facebook_page": "http://www.facebook.com/avengers"}
+        with mock.patch.object(mf, "_fetch",
+                               return_value=(200, '<meta property="og:title" content="Avengers" />')):
+            mf.verify_socials(meta, "Avengers", kind="movie")
+        self.assertIn("facebook_page", meta)
+
+    def test_category_read_from_page_json(self):
+        mf.FB_ACCESS_TOKEN = ""
+        html = ('<meta property="og:title" content="Avengers" />'
+                '{"category_name":"Singer","name":"Someone Else"}'
+                '{"id":"1","category_name":"Film","name":"Avengers"}')
+        with mock.patch.object(mf, "_fetch", return_value=(200, html)):
+            self.assertEqual(mf.facebook_category("avengers"), ["Film"])
+
 
 if __name__ == "__main__":
     unittest.main()
