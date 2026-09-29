@@ -227,7 +227,7 @@ class SourcingPolicyTests(unittest.TestCase):
             _claim_values=fake_claim_values,
             _labels=lambda qids: labels,
             youtube_channel=lambda name: {},
-            verify_socials=lambda meta, title=None, reject_foreign=False: None,
+            verify_socials=lambda meta, title=None, reject_foreign=False, **kw: None,
             # the Wikipedia / IMDb fallbacks are exercised in
             # test_year_aware_metadata; here they must stay off the network
             wiki_lookup_game=lambda title, year=None: (None, None, None, True),
