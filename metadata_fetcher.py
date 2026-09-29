@@ -511,14 +511,32 @@ _FB_BAD_PATH_RE = re.compile(
     r"facebook\.com/(?:p|php|people)/|facebook\.com/profile\.php", re.I)
 
 
-def verify_socials(meta, title=None, reject_foreign=False):
-    """Drop social handles that are wrong or dead.
+# SOCIAL_STRICT=1: ship ONLY handles whose profile was confirmed to exist and
+# load publicly -- an account page that could not be opened (login wall,
+# throttling) is dropped too, even from Wikidata / TMDB. Default (0): a
+# curated handle whose page could not be opened is kept with a review note;
+# a discovered / guessed one is dropped.
+SOCIAL_STRICT = os.getenv("SOCIAL_STRICT", "0").strip().lower() in ("1", "true", "yes")
+
+_VERIFY_FIELDS = (("twitter", "twitter_handle"), ("instagram", "instagram_user"),
+                  ("facebook", "facebook_page"), ("tiktok", "tiktok_user"))
+_PLAT_LABEL = {"twitter": "X/Twitter", "instagram": "Instagram",
+               "facebook": "Facebook", "tiktok": "TikTok"}
+
+
+def verify_socials(meta, title=None, reject_foreign=False, notes=None):
+    """Drop social handles that are wrong, dead or restricted.
 
     With reject_foreign set (movies/TV), a handle whose slug signals a different
     owner -- '...band', 'VEVO', 'Topic' -- is dropped first, so a same-named
     band's account never rides along on a movie/show (the 'Crawlers' case).
-    Then the live check runs; it fails OPEN, removing a handle only on a
-    definitive 404 -- bot walls and rate limits never strip a valid account."""
+
+    Then every handle is probed (probe_handle): a profile that does not exist,
+    is suspended / removed, private, or restricted (age / country gated
+    Facebook pages) is dropped and a note says so. A profile the server could
+    not open (login wall / throttling) is kept only when it came from a
+    curated source (Wikidata / TMDB / IMDb / the studio's own page) and
+    SOCIAL_STRICT is off; a guessed one is dropped."""
     if not meta:
         return meta
     if reject_foreign and title:
@@ -536,15 +554,31 @@ def verify_socials(meta, title=None, reject_foreign=False):
         meta.pop("facebook_page", None)
     if not VALIDATE_URLS:
         return meta
-    if meta.get("twitter_handle") and not _twitter_alive(meta["twitter_handle"]):
-        log.info("dropping dead twitter handle %r", meta["twitter_handle"])
-        meta.pop("twitter_handle")
-    if meta.get("instagram_user") and not _instagram_alive(meta["instagram_user"]):
-        log.info("dropping dead instagram user %r", meta["instagram_user"])
-        meta.pop("instagram_user")
-    if meta.get("facebook_page") and not _facebook_alive(meta["facebook_page"]):
-        log.info("dropping dead facebook page %r", meta["facebook_page"])
-        meta.pop("facebook_page")
+    src = meta.get("_social_src") or {}
+    todo = [(plat, field) for plat, field in _VERIFY_FIELDS if meta.get(field)]
+    if not todo:
+        return meta
+    results = _parallel_calls(
+        {plat: (probe_handle, (plat, str(meta[field])), {}) for plat, field in todo},
+        defaults={plat: (None, "") for plat, _f in todo})
+    for plat, field in todo:
+        val = meta[field]
+        exists = (results.get(plat) or (None, ""))[0]
+        if exists is False:
+            log.info("dropping dead/restricted %s %r", plat, val)
+            meta.pop(field, None)
+            _note(notes, "Social handles: %s %r was removed -- the profile does not "
+                         "exist, is suspended/private, or is restricted."
+                  % (_PLAT_LABEL[plat], val))
+        elif exists is None:
+            if SOCIAL_STRICT or src.get(plat) == "guess":
+                log.info("dropping unconfirmed %s %r", plat, val)
+                meta.pop(field, None)
+                _note(notes, "Social handles: %s %r was removed -- its profile could "
+                             "not be confirmed as a live public page." % (_PLAT_LABEL[plat], val))
+            else:
+                _note(notes, "Social handles: %s %r could not be opened to confirm it "
+                             "is live -- verify." % (_PLAT_LABEL[plat], val))
     return meta
 
 
@@ -3270,18 +3304,112 @@ def probe_handle(plat, handle):
     return res
 
 
+# Optional Facebook Graph credentials. With them, Facebook existence is decided
+# by the Graph API (a removed, unpublished, age- or country-restricted page
+# answers with an error), which is the only check Facebook does not wall off
+# for a datacenter IP. Without them the keyless page probe below is used.
+FB_ACCESS_TOKEN = (os.getenv("FB_ACCESS_TOKEN") or "").strip() or (
+    ("%s|%s" % (os.getenv("FB_APP_ID", "").strip(), os.getenv("FB_APP_SECRET", "").strip()))
+    if os.getenv("FB_APP_ID") and os.getenv("FB_APP_SECRET") else "")
+FB_GRAPH = "https://graph.facebook.com/v19.0/"
+
+# Text Facebook serves (with HTTP 200) for a page that is gone or restricted.
+_FB_UNAVAILABLE_RE = re.compile(
+    r"this content isn.t available|this page isn.t available|content isn.t available"
+    r" right now|the link you followed may be broken|page may have been removed|"
+    r"isn.t available in your country|restricted to people|content_unavailable|"
+    r"page not found", re.I)
+_FB_GENERIC_TITLE_RE = re.compile(r"^(facebook|log in|log into|error|page not found|"
+                                  r"content not found|this content isn)", re.I)
+# Browser UA gets the login wall; Facebook's own crawler UA gets the public
+# page's og: tags (and the 'not available' page for a gone / restricted one).
+_FB_CRAWLER_HEADERS = {"User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+                       "Accept-Language": "en-US,en;q=0.9"}
+_IG_API_HEADERS = {"User-Agent": HTML_HEADERS.get("User-Agent", "Mozilla/5.0"),
+                   "x-ig-app-id": "936619743392459", "Accept": "application/json"}
+
+
+def _probe_facebook(h):
+    if FB_ACCESS_TOKEN:
+        status, text = _fetch(FB_GRAPH + urllib.parse.quote(h, safe="."),
+                              params={"fields": "name,link,is_published",
+                                      "access_token": FB_ACCESS_TOKEN},
+                              headers=HEADERS)
+        try:
+            data = json.loads(text or "{}")
+        except Exception:  # noqa: BLE001
+            data = {}
+        if status == 200 and data.get("name"):
+            if data.get("is_published") is False:
+                return False, ""
+            return True, str(data["name"])
+        err = (data.get("error") or {}) if isinstance(data, dict) else {}
+        # 803: no such alias; 100: not a public page / restricted; 190 = bad token
+        if err.get("code") in (803, 100) or status == 404:
+            return False, ""
+        # token problem / throttled -> fall through to the keyless probe
+    for headers in (_FB_CRAWLER_HEADERS, None):
+        status, text = _fetch("https://www.facebook.com/%s" % h, headers=headers)
+        if status in (404, 410):
+            return False, ""
+        if status != 200 or not text:
+            continue
+        m = re.search(r'property="og:title"\s+content="([^"]*)"', text)
+        t = (SP.page_text(m.group(1)) if SP else m.group(1)).strip() if m else ""
+        if t and not _FB_GENERIC_TITLE_RE.search(t):
+            return True, t
+        if _FB_UNAVAILABLE_RE.search(text[:200000]):
+            return False, ""
+    return None, ""
+
+
+def _probe_instagram(h):
+    status, text = _fetch("https://www.instagram.com/api/v1/users/web_profile_info/",
+                          params={"username": h}, headers=_IG_API_HEADERS)
+    if status == 404:
+        return False, ""
+    if status == 200:
+        try:
+            user = ((json.loads(text or "{}") or {}).get("data") or {}).get("user")
+        except Exception:  # noqa: BLE001
+            user = None
+        if user is None and text and '"user":null' in text.replace(" ", ""):
+            return False, ""
+        if isinstance(user, dict):
+            if user.get("is_private"):
+                return False, ""  # a private account is not a usable brand handle
+            return True, str(user.get("full_name") or user.get("username") or h)
+    status, text = _fetch("https://www.instagram.com/%s/" % h)
+    if status in (404, 410):
+        return False, ""
+    if re.search(r"Sorry, this page isn.t available|The link you followed may be broken",
+                 text or "", re.I):
+        return False, ""
+    m = re.search(r'property="og:title"\s+content="([^"]*)"', text or "")
+    if m:
+        t = SP.page_text(m.group(1)) if SP else m.group(1)
+        if ("@" + h).lower() in t.lower():
+            return True, t.split("(@")[0].strip()
+    return None, ""
+
+
 def _probe_handle(plat, handle):
     """(exists, display_name) for a handle on a platform, keyless.
     exists: True (the account page answered as that account), False (a
-    definitive 'no such account'), None (login wall / throttled -- unknown)."""
+    definitive 'no such account' OR a page that is removed, suspended,
+    private or restricted -- i.e. not a usable public profile), None (login
+    wall / throttled -- unknown)."""
     h = str(handle or "").strip().lstrip("@")
+    if plat == "facebook":
+        h = re.sub(r"^https?://(?:www\.|m\.)?facebook\.com/", "", h, flags=re.I)
+        h = h.split("?")[0].strip("/")
     if not h:
         return False, ""
     try:
         if plat == "twitter":
             status, text = _fetch("https://publish.twitter.com/oembed",
                                   params={"url": "https://twitter.com/" + h})
-            if status == 404:
+            if status in (404, 403, 410):  # 403 = suspended / protected
                 return False, ""
             if status == 200:
                 try:
@@ -3290,35 +3418,22 @@ def _probe_handle(plat, handle):
                     return None, ""
             return None, ""
         if plat == "instagram":
-            status, text = _fetch("https://www.instagram.com/%s/" % h)
-            if status in (404, 410):
-                return False, ""
-            m = re.search(r'property="og:title"\s+content="([^"]*)"', text or "")
-            if m:
-                t = SP.page_text(m.group(1)) if SP else m.group(1)
-                if ("@" + h).lower() in t.lower():
-                    return True, t.split("(@")[0].strip()
-            return None, ""
+            return _probe_instagram(h)
         if plat == "tiktok":
             status, text = _fetch("https://www.tiktok.com/@%s" % h)
             if status in (404, 410):
                 return False, ""
+            if re.search(r'"statusCode"\s*:\s*(?:10221|10202|10222)|Couldn.t find this account',
+                         text or ""):
+                return False, ""
             if re.search(r'"uniqueId"\s*:\s*"%s"' % re.escape(h), text or "", re.I):
+                if re.search(r'"privateAccount"\s*:\s*true', text or ""):
+                    return False, ""
                 n = re.search(r'"nickname"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
                 return True, (n.group(1) if n else "")
-            if re.search(r'"statusCode"\s*:\s*10221|Couldn.t find this account', text or ""):
-                return False, ""
             return None, ""
         if plat == "facebook":
-            status, text = _fetch("https://www.facebook.com/%s" % h)
-            if status in (404, 410):
-                return False, ""
-            m = re.search(r'property="og:title"\s+content="([^"]*)"', text or "")
-            if m:
-                t = SP.page_text(m.group(1)) if SP else m.group(1)
-                if t and not re.search(r"^(facebook|log in|log into)", t, re.I):
-                    return True, t
-            return None, ""
+            return _probe_facebook(h)
     except Exception as e:  # noqa: BLE001
         log.info("probe %s %s failed: %s", plat, h, e)
     return None, ""
@@ -3363,15 +3478,30 @@ def _discover_socials(meta, title, year, notes, network=""):
                 take(info.get("links") or {}, "official site")
                 hashtags += [t for t in info.get("hashtags") or [] if t not in hashtags]
 
+    src = meta.setdefault("_social_src", {})
     for plat, (h, source) in found.items():
         field = _SOCIAL_FIELD[plat]
         cur = _existing_handle(meta, plat)
         if not cur:
             meta[field] = _social_value(plat, h)
+            src[plat] = source
         elif _norm(cur) != _norm(h):
-            _note(notes, "Social handles: %s %r replaced by %r listed on the %s "
-                         "-- verify." % (_SOCIAL_LABEL[plat], cur, h, source))
-            meta[field] = _social_value(plat, h)
+            # A curated handle (Wikidata / TMDB) is only overwritten when the
+            # studio-listed one is CONFIRMED to be a live public account, or
+            # the curated one is confirmed dead. Before Sep 2026 a same-named
+            # franchise / network handle scraped from a trailer description
+            # silently replaced a correct Wikidata handle.
+            new_ok = probe_handle(plat, h)[0] if VALIDATE_URLS else None
+            cur_ok = probe_handle(plat, cur)[0] if VALIDATE_URLS else None
+            if new_ok is True or (cur_ok is False and new_ok is not False):
+                _note(notes, "Social handles: %s %r replaced by %r listed on the %s "
+                             "-- verify." % (_SOCIAL_LABEL[plat], cur, h, source))
+                meta[field] = _social_value(plat, h)
+                src[plat] = source
+            else:
+                _note(notes, "Social handles: the %s lists %s %r, but %r (from "
+                             "Wikidata/TMDB) was kept -- check which is the title's "
+                             "account." % (source, _SOCIAL_LABEL[plat], h, cur))
 
     # 4) platforms still missing -> probe the handle the studio uses elsewhere
     missing = [p for p in _SOCIAL_FIELD if not _existing_handle(meta, p)]
@@ -3392,21 +3522,25 @@ def _discover_socials(meta, title, year, notes, network=""):
     for plat in missing:
         for h, strength in guesses:
             exists, name = results.get((plat, h)) or (None, "")
-            accept = (exists is True and (strength == "strong" or _name_fits(name, title))) \
-                or (exists is None and strength == "strong")
+            # A GUESSED handle ships only when the account was confirmed to
+            # exist and be public. Accepting an unopenable page (exists None)
+            # is what put non-existent / restricted Facebook pages on rows:
+            # Facebook login-walls every request from the server, so every
+            # guess looked 'unknown' and was accepted.
+            accept = exists is True and (strength == "strong" or _name_fits(name, title))
             if not accept:
                 continue
             meta[_SOCIAL_FIELD[plat]] = _social_value(plat, h)
+            src[plat] = "guess"
             _note(notes, "Social handles: %s %r was not listed by any source; it "
-                         "matches the title's handle on other platforms%s -- verify."
-                  % (_SOCIAL_LABEL[plat], h,
-                     "" if exists else " (the account page could not be opened)"))
+                         "matches the title's handle on other platforms -- verify."
+                  % (_SOCIAL_LABEL[plat], h))
             break
     return meta
 
 
 _PRIVATE_KEYS = ("_trailer_keys", "_homepage", "_homepage_imdb", "_us_release_types",
-                 "_imdb_socials", "_network_source")
+                 "_imdb_socials", "_network_source", "_social_src")
 
 
 def _drop_private(meta):
@@ -3554,14 +3688,18 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None, want_year=None):
 
     # confirm network + Wide/Limited on RT / Metacritic / the distributor's
     # site, then find the socials the studio itself publishes for the title
+    # separate guards: a cross-check failure must not skip social discovery
     try:
         _cross_check(meta, is_movie, _yr, notes)
-        _discover_socials(meta, title_hint, _yr, notes, network=meta.get("network", ""))
     except Exception as e:  # noqa: BLE001
         log.warning("cross-check failed for %s: %s", tt, e)
+    try:
+        _discover_socials(meta, title_hint, _yr, notes, network=meta.get("network", ""))
+    except Exception as e:  # noqa: BLE001
+        log.warning("social discovery failed for %s: %s", tt, e)
 
-    # drop wrong-owner (band/artist) handles first, then dead ones
-    verify_socials(meta, title_hint, reject_foreign=True)
+    # drop wrong-owner (band/artist) handles first, then dead / restricted ones
+    verify_socials(meta, title_hint, reject_foreign=True, notes=notes)
     _carry_year_notes(meta, notes)
     return _drop_private(meta)
 
@@ -3722,10 +3860,13 @@ def fetch_metadata(title, is_movie=True, year_hint=""):
                 meta.pop("rottentomatoes", None)
             try:
                 _cross_check(meta, is_movie, _yr, notes)
-                _discover_socials(meta, lookup, _yr, notes, network=meta.get("network", ""))
             except Exception as e:  # noqa: BLE001
                 log.warning("cross-check failed for %r: %s", lookup, e)
-            verify_socials(meta, lookup, reject_foreign=True)
+            try:
+                _discover_socials(meta, lookup, _yr, notes, network=meta.get("network", ""))
+            except Exception as e:  # noqa: BLE001
+                log.warning("social discovery failed for %r: %s", lookup, e)
+            verify_socials(meta, lookup, reject_foreign=True, notes=notes)
             _carry_year_notes(meta, notes)
             _drop_private(meta)
         if sug_ptype:
