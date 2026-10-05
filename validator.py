@@ -164,6 +164,9 @@ DEFAULT_RULES = {
         {"sheet": "*", "column": "primary_genre", "check": "primary_genre_in_genre",
          "applies_to": ["Movies", "TV Shows"],
          "message": "primary_genre must be one of the values in the row's own genre column."},
+        {"sheet": "*", "column": "genre", "check": "imdb_genre",
+         "applies_to": ["Movies"],
+         "message": "genre must use IMDb / Box Office Mojo genres only."},
         {"sheet": "*", "column": "twitter_handle", "check": "bare_handle",
          "message": "twitter_handle is a bare handle -- no twitter.com URL, no leading '@'."},
         {"sheet": "*", "column": "instagram_user", "check": "bare_handle",
@@ -747,6 +750,28 @@ def _chk_primary_genre_in_genre(val, row, rule):
     return None, ""
 
 
+def _chk_imdb_genre(val, row, rule):
+    """Every genre line must be an IMDb / Box Office Mojo genre (LF spelling:
+    'Sci Fi', 'Film Noir'). Catches Wikidata literature genres such as
+    'Horror Fiction' (Pendulum 2027)."""
+    applies = [a.lower() for a in rule.get("applies_to", [])]
+    if applies and _norm(_row_get(row, "title_category")) not in applies:
+        return None, ""
+    lines = [ln.strip() for ln in _s(val).splitlines() if ln.strip()]
+    if not lines:
+        return None, ""
+    try:
+        from metadata_fetcher import map_genre, IMDB_GENRES
+    except Exception:  # pragma: no cover - fail soft
+        return None, ""
+    bad = [ln for ln in lines if ln not in IMDB_GENRES and not map_genre(ln)]
+    if bad:
+        return SEV_FAIL, "%s Not an IMDb genre: %s." % (
+            rule.get("message", "genre must use IMDb genres only."),
+            ", ".join(repr(b) for b in bad))
+    return None, ""
+
+
 # handles are stored bare -- no URL, no leading '@'. An attribution window
 # ('|YYYY-MM-DD') is legitimate and is stripped before the shape is judged.
 _HANDLE_BAD_RE = re.compile(r"https?://|\bwww\.|[/@]", re.I)
@@ -827,6 +852,7 @@ CHECKS = {
     "attribution_window_format": _chk_attribution_window_format,
     "sub_category_shape": _chk_sub_category_shape,
     "primary_genre_in_genre": _chk_primary_genre_in_genre,
+    "imdb_genre": _chk_imdb_genre,
     "bare_handle": _chk_bare_handle,
     "not_fanpage": _chk_not_fanpage,
     "companies_present": _chk_companies_present,
