@@ -258,8 +258,14 @@ def _ref_normalize_genres(genre_multiline):
         return genre_multiline, ""
     parts = [p.strip() for p in str(genre_multiline).split("\n") if p.strip()]
     fixed = [_GENRE_FIX.get(p, p) for p in parts]
-    seen = set()
-    uniq = [g for g in fixed if not (g in seen or seen.add(g))]
+    try:
+        # final guard: only IMDb / Box Office Mojo genres reach the export
+        # (drops e.g. Wikidata's 'Horror Fiction')
+        from metadata_fetcher import normalize_genres as _imdb_genres
+        uniq = _imdb_genres(fixed)
+    except Exception:  # pragma: no cover - fail soft, old behaviour
+        seen = set()
+        uniq = [g for g in fixed if not (g in seen or seen.add(g))]
     return "\n".join(uniq), (uniq[0] if uniq else "")
 
 
@@ -1682,6 +1688,15 @@ def create_row(title, is_movie, network="", metadata=None):
         _genre, _primary_fix = REF.normalize_genres(_genre)
         if not _primary:            # keep a provided primary_genre; else derive
             _primary = _primary_fix
+        else:
+            # a provided primary that is not an IMDb genre ('Horror Fiction')
+            # falls back to the first cleaned genre
+            try:
+                from metadata_fetcher import map_genre as _map_genre
+                _pm = _map_genre(_primary)
+                _primary = _pm[0] if _pm else _primary_fix
+            except Exception:  # pragma: no cover
+                pass
 
     # YouTube: company channel comes from the network; username lines combine
     # the title's own channel (if any) + '<network channel>|<title>' variants
