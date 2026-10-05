@@ -931,6 +931,96 @@ def wiki_infobox_network(page_title, is_movie=True):
     return None
 
 
+# ---------------- genre vocabulary (IMDb / Box Office Mojo) ----------------
+# Genres must be ones IMDb (and therefore Box Office Mojo, which shows IMDb's
+# genres) actually uses. Wikidata's P136 and TMDB carry other vocabularies --
+# e.g. Wikidata tags Pendulum (2027, Q134114137) with 'horror fiction', a
+# literature genre, which leaked through as 'Horror Fiction'. Every genre
+# value is mapped onto IMDb's list (LF spelling) and anything that does not
+# map is dropped with a review note.
+IMDB_GENRES = (
+    "Action", "Adventure", "Animation", "Biography", "Comedy", "Crime",
+    "Documentary", "Drama", "Family", "Fantasy", "Film Noir", "Game Show",
+    "History", "Horror", "Music", "Musical", "Mystery", "News", "Reality TV",
+    "Romance", "Sci Fi", "Short", "Sport", "Talk Show", "Thriller", "War",
+    "Western")
+_GENRE_EXACT = {g.lower(): g for g in IMDB_GENRES}
+_GENRE_EXACT.update({
+    "sci-fi": "Sci Fi", "science fiction": "Sci Fi", "scifi": "Sci Fi",
+    "film-noir": "Film Noir", "noir": "Film Noir", "reality-tv": "Reality TV",
+    "reality": "Reality TV", "game-show": "Game Show", "talk-show": "Talk Show",
+    "biographical": "Biography", "biopic": "Biography", "historical": "History",
+    "animated": "Animation", "sports": "Sport", "rom-com": "Romance",
+    "romantic": "Romance", "kids": "Family", "children's": "Family",
+})
+# multi-genre labels (Wikidata compounds, TMDB 'X & Y' TV genres)
+_GENRE_COMPOUND = {
+    "romantic comedy": ("Romance", "Comedy"), "comedy-drama": ("Comedy", "Drama"),
+    "comedy drama": ("Comedy", "Drama"), "action & adventure": ("Action", "Adventure"),
+    "sci-fi & fantasy": ("Sci Fi", "Fantasy"), "war & politics": ("War",),
+    "science fiction horror": ("Sci Fi", "Horror"), "action comedy": ("Action", "Comedy"),
+    "crime thriller": ("Crime", "Thriller"), "mystery thriller": ("Mystery", "Thriller"),
+    "psychological thriller": ("Thriller",), "psychological horror": ("Horror",),
+    "supernatural horror": ("Horror",), "folk horror": ("Horror",),
+    "black comedy": ("Comedy",), "dark comedy": ("Comedy",),
+    "musical film": ("Musical",), "war film": ("War",),
+}
+_GENRE_STRIP_RE = re.compile(
+    r"\s+(film|films|movie|television series|tv series|series|television program)$", re.I)
+
+
+def map_genre(label):
+    """One raw genre label -> list of IMDb genres ([] when it is not one).
+    'horror film' -> ['Horror']; 'horror fiction' -> [] (literature genre)."""
+    raw = re.sub(r"\s+", " ", str(label or "")).strip().lower()
+    if not raw:
+        return []
+    if raw in _GENRE_EXACT:
+        return [_GENRE_EXACT[raw]]
+    if raw in _GENRE_COMPOUND:
+        return list(_GENRE_COMPOUND[raw])
+    base = _GENRE_STRIP_RE.sub("", raw).strip()
+    if base in _GENRE_EXACT:
+        return [_GENRE_EXACT[base]]
+    if base in _GENRE_COMPOUND:
+        return list(_GENRE_COMPOUND[base])
+    return []
+
+
+def normalize_genres(genres, notes=None):
+    """Map a genre list / newline or comma string onto IMDb's vocabulary,
+    de-duplicated, order kept. Returns the list; dropped labels get a note."""
+    if isinstance(genres, str):
+        parts = re.split(r"[\n,]", genres)
+    else:
+        parts = list(genres or [])
+    out, dropped = [], []
+    for p in parts:
+        p = str(p or "").strip()
+        if not p:
+            continue
+        mapped = map_genre(p)
+        if not mapped:
+            dropped.append(p)
+        for g in mapped:
+            if g not in out:
+                out.append(g)
+    if dropped and notes is not None:
+        _note(notes, "Genre: dropped %s -- not an IMDb / Box Office Mojo genre."
+              % ", ".join(repr(d) for d in dropped))
+    return out
+
+
+def _apply_genres(meta, genres, notes=None):
+    gs = normalize_genres(genres, notes)
+    if gs:
+        meta["genre"] = "\n".join(gs)
+        meta["primary_genre"] = gs[0]
+    else:
+        meta.pop("genre", None)
+        meta.pop("primary_genre", None)
+
+
 # ---------------- IMDb scrape ----------------
 def imdb_scrape(tt):
     """genre, primary_genre, datePublished (often a festival date -> lowest
@@ -1377,16 +1467,19 @@ _SOCIAL_PROPS = {"P2002", "P2003", "P2013", "P2397", "P11245",
                  "P7085", "P4264", "P3836", "P11892"}
 
 
-def _claim_values(claims, prop, prefer_us=False):
+def _claim_values(claims, prop, prefer_us=False, referenced=False):
     """Values for a property. With prefer_us=True, claims qualified with
     'place of publication'/'applies to' = United States (Q30) come first.
     Deprecated-rank claims are skipped; social claims carrying an 'end time'
     (P582) qualifier (defunct/suspended accounts) are skipped; within each
-    group, preferred-rank claims come first."""
+    group, preferred-rank claims come first. With referenced=True a claim
+    with 0 references is skipped (unsourced Wikidata edits)."""
     groups = {(u, p): [] for u in (0, 1) for p in (0, 1)}  # (is_us, is_pref)
     for c in claims.get(prop, []):
         if c.get("rank") == "deprecated":
             continue
+        if referenced and not c.get("references"):
+            continue  # 0 references -> not trusted
         quals = c.get("qualifiers", {}) or {}
         if prop in _SOCIAL_PROPS and "P582" in quals:
             continue  # account no longer active
@@ -1606,22 +1699,16 @@ def wikidata_meta(title, qid=None, is_movie=True, tt=None, verify=True, year=Non
         if v:
             net_qid = v[0]
             break
-    genre_qids = _claim_values(claims, "P136")
+    # Ops rule: a Wikidata genre with 0 references is not considered
+    # (Pendulum 2027: 'horror fiction' had none)
+    genre_qids = _claim_values(claims, "P136", referenced=True)
     labels = _labels(([net_qid] if net_qid else []) + genre_qids)
     if net_qid and labels.get(net_qid):
         meta["network"] = labels[net_qid]
     # Wikidata genre labels are lowercase and suffixed ('science fiction
     # film') -- clean them into Title Case tokens the LF taxonomy expects
-    gnames = []
-    for q in genre_qids:
-        lbl = labels.get(q)
-        if not lbl:
-            continue
-        lbl = re.sub(r"\s+(film|television series|tv series|series)$", "",
-                     lbl.strip(), flags=re.IGNORECASE).strip()
-        lbl = lbl.title().replace("Science Fiction", "Sci Fi")
-        if lbl and lbl not in gnames:
-            gnames.append(lbl)
+    # ('horror fiction' is a literature genre, not IMDb's -> dropped)
+    gnames = normalize_genres([labels.get(q) for q in genre_qids if labels.get(q)])
     if gnames:
         meta["genre"] = "\n".join(gnames)
         meta["primary_genre"] = gnames[0]
@@ -2655,7 +2742,8 @@ def fetch_game(name, qid=None, year_hint=""):
             dev_qids = _claim_values(claims, "P178")[:2]
             pub_qids = _claim_values(claims, "P123", prefer_us=True)[:2]
             plat_qids = _claim_values(claims, "P400")[:6]
-            genre_qids = _claim_values(claims, "P136")[:4]
+            # Ops rule: a Wikidata genre with 0 references is not considered
+            genre_qids = _claim_values(claims, "P136", referenced=True)[:4]
             labels = _labels(dev_qids + pub_qids + plat_qids + genre_qids)
             if dev_qids and labels.get(dev_qids[0]):
                 meta["developer"] = labels[dev_qids[0]]
@@ -3670,8 +3758,9 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None, want_year=None):
 
     # 0) upcoming-release-movies service (BOM calendar): distributor, genres,
     #    release date + Wide/Limited scale -- authoritative when present
+    upcoming = _upcoming_meta(_upcoming_index()["by_tt"].get(tt)) if is_movie else {}
     if is_movie:
-        _fill(meta, _upcoming_meta(_upcoming_index()["by_tt"].get(tt)))
+        _fill(meta, upcoming)
 
     # 1) Box Office Mojo -- US Domestic Distributor (released titles only)
     _fill(meta, pre["bom"])
@@ -3711,6 +3800,14 @@ def _enrich_by_tt(tt, is_movie, title_hint, wikidata_id=None, want_year=None):
     imeta = dict(pre["imdb"] or {})
     imdb_prod_co = imeta.pop("production_company", None)
     _fill(meta, imeta)
+
+    # GENRE: IMDb's own genres win (Box Office Mojo calendar -> OMDb -> IMDb
+    # page, all IMDb data); Wikidata / TMDB genres are only a fallback, and
+    # either way every value is held to IMDb's genre list.
+    imdb_genre = next((src.get("genre") for src in (upcoming, pre["omdb"] or {}, pre["imdb"] or {})
+                       if src and src.get("genre")), None)
+    if imdb_genre or meta.get("genre"):
+        _apply_genres(meta, imdb_genre or meta.get("genre"), notes)
 
     # production company is a LAST RESORT for network (it caused wrong
     # distributor attributions before -- e.g. prod-co instead of Neon).
@@ -3953,6 +4050,9 @@ def fetch_metadata(title, is_movie=True, year_hint=""):
                 log.warning("social discovery failed for %r: %s", lookup, e)
             verify_socials(meta, lookup, reject_foreign=True, notes=notes,
                            kind="movie" if is_movie else "tv")
+            if meta.get("genre"):
+                # TMDB / Wikidata genres held to IMDb's genre list
+                _apply_genres(meta, meta["genre"], notes)
             _carry_year_notes(meta, notes)
             _drop_private(meta)
         if sug_ptype:
