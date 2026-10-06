@@ -1,3 +1,7 @@
+try:  # first import: caps glibc malloc arenas before any threads start
+    import memory_guard  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass
 from flask import Flask, render_template, request, jsonify, send_file
 import pandas as pd
 import csv
@@ -4439,6 +4443,10 @@ def review_async():
 #   web: gunicorn app:app --workers 1 --threads 8 --timeout 120
 _JOBS = {}
 _JOBS_LOCK = threading.Lock()
+try:
+    import memory_guard as _MG   # Render 512 MB: cap malloc arenas + watchdog
+except Exception:  # noqa: BLE001
+    _MG = None
 _JOB_TTL = 1800  # seconds to keep a finished job's file in memory
 
 
@@ -4463,6 +4471,15 @@ def _prune_jobs():
 
 
 def _run_generation(jid, kind, payload):
+    try:
+        _run_generation_inner(jid, kind, payload)
+    finally:
+        payload.clear()          # drop the uploaded bytes now, not at GC time
+        if _MG is not None:
+            _MG.trim()           # hand freed memory back to the OS
+
+
+def _run_generation_inner(jid, kind, payload):
     try:
         def prog(done, total):
             _job_set(jid, done=done, total=total)
