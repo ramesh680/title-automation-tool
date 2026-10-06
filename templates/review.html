@@ -70,6 +70,7 @@
         .message{padding:13px 16px;border-radius:var(--radius-sm);margin-top:16px;display:none;font-size:.86rem;font-weight:500}
         .message.success{display:block;background:var(--okbg);color:var(--ok);border:1px solid rgba(52,211,153,.3)}
         .message.error{display:block;background:var(--errbg);color:var(--err);border:1px solid rgba(251,113,133,.3)}
+        .message.info{display:block;background:rgba(129,140,248,.12);color:#c7d2fe;border:1px solid rgba(129,140,248,.35)}
         .loading{display:flex;flex-direction:column;align-items:center;gap:14px;padding:36px 0;color:var(--muted)}
         .spinner{width:42px;height:42px;border-radius:50%;border:3px solid rgba(255,255,255,.1);border-top-color:var(--brand1);animation:spin .8s linear infinite}
         @keyframes spin{to{transform:rotate(360deg)}}
@@ -184,9 +185,17 @@
                  <p>${label} ${total ? done + ' / ' + total + ' (' + pct + '%)' : ''}</p></div>`;
         }
 
-        function runReview() {
+        // If the server restarts mid-run (Render recycles the instance), the
+        // in-memory job is lost. Re-submit the same file automatically a couple
+        // of times instead of making the user start over.
+        const MAX_AUTO_RETRIES = 2;
+        let reviewAttempt = 0;
+
+        function runReview(isRetry) {
             const f = document.getElementById('fileUpload').files[0];
             if (!f) { msg('Please select the manually prepared file first.', 'error'); return; }
+            if (isRetry !== true) reviewAttempt = 0;
+            if (isRetry !== true) msg('', '');
             const fd = new FormData();
             fd.append('file', f);
             fd.append('autoFetch', document.getElementById('autoFetch').checked);
@@ -223,6 +232,11 @@
                         a.href = '/api/job/' + id + '/download';
                         document.body.appendChild(a); a.click(); a.remove();
                         msg('✓ Review complete — the highlighted workbook has downloaded (Summary, Reviewed, Findings sheets).', 'success');
+                    } else if (j.lost && reviewAttempt < MAX_AUTO_RETRIES) {
+                        reviewAttempt++;
+                        msg('The server restarted during the review — restarting it automatically (attempt '
+                            + (reviewAttempt + 1) + ' of ' + (MAX_AUTO_RETRIES + 1) + ')…', 'info');
+                        setTimeout(() => runReview(true), 3000);
                     } else {
                         msg((j.lost ? j.hint : '') || j.error || 'Review failed', 'error');
                         document.getElementById('progress').innerHTML = '';
