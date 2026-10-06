@@ -169,6 +169,35 @@ _MAX_RETRIES = 4
 _HOST_SEMS = {}
 _HOST_SEMS_LOCK = threading.Lock()
 
+# MEMORY (Oct 2026): the per-host cap alone still let ~40 pages download at
+# once (a dozen hosts x 4) on top of 8 row workers -- the 512 MB Render
+# instance was OOM-killed mid-review. Cap downloads in flight across ALL
+# hosts and wait for memory headroom before starting a new one.
+try:
+    MAX_INFLIGHT = max(1, int(os.getenv("MAX_INFLIGHT_REQUESTS", "10")))
+except ValueError:
+    MAX_INFLIGHT = 10
+_INFLIGHT = threading.BoundedSemaphore(MAX_INFLIGHT)
+try:
+    import memory_guard as _MG
+except Exception:  # noqa: BLE001
+    _MG = None
+
+# YouTube Data API breaker: once Google answers 429/403 (rate limit / daily
+# quota) every further call would also fail after 4 back-off retries, tying
+# up row workers for minutes. Skip YouTube calls for a cool-down instead.
+_YT_COOLDOWN_SECONDS = 300
+_YT_BLOCKED_UNTIL = {"t": 0.0}
+
+
+def _is_youtube_api(url):
+    return "googleapis.com/youtube/" in str(url)
+
+
+def _redact(url):
+    """Never write the API key into the logs."""
+    return re.sub(r"([?&]key=)[^&\s]+", r"\1***", str(url))
+
 
 def _host_sem(url):
     host = urllib.parse.urlsplit(url).netloc.lower()
@@ -183,10 +212,15 @@ def _polite_get(url, **kw):
     """Session.get with a per-host concurrency cap and retry/backoff on
     rate-limit / transient statuses (honours Retry-After). Raises like
     Session.get on final failure."""
+    if _is_youtube_api(url) and time.time() < _YT_BLOCKED_UNTIL["t"]:
+        raise requests.exceptions.HTTPError(
+            "YouTube API rate-limited -- skipped during cool-down")
     sem = _host_sem(url)
     delay = 0.5
     for attempt in range(_MAX_RETRIES + 1):
-        with sem:
+        if _MG is not None:
+            _MG.wait_for_headroom()
+        with sem, _INFLIGHT:
             try:
                 r = _SESSION.get(url, **kw)
             except requests.exceptions.RequestException:
@@ -195,6 +229,13 @@ def _polite_get(url, **kw):
                 time.sleep(delay)
                 delay *= 2
                 continue
+        if _is_youtube_api(url) and r.status_code in (403, 429):
+            # quota / rate limit: retrying only burns minutes per row
+            if r.status_code == 429 or "quota" in (r.text or "").lower():
+                _YT_BLOCKED_UNTIL["t"] = time.time() + _YT_COOLDOWN_SECONDS
+                log.warning("YouTube API answered %s -- pausing YouTube "
+                            "lookups for %ss", r.status_code, _YT_COOLDOWN_SECONDS)
+            return r
         if r.status_code in _RETRY_STATUS and attempt < _MAX_RETRIES:
             ra = r.headers.get("Retry-After")
             try:
@@ -220,7 +261,7 @@ def _get_json(url, params=None, headers=None):
         r.raise_for_status()
         return r.json()
     except Exception as e:  # noqa: BLE001
-        log.warning("json request failed (%s): %s", url, e)
+        log.warning("json request failed (%s): %s", _redact(url), _redact(e))
         return None
 
 
@@ -232,7 +273,7 @@ def _get_html(url):
         r.raise_for_status()
         return r.text
     except Exception as e:  # noqa: BLE001
-        log.warning("html request failed (%s): %s", url, e)
+        log.warning("html request failed (%s): %s", _redact(url), _redact(e))
         return None
 
 
@@ -3164,7 +3205,9 @@ def _fetch(url, params=None, headers=None):
         # ONE attempt under the per-host cap -- these are best-effort reads
         # (account pages, trailer pages). The polite 4x retry/backoff used for
         # the core APIs turned a single login-walled site into ~30 s per title.
-        with _host_sem(url):
+        if _MG is not None:
+            _MG.wait_for_headroom()
+        with _host_sem(url), _INFLIGHT:
             r = _SESSION.get(url, params=params, headers=headers or HTML_HEADERS,
                              timeout=VALIDATE_TIMEOUT, allow_redirects=True)
         return r.status_code, (r.text or "")
@@ -4205,3 +4248,15 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     t = sys.argv[1] if len(sys.argv) > 1 else "Dune"
     print(json.dumps(fetch_metadata(t, True), indent=2))
+
+
+# Caches the memory guard may empty under pressure (cheapest to lose first).
+# Emptying any of them only costs a re-fetch -- results are unchanged.
+if _MG is not None:
+    _MG.register_cache("page html", _PAGE_CACHE, priority=0, lock=_PAGE_LOCK)
+    _MG.register_cache("url status", _URL_STATUS_CACHE, priority=1)
+    _MG.register_cache("probes", _PROBE_CACHE, priority=1)
+    _MG.register_cache("imdb suggest", _SUGGEST_CACHE, priority=1)
+    _MG.register_cache("yt channels", _YT_CHANNEL_DETAIL_CACHE, priority=1)
+    _MG.register_cache("page info", _INFO_CACHE, priority=2)
+    _MG.register_cache("title metadata", _CACHE, priority=3)
