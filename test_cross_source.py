@@ -521,8 +521,10 @@ class ReviewUpdated(unittest.TestCase):
         book, summ = self._review({"Movies": [m]}, meta=meta)
         f = book["Findings"]
         v = f[f["Type"] == "Verify"]
-        self.assertEqual(set(v["Column"]), {"title_sub_category", "tiktok_user", "imdb_id"})
-        self.assertEqual(summ["verify"], 3)
+        # Oct 2026 Movies rebuild: a GUESSED handle no source listed is no longer
+        # reported at all (it was the main source of false findings)
+        self.assertEqual(set(v["Column"]), {"title_sub_category", "imdb_id"})
+        self.assertEqual(summ["verify"], 2)
         ing = book["Reviewed"].iloc[0]           # the INGESTED row
         self.assertEqual(ing["imdb_id"], "http://www.imdb.com/title/tt35606013")
 

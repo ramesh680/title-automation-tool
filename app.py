@@ -490,6 +490,18 @@ def _norm_bool(v):
 # the bare handle.
 
 import attribution_window as _aw
+import movie_review_rules as MRR
+# Oct 2026 Movies review rebuild (release-year anchor + precision gate).
+# Set MOVIE_REVIEW_RULES=0 on Render to fall back to the previous behaviour.
+MOVIE_RULES_ENABLED = os.environ.get('MOVIE_REVIEW_RULES', '1') != '0'
+
+
+def _is_movies_cat(cat):
+    """True for EVERY row whose title_category is Movies ('Movies', 'Movie',
+    'Film', 'Films', any case/spacing). The Movies review rules are keyed on the
+    category -- never on a title, network or brand -- so every Movies brand in a
+    file (base and DAR rows alike) gets the same rules."""
+    return bool(re.fullmatch(r'\s*(?:movies?|films?)\s*', str(cat or ''), re.I))
 
 ATTRIBUTION_WINDOW_ENABLED = _aw.ENABLED
 ATTRIBUTION_WINDOW_MONTHS = _aw.MONTHS
@@ -3816,7 +3828,7 @@ def _tfx_schema_for_row(r, cat):
     if not TFX_OK:
         return None
     c = str(cat or '').strip()
-    if c.lower() in _TFX_LEGACY_CATS or 'game' in c.lower():
+    if c.lower() in _TFX_LEGACY_CATS or 'game' in c.lower() or _is_movies_cat(c):
         return None
     # 'Publishers' is in the General master category list, but Publisher brands
     # have their OWN 40-column BrandDefinitionReport schema (create_publisher_row)
@@ -3839,7 +3851,7 @@ def _review_lookup_call(r, lower_cols):
     if not t:
         return None
     cat = str(r.get(lower_cols.get('title_category', ''), '') or '')
-    if _row_is_publisher(r, cat, lower_cols):
+    if not _is_movies_cat(cat) and _row_is_publisher(r, cat, lower_cols):
         return (fetch_brand, (t,), {})
     if _tfx_schema_for_row(r, cat):
         return None
@@ -3930,7 +3942,7 @@ def _review_frame(df, auto_fetch=True, progress=None):
         # cells, and the columns a publication never carries (genre, box
         # office, RT / IMDb / Metacritic). Those rules do not need
         # auto-discovery; discovery only fills blank socials afterwards.
-        if _row_is_publisher(r, cat, lower_cols):
+        if not _is_movies_cat(cat) and _row_is_publisher(r, cat, lower_cols):
             meta = dict(fetch_brand(t) or {}) if auto_fetch else {}
             # LinkedIn / Pinterest suggestions must follow the publisher shape
             if meta.get('linkedin_page'):
@@ -4131,6 +4143,11 @@ def _review_frame(df, auto_fetch=True, progress=None):
         for k, v in hints.items():
             if meta.get(k) in (None, ''):
                 meta[k] = v
+        # Oct 2026: the file's release date is the review's anchor. Discovery's
+        # own date (a festival / RT year) must not override it -- that is what
+        # turned a correct '"2026"' keyword term into a '2025' Mismatch.
+        if hints.get('released_on'):
+            meta['released_on'] = hints['released_on']
         if _sheet_trailer:
             meta['trailer_released_on'] = _sheet_trailer
         # date-first IMDb: surface the resolver's year note as a review finding
@@ -4139,6 +4156,7 @@ def _review_frame(df, auto_fetch=True, progress=None):
         # sources, unconfirmed social handles) are 'Verify' findings: they
         # tell the reviewer what to double-check but never replace a value on
         # the INGESTED row -- the note is prose, not data.
+        _fstart = len(findings)   # this row's findings start here (Movies gate)
         _notes = []
         _imdb_note = meta.pop('_imdb_year_note', '')
         if _imdb_note:
@@ -4210,6 +4228,25 @@ def _review_frame(df, auto_fetch=True, progress=None):
                 current=str(r.get(src_col) if r.get(src_col) is not None else ''),
                 suggested=sugg))
             fills[(i, src_col)] = status
+
+        # ---- Movies (Oct 2026 rebuild): LF-row-anchored rules + precision gate
+        if MOVIE_RULES_ENABLED and _is_movies_cat(cat):
+            _lrow = {str(k).lower(): v for k, v in r.items()}
+            _disc = findings[_fstart:]
+            del findings[_fstart:]
+            for _c in [c for (ri, c) in list(fills) if ri == i]:
+                fills.pop((i, _c), None)
+            _gated = MRR.gate_discovery_findings(
+                [dict(f, column=str(f['column']).lower()) for f in _disc], _lrow)
+            for f in MRR.merge_findings(MRR.movie_rule_findings(_lrow), _gated):
+                src_col = lower_cols.get(f['column'], f['column'])
+                findings.append(dict(
+                    row=i + 2, title=t, column=src_col, status=f['status'],
+                    current=str(f.get('current') or ''),
+                    suggested=str(f.get('suggested') or ''),
+                    reason=f.get('reason', '')))
+                if f['status'] in ('Mismatch', 'Gap'):
+                    fills[(i, src_col)] = f['status']
         if progress:
             progress(i + 1, total)
 
@@ -4382,7 +4419,7 @@ def build_review(src, auto_fetch=True, progress=None):
     # Findings detail
     ws3 = wb.create_sheet('Findings')
     hdr = (['Sheet'] if multi else []) + ['Row', 'Title', 'Column', 'Type',
-                                          'Current Value', 'Suggested Value']
+                                          'Current Value', 'Suggested Value', 'Why']
     ws3.append(hdr)
     off = 1 if multi else 0
     for c in range(1, len(hdr) + 1):
@@ -4391,11 +4428,11 @@ def build_review(src, auto_fetch=True, progress=None):
     for f in findings:
         ws3.append(([f.get('sheet', '')] if multi else [])
                    + [f['row'], f['title'], f['column'], f['status'],
-                      f['current'], f['suggested']])
+                      f['current'], f['suggested'], f.get('reason', '')])
         ws3.cell(ws3.max_row, 4 + off).fill = {'Mismatch': RED, 'Verify': BLUE}.get(f['status'], AMBER)
-        for c in (5 + off, 6 + off):
+        for c in (5 + off, 6 + off, 7 + off):
             ws3.cell(ws3.max_row, c).alignment = Alignment(wrap_text=True, vertical='top')
-    widths = ([16] if multi else []) + [6, 34, 26, 11, 60, 60]
+    widths = ([16] if multi else []) + [6, 34, 26, 11, 60, 60, 60]
     for c, w in enumerate(widths, start=1):
         ws3.column_dimensions[get_column_letter(c)].width = w
     ws3.freeze_panes = 'A2'

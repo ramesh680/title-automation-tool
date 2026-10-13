@@ -409,14 +409,16 @@ def resolve_metacritic(title, is_movie=True, candidate=None, curated=False, year
             return candidate
     slug = _mc_slug(title)
     slugs = ([f"{slug}-{year}", slug] if year else [slug]) if slug else []
-    sections = ("movie", "tv") if is_movie else ("tv", "movie")
+    # Oct 2026: a Movies title is never matched to a /tv/ page (that is how
+    # the movie "Human" got metacritic.com/tv/human/).
+    sections = ("movie",) if is_movie else ("tv",)
     for sec in sections:
         for sl in slugs:
             url = "https://www.metacritic.com/%s/%s/" % (sec, sl)
             if candidate and url.rstrip("/") == str(candidate).replace(
                     "http://", "https://").rstrip("/"):
                 continue  # already tried above
-            if _mc_alive(url) and not _page_year_conflict(url, year, "mc"):
+            if _mc_alive(url) and _slug_ok_for_year(url, sl, year, "mc", notes):
                 return "http://www.metacritic.com/%s/%s/" % (sec, sl)
     # No page for the known release year. A curated candidate is still the best
     # value we have -- keep it, but tell the reviewer it is unverified for the
@@ -500,7 +502,7 @@ def resolve_rottentomatoes(title, is_movie=True, candidate=None, curated=False,
         if cand and url.rstrip("/") == str(cand).replace(
                 "http://", "https://").rstrip("/"):
             continue
-        if _rt_alive(url) and not _page_year_conflict(url, year, "rt"):
+        if _rt_alive(url) and _slug_ok_for_year(url, sl, year, "rt", notes):
             return "http://www.rottentomatoes.com/m/%s" % sl
     if cand and not cand_fits_year and not _page_year_conflict(cand, year, "rt"):
         alive = _rt_alive(cand)
@@ -3287,6 +3289,22 @@ def _home_parse(html):
 def home_info(url):
     """Wide/Limited wording, social links and hashtags of an official site."""
     return _parsed("home", url, _home_parse) if (SP and url) else {}
+
+
+def _slug_ok_for_year(url, slug, year, kind, notes=None):
+    """A GENERATED RT / Metacritic slug is accepted only when it fits the
+    release year. A year-suffixed slug carries its own proof; a bare slug
+    (usually the oldest same-named title -- /m/falling is the 2020 film) whose
+    page year cannot be read is kept as the best match but FLAGGED for review."""
+    if not year or re.search(r"[-_](?:19|20)\d{2}$", slug or ""):
+        return not _page_year_conflict(url, year, kind)
+    conflict = _page_year_conflict(url, year, kind)
+    if conflict is None and notes is not None:
+        # best match kept, but flagged (stated rule) -- never silently shipped
+        _note(notes, "%s %s could not be confirmed as the %s title -- verify it "
+                     "is the right year's page." % (
+                         "Rotten Tomatoes" if kind == "rt" else "Metacritic", url, year))
+    return not conflict
 
 
 def _page_year_conflict(url, year, kind):
