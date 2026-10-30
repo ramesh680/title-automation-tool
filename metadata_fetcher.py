@@ -1748,6 +1748,9 @@ def wikidata_meta(title, qid=None, is_movie=True, tt=None, verify=True, year=Non
     labels = _labels(([net_qid] if net_qid else []) + genre_qids)
     if net_qid and labels.get(net_qid):
         meta["network"] = labels[net_qid]
+        # the network's own Wikidata item: lets the generator read that
+        # network's official YouTube channel straight from it
+        meta["network_qid"] = net_qid
     # Wikidata genre labels are lowercase and suffixed ('science fiction
     # film') -- clean them into Title Case tokens the LF taxonomy expects
     # ('horror fiction' is a literature genre, not IMDb's -> dropped)
@@ -2792,6 +2795,7 @@ def fetch_game(name, qid=None, year_hint=""):
                 meta["developer"] = labels[dev_qids[0]]
             if pub_qids and labels.get(pub_qids[0]):
                 meta["network"] = labels[pub_qids[0]]  # publisher
+                meta["network_qid"] = pub_qids[0]
             plats = [labels[q] for q in plat_qids if labels.get(q)]
             if plats:
                 meta["platforms"] = plats
