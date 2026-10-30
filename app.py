@@ -284,6 +284,29 @@ REF = _types.SimpleNamespace(
 )
 
 try:
+    import network_youtube as _NYT
+except Exception as _e:  # pragma: no cover - fail soft, old behaviour
+    _NYT = None
+    logging.warning(f"network_youtube unavailable: {_e}")
+
+
+def _network_youtube(network, metadata, raw='', company='', fallback='',
+                     scheme='http'):
+    """The network's / studio's OWN YouTube channel, looked up live (Wikidata
+    entity of that network, then a YouTube channel search) once a network is
+    known for the title. The ingest-template value is only a last resort when
+    the live lookup finds nothing (see network_youtube.py)."""
+    network = str(network or '').strip()
+    if not network or network.startswith('\u00ab'):   # «CONFIRM ...» placeholder
+        return ''
+    if _NYT is None:
+        return fallback or ''
+    return _NYT.channel_for(
+        network, raw=raw, company=company,
+        qid=str((metadata or {}).get('network_qid') or ''),
+        fallback=fallback, scheme=scheme)
+
+try:
     from validator import validate_workbook, DEFAULT_RULES
 except Exception:  # validator is optional; page still loads
     validate_workbook = None
@@ -828,9 +851,19 @@ def create_tv_row(title, network="", metadata=None):
     # ---- youtube / search terms ----
     channels = list(info.get("yt") or [])
     if tinfo and tinfo.get("youtube"):
-        # template channel wins; the cell may hold several channels
-        # (newline-separated, e.g. Amazon Prime Video)
+        # template cell may hold several channels (newline-separated)
         channels = [c.strip() for c in str(tinfo["youtube"]).split("\n") if c.strip()]
+    # (Oct 2026) the network's own channel is resolved LIVE once a network is
+    # known; the template / inline channels are only the fallback
+    if eff_network and _NYT is not None and _NYT.live_enabled():
+        _live = _network_youtube(
+            eff_network, metadata, raw=_net_raw,
+            company=(tinfo.get("company") if tinfo else "") or info.get("companies") or "",
+            fallback="", scheme="https")
+        if _live:
+            channels = [_live]
+        elif not _NYT.template_fallback_enabled():
+            channels = []
     _yt = str(metadata.get('youtube_channel_username') or '').strip()
     if not _yt and channels:
         _yt = _tv_youtube_username(channels, clean_title)
@@ -1508,10 +1541,15 @@ def create_game_row(title, metadata=None):
     if not _yt:
         _channels = [u.strip() for u in
                      str(metadata.get('youtube_own_channel') or '').splitlines() if u.strip()]
-        if not _channels and publisher and _tref():
-            pinfo = _tref().game_publisher(publisher)
-            if pinfo and pinfo.get('youtube'):
-                _channels = [pinfo['youtube']]
+        if not _channels and publisher:
+            # (Oct 2026) publisher channel resolved LIVE; template = fallback
+            pinfo = _tref().game_publisher(publisher) if _tref() else None
+            _pub_yt = _network_youtube(
+                publisher, metadata,
+                fallback=(pinfo.get('youtube') if pinfo else '') or '',
+                scheme='https')
+            if _pub_yt:
+                _channels = [_pub_yt]
         _yt = _game_youtube_lines(_channels, clean_title)
 
     # developer keyword clauses (template tables; constructed fallback)
@@ -1716,13 +1754,19 @@ def create_row(title, is_movie, network="", metadata=None):
 
     # YouTube: company channel comes from the network; username lines combine
     # the title's own channel (if any) + '<network channel>|<title>' variants
+    # (Oct 2026) the network/studio channel is resolved LIVE for the network
+    # found for this title; the template's YouTube column is only a fallback.
     _yt_company = str(metadata.get('youtube_channel_company') or '').strip()
-    if not _yt_company and sinfo and sinfo.get('youtube'):
-        # movie schema uses http:// URLs; take the first channel if several
-        _yt_company = re.sub(r'^https://', 'http://',
-                             str(sinfo['youtube']).split('\n')[0].strip())
-    if not _yt_company and REF is not None and eff_network:
-        _yt_company = REF.youtube_for(eff_network)
+    if not _yt_company and eff_network:
+        _tmpl_yt = ''
+        if sinfo and sinfo.get('youtube'):
+            # movie schema uses http:// URLs; take the first channel if several
+            _tmpl_yt = str(sinfo['youtube']).split('\n')[0].strip()
+        if not _tmpl_yt and REF is not None:
+            _tmpl_yt = REF.youtube_for(eff_network)
+        _yt_company = _network_youtube(eff_network, metadata, raw=_net_raw,
+                                       company=parent, fallback=_tmpl_yt,
+                                       scheme='http')
     _yt_username = str(metadata.get('youtube_channel_username') or '').strip()
     if not _yt_username:
         _yt_username = build_youtube_username(
