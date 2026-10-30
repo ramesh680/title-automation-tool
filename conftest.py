@@ -10,3 +10,6 @@ import os
 os.environ.setdefault("VERIFY_PAGE_CONTENT", "0")
 os.environ.setdefault("SOCIAL_DISCOVERY", "0")
 os.environ.setdefault("SOCIAL_GUESSING", "0")
+# live network/studio YouTube lookup (network_youtube.py) - mocked in
+# test_network_youtube.py, off for the legacy suites
+os.environ.setdefault("NETWORK_YT_LIVE", "0")
