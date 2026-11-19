@@ -5060,7 +5060,64 @@ def _prune_jobs():
             _JOBS.pop(k, None)
 
 
+# ---- keep-alive while a job runs (Nov 2026) ---------------------------------
+# Render's free tier stops an instance after 15 minutes without INBOUND HTTP
+# traffic. A background review is not traffic, and Chrome throttles / freezes
+# the polling of a tab in the background -- so a long review was shut down
+# mid-run ("Handling signal: term" exactly 15 min after the last request), the
+# in-memory job vanished and the page said "The server restarted during the
+# review". While any job is running, ping our own PUBLIC URL every few minutes:
+# it comes back in through Render's proxy, so it counts as inbound traffic.
+# Nothing is sent when no job runs, so idle spin-down still happens.
+_KEEPALIVE_URL = (os.getenv('KEEPALIVE_URL')
+                  or os.getenv('RENDER_EXTERNAL_URL', '')).rstrip('/')
+_KEEPALIVE_EVERY = int(os.getenv('KEEPALIVE_EVERY_S', '240'))
+_keepalive_lock = threading.Lock()
+_keepalive_running = False
+
+
+def _jobs_running():
+    with _JOBS_LOCK:
+        return any(v.get('status') == 'running' for v in _JOBS.values())
+
+
+def _keepalive_loop():
+    global _keepalive_running
+    import requests as _rq
+    try:
+        while True:
+            time.sleep(_KEEPALIVE_EVERY)
+            if not _jobs_running():
+                return
+            try:
+                _rq.get(_KEEPALIVE_URL + '/api/ping', timeout=15)
+            except Exception as e:  # noqa: BLE001 - a missed ping is harmless
+                logging.warning('keep-alive ping failed: %s', e)
+    finally:
+        with _keepalive_lock:
+            _keepalive_running = False
+
+
+def _ensure_keepalive():
+    """Start the keep-alive thread if a public URL is known and none runs."""
+    global _keepalive_running
+    if not _KEEPALIVE_URL:
+        return False
+    with _keepalive_lock:
+        if _keepalive_running:
+            return True
+        _keepalive_running = True
+    threading.Thread(target=_keepalive_loop, name='keepalive', daemon=True).start()
+    return True
+
+
+@app.route('/api/ping')
+def api_ping():
+    return ('', 204)
+
+
 def _run_generation(jid, kind, payload):
+    _ensure_keepalive()
     try:
         _run_generation_inner(jid, kind, payload)
     finally:
