@@ -109,7 +109,7 @@
             </div>
 
             <div class="form-group file-upload">
-                <input type="file" id="fileUpload" accept=".csv,.xlsx,.xls">
+                <input type="file" id="fileUpload" accept=".csv,.xlsx">
                 <label for="fileUpload" class="file-upload-label">📁 Click to select or drag file here</label>
                 <span class="hint">Works with every schema: Movies export (39 cols), TV BrandIngest (38),
                 Talent BrandDef (38), Video Game BDR (39), Publishers BrandDefinitionReport (38)
@@ -155,6 +155,7 @@
                 <div class="stat-item"><div class="stat-value v-gap" id="sGaps">0</div><div class="stat-label">Gaps</div></div>
                 <div class="stat-item"><div class="stat-value v-mis" id="sMis">0</div><div class="stat-label">Mismatches</div></div>
                 <div class="stat-item"><div class="stat-value" id="sVer" style="color:#7fb3ff">0</div><div class="stat-label">To verify</div></div>
+                <div class="stat-item"><div class="stat-value" id="sUnv" style="color:#9aa4b2">0</div><div class="stat-label">Not verifiable</div></div>
             </div>
             <div class="legend" id="legend" style="display:none">
                 <span><span class="sw" style="background:#FFEB9C"></span>Gap — value found, cell empty</span>
@@ -211,10 +212,14 @@
                 .catch(e => { msg('Error: ' + e.message, 'error'); document.getElementById('progress').innerHTML=''; });
         }
 
+        const MAX_POLL_FAILURES = 40;   // ~100 s of consecutive failures
+        let pollFailures = 0;
+
         function poll(id) {
             fetch('/api/job/' + id)
                 .then(r => r.json())
                 .then(j => {
+                    pollFailures = 0;
                     if (j.status === 'running') {
                         progress(j.done, j.total, 'Reviewing rows…');
                         setTimeout(() => poll(id), 1500);
@@ -226,12 +231,19 @@
                         document.getElementById('sGaps').textContent = s.gaps ?? '—';
                         document.getElementById('sMis').textContent = s.mismatches ?? '—';
                         document.getElementById('sVer').textContent = s.verify ?? 0;
+                        document.getElementById('sUnv').textContent = s.unverified ?? 0;
+
                         document.getElementById('stats').style.display = 'flex';
                         document.getElementById('legend').style.display = 'flex';
                         const a = document.createElement('a');
                         a.href = '/api/job/' + id + '/download';
                         document.body.appendChild(a); a.click(); a.remove();
-                        msg('✓ Review complete — the highlighted workbook has downloaded (Summary, Reviewed, Findings sheets).', 'success');
+                        if (s.unverified && s.ok !== undefined && s.unverified > s.ok) {
+                            msg('✓ Review complete — but most cells could not be compared with a live source '
+                                + '(discovery off, or lookups failed). Treat this run as a template-rules check only.', 'info');
+                        } else {
+                            msg('✓ Review complete — the highlighted workbook has downloaded (Summary, Reviewed, Findings sheets).', 'success');
+                        }
                     } else if (j.lost && reviewAttempt < MAX_AUTO_RETRIES) {
                         reviewAttempt++;
                         msg('The server restarted during the review — restarting it automatically (attempt '
@@ -242,7 +254,14 @@
                         document.getElementById('progress').innerHTML = '';
                     }
                 })
-                .catch(() => setTimeout(() => poll(id), 2500));
+                .catch(() => {
+                    if (++pollFailures >= MAX_POLL_FAILURES) {
+                        msg('Lost contact with the server while reviewing. Please run the review again.', 'error');
+                        document.getElementById('progress').innerHTML = '';
+                        return;
+                    }
+                    setTimeout(() => poll(id), 2500);
+                });
         }
     </script>
 </body>
