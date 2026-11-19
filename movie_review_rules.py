@@ -50,6 +50,9 @@ import re
 import unicodedata
 
 YEAR_TOLERANCE = 1          # festival premiere vs release
+# never valid as a page (mirrors ingest_rules._BAD_FB_MANUAL_RE)
+_BAD_FB_RE = re.compile(
+    r'facebook\.com/(?:p|php|people)/|facebook\.com/profile\.php', re.I)
 SOCIAL_COLS = ('facebook_page', 'twitter_handle', 'instagram_user', 'tiktok_user')
 _PLAT = {'facebook_page': 'facebook', 'twitter_handle': 'twitter',
          'instagram_user': 'instagram', 'tiktok_user': 'tiktok'}
@@ -220,6 +223,12 @@ def check_social_cells(row):
             plat = _PLAT[col]
             # format
             if col == 'facebook_page':
+                if _BAD_FB_RE.search(strip_window(ln)):
+                    out.append(_f(col, 'Mismatch', cur, '',
+                                  "facebook_page '%s' is a profile / post URL, not the "
+                                  "film's page -- replace it with the official page URL."
+                                  % strip_window(ln)))
+                    break
                 if not re.match(r'^https?://(?:www\.)?facebook\.com/', strip_window(ln), re.I):
                     out.append(_f(col, 'Mismatch', cur,
                                   cur.replace(strip_window(ln),
@@ -290,11 +299,19 @@ def check_keywords(row):
     out, new, reasons = [], cur, []
     # year term(s)
     years = set(re.findall(r'"((?:19|20)\d{2})"', cur))
-    if year and years and str(year) not in years:
-        for y in years:
-            new = new.replace('"%s"' % y, '"%s"' % year)
-        reasons.append('year term %s should be %s (released_on)'
-                       % ('/'.join(sorted(years)), year))
+    if year and years and str(year) not in years and not row.get('_date_disputed'):
+        if row.get('_date_confirmed', True):
+            for y in years:
+                new = new.replace('"%s"' % y, '"%s"' % year)
+            reasons.append('year term %s should be %s (released_on)'
+                           % ('/'.join(sorted(years)), year))
+        else:
+            # Nov 2026: no source confirms released_on, so either year may be
+            # the wrong one -- ask instead of rewriting the keyword
+            out.append(_f(col, 'Verify', cur,
+                          'Keyword year %s does not match released_on %s -- confirm '
+                          'which is right.' % ('/'.join(sorted(years)), year),
+                          'year term vs released_on (date unconfirmed)'))
     # distributor term must be the row's network
     net = _alnum(row.get('network'))
     if net:
@@ -380,8 +397,17 @@ def gate_discovery_findings(findings, row):
                          reason="%s does not exist / is suspended." % m.group(1))
             kept.append(f)
             continue
-        # keyword findings come only from the row rules (case-preserving)
+        # keyword findings come only from the row rules (case-preserving) --
+        # except an EMPTY cell (a Gap) and a bare #hashtag / @handle line (the
+        # ingest-platform format rule), which the row rules cannot see
         if col == 'twitter_search_term_keywords':
+            if not cur:
+                kept.append(dict(f, status='Gap'))
+            elif any(ln.strip().startswith(('#', '@'))
+                     for ln in cur.split('\n') if ln.strip()):
+                kept.append(dict(f, status='Mismatch',
+                                 reason='A bare #hashtag / @handle is a search term, not a '
+                                        'keyword -- it belongs in twitter_search_terms.'))
             continue
         if col in SOCIAL_COLS:
             h = bare_handle(col, sugg)

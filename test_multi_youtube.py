@@ -20,9 +20,15 @@ class BuildYouTubeUsername(unittest.TestCase):
 class YouTubeChannelMulti(unittest.TestCase):
     def setUp(self):
         self._gj, self._k = mf._get_json, mf.YOUTUBE_API_KEY
+        self._off = mf._yt_channel_is_official
         mf.YOUTUBE_API_KEY = "k"
+        # this suite tests NAME matching + multi-channel output; the official-
+        # channel score (badge / subscribers) has its own tests and would drop
+        # these bare mock snippets
+        mf._yt_channel_is_official = lambda *a, **k: True
     def tearDown(self):
         mf._get_json, mf.YOUTUBE_API_KEY = self._gj, self._k
+        mf._yt_channel_is_official = self._off
     def test_two_valid_channels_returned(self):
         mf._get_json = lambda *a, **k: {"items":[
             {"snippet":{"title":"Aurora","channelId":"UC%022d"%1}},

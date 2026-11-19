@@ -82,8 +82,14 @@ class ReviewComparatorMovieRules(unittest.TestCase):
         self.assertFalse(self.rc("network", "Walt Disney Studios Motion Pictures",
                                  "20th Century Studios", title="Ice Age")[0])
 
-    def test_network_blank_allowed(self):
-        self.assertTrue(self.rc("network", "", "Disney", title="X")[0])
+    def test_network_blank_allowed_when_no_source_found_one(self):
+        self.assertTrue(self.rc("network", "", "", title="X")[0])
+
+    def test_network_blank_is_gap_when_discovered(self):
+        # Nov 2026: blank is only fine when no source names a network
+        ok, sugg = self.rc("network", "", "Disney", title="X")
+        self.assertFalse(ok)
+        self.assertEqual(sugg, "Disney")
 
     def test_companies_dar_must_be_pristine(self):
         self.assertFalse(self.rc("companies", "Warner Bros. Pictures",

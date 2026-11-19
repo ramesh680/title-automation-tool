@@ -972,6 +972,9 @@ _TALENT_OCC_MAP = [
     ('record producer', 'Musician', 'Musician', 'DJ / Producer'),
     ('musician', 'Musician', '', ''),
     ('actor', 'Actor', '', ''),
+    # Wikidata labels some women's P106 'actress' -- not a substring of 'actor',
+    # so it used to fall through to Media Personality
+    ('actress', 'Actor', '', ''),
     ('film director', 'Director', '', ''),
     ('director', 'Director', '', ''),
     ('comedian', 'Comedian', '', ''),
@@ -1562,8 +1565,11 @@ def create_game_row(title, metadata=None):
     gen_terms = _game_search_terms(clean_title, is_dar)
     kw_tail = "|DAR|DAR|2021-01-01" if is_dar else \
         "|Operations - Core Title|Operations - Core Title"
-    gen_kw = f'("{clean_title}") ({tw_clause} OR {_GAME_KW_TAIL}){kw_tail}'
-    gen_reddit = f'("{clean_title}") ({rd_clause} | {_GAME_RD_TAIL})' + \
+    # no developer: the tail already carries "Video Game" -- don't repeat it
+    gen_kw = (f'("{clean_title}") ({tw_clause} OR {_GAME_KW_TAIL}){kw_tail}' if dev_name
+              else f'("{clean_title}") ({_GAME_KW_TAIL}){kw_tail}')
+    gen_reddit = (f'("{clean_title}") ({rd_clause} | {_GAME_RD_TAIL})' if dev_name
+                  else f'("{clean_title}") ({_GAME_RD_TAIL})') + \
         ("|2021-01-01" if is_dar else "")
 
     def mv(key, default=''):
@@ -1926,6 +1932,10 @@ def _read_upload_frames(src):
         filename = src.filename
         stream = src
     fn = (filename or '').lower()
+    if fn.endswith('.xls'):
+        raise ValueError('Old Excel .xls files are not supported -- open the file in '
+                         'Excel or Google Sheets and save it as .xlsx (or .csv), then '
+                         'upload again.')
     if fn.endswith('.csv'):
         frames = [('Sheet1', pd.read_csv(stream))]
     else:
@@ -3487,8 +3497,8 @@ _PUB_FB_URL_RE = _ir._PUB_FB_URL_RE
 
 # columns that are inherently manual / not derivable -> never flagged
 REVIEW_SKIP_COLS = {
-    'record_type', 'brand_id', 'title', 'title_category', 'title_created_date',
-    'active', 'brand_listing_hidden', 'last_reviewed', 'rovi_id',
+    'record_type', 'brand_id', 'title', 'title_created_date',
+    'brand_listing_hidden', 'last_reviewed', 'rovi_id',
     'title_content_windows', 'composite_brand_set', 'iso_mic', 'stock_exchange',
     'box_office', 'street_date', 'gross_screen', 'opening_weekend_box_office',
     'domestic_opening_weekend_box_office', 'domestic_opening_weekend_screens',
@@ -3650,8 +3660,260 @@ _PUB_HANDLE_BAD_RE = re.compile(r'https?://|\bwww\.|[/@]', re.I)
 
 
 
+# ================= review reliability rules (Nov 2026 audit) =================
+# Each helper below closes a gap found by the column-by-column mutation audit:
+# a real error the Review used to wave through, or a suggestion that would have
+# written wrong data into the INGESTED row.
+
+_ISO_DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}')
+
+
+def _review_kind(cat):
+    """'movie' | 'tv' | 'talent' | 'game' from a row's title_category."""
+    s = str(cat or '').lower()
+    if 'talent' in s:
+        return 'talent'
+    if 'game' in s:
+        return 'game'
+    if 'tv' in s:
+        return 'tv'
+    return 'movie'
+
+
+def _iso_from_any(v):
+    """Best-effort ISO 'YYYY-MM-DD' for a date written another way
+    ('17/07/2026', 'July 17, 2026'); '' when it cannot be read."""
+    s = str(v or '').strip()
+    if not s:
+        return ''
+    try:
+        d = pd.to_datetime(s, dayfirst=True, errors='coerce')
+        return '' if pd.isna(d) else d.strftime('%Y-%m-%d')
+    except Exception:  # noqa: BLE001
+        return ''
+
+
+def _year_of(v):
+    m = re.match(r'\s*((?:19|20)\d{2})-\d{2}-\d{2}', str(v or ''))
+    return int(m.group(1)) if m else None
+
+
+def release_dispute(manual, discovered, strong=False):
+    """(status, suggestion, reason) when the file's released_on disagrees with
+    the discovered date by year, else None.
+
+    The file's date stays the anchor (Oct 2026 rule), so a disagreement is
+    never silently 'fixed' downstream -- it is raised on released_on itself.
+    A gap of more than one year on a row whose identity is pinned by its IMDb
+    id ('strong') is a Mismatch; otherwise (festival vs release, or a lookup
+    that may have hit a same-named title) it is a Verify."""
+    my, dy = _year_of(manual), _year_of(discovered)
+    if not my or not dy or my == dy:
+        return None
+    if strong and abs(my - dy) > 1:
+        return ('Mismatch', str(discovered)[:10],
+                f'Sources date this title {str(discovered)[:10]}; the file says '
+                f'{str(manual)[:10]}.')
+    return ('Verify',
+            f'A source dates this title {str(discovered)[:10]} but the file says '
+            f'{str(manual)[:10]} -- confirm the release date (keywords follow it).',
+            'release date disagreement')
+
+
+_YEAR_TOKEN_RE = re.compile(r'(?<!\d)(?:19|20)\d{2}(?!\d)')
+
+
+def _same_but_year(a, b):
+    """True when two search-term strings differ only by their year tokens."""
+    return _kw_terms(_YEAR_TOKEN_RE.sub('YEAR', str(a or ''))) == \
+        _kw_terms(_YEAR_TOKEN_RE.sub('YEAR', str(b or '')))
+
+
+# valid IMDb / RT / Metacritic URL shapes per row kind
+_URL_SHAPES = {
+    'imdb_id': {'movie': r'imdb\.com/title/tt\d+', 'tv': r'imdb\.com/title/tt\d+',
+                'game': r'imdb\.com/title/tt\d+', 'talent': r'imdb\.com/name/nm\d+'},
+    'rottentomatoes': {'movie': r'rottentomatoes\.com/m/', 'tv': r'rottentomatoes\.com/tv/',
+                       'talent': r'rottentomatoes\.com/celebrity/', 'game': None},
+    'metacritic': {'movie': r'metacritic\.com/movie/', 'tv': r'metacritic\.com/tv/',
+                   'game': r'metacritic\.com/game/', 'talent': r'metacritic\.com/person/'},
+}
+_URL_SHAPE_HELP = {
+    'imdb_id': {'talent': 'a person page (imdb.com/name/nm...)',
+                '*': 'a title page (imdb.com/title/tt...)'},
+    'rottentomatoes': {'movie': 'a /m/ film page', 'tv': 'a /tv/ series page',
+                       'talent': 'a /celebrity/ page',
+                       'game': 'blank -- Rotten Tomatoes does not cover video games'},
+    'metacritic': {'movie': 'a /movie/ page', 'tv': 'a /tv/ page',
+                   'game': 'a /game/ page', 'talent': 'a /person/ page'},
+}
+
+
+def url_shape_problem(col, value, kind):
+    """Reason string when an IMDb / RT / Metacritic value has the wrong shape
+    for the row's kind (a tt code on a Talent row, a /m/ page on a TV row, any
+    RT link on a game), else ''. Runs with or without auto-discovery."""
+    shapes = _URL_SHAPES.get(col)
+    if not shapes or not str(value or '').strip():
+        return ''
+    pat = shapes.get(kind, shapes.get('movie'))
+    help_ = _URL_SHAPE_HELP[col].get(kind) or _URL_SHAPE_HELP[col].get('*', '')
+    for ln in str(value).split('\n'):
+        ln = ln.strip()
+        if not ln:
+            continue
+        if pat is None or not re.search(pat, ln, re.I):
+            return f'{col} for a {kind} row must be {help_}.'
+    return ''
+
+
+def _genre_slugs(v):
+    return {re.sub(r'[^a-z0-9]', '', l.lower())
+            for l in str(v or '').split('\n') if l.strip()}
+
+
+def genre_problem(manual, expected):
+    """Reason when the file's genre is not usable: a label outside the IMDb
+    vocabulary (Oct 2026 rule), or no genre in common with the sources."""
+    try:
+        from metadata_fetcher import map_genre as _mg
+    except Exception:  # pragma: no cover
+        _mg = None
+    if _mg is not None:
+        bad = [l.strip() for l in str(manual or '').split('\n')
+               if l.strip() and not _mg(l.strip())]
+        if bad:
+            return 'Not an IMDb genre: ' + ', '.join(bad)
+    exp = _genre_slugs(expected)
+    if exp and not (_genre_slugs(manual) & exp):
+        return 'No genre in common with IMDb / Box Office Mojo'
+    return ''
+
+
+# brand sets that cannot sit on a DAR row, and the one that cannot sit on a base row
+_DAR_ONLY_SET = 'pristine dar brands'
+_BASE_ONLY_SETS = ('competitive view',)
+
+
+def brand_set_conflicts(manual_raw, is_dar):
+    """Lines in the file's brand_set that contradict the row type."""
+    out = []
+    for ln in str(manual_raw or '').split('\n'):
+        k = re.sub(r'\s+', ' ', ln.split('||', 1)[0]).strip().lower()
+        if not k:
+            continue
+        if is_dar and (k in _BASE_ONLY_SETS or k.startswith('[data feed]')):
+            out.append(ln.strip())
+        if not is_dar and k == _DAR_ONLY_SET:
+            out.append(ln.strip())
+    return out
+
+
+def _yt_channel_key(line):
+    """Channel identity of a youtube_channel_username line, independent of the
+    URL form: '/user/WarnerBrosPictures', '/@warnerbrospictures' and
+    '/c/WarnerBrosPictures' all -> 'warnerbrospictures'."""
+    base = str(line or '').split('|', 1)[0].strip()
+    m = re.search(r'youtube\.com/(?:@|user/|c/|channel/)?([^/?#\s]+)', base, re.I)
+    return re.sub(r'[^a-z0-9]', '', m.group(1).lower()) if m else ''
+
+
+def youtube_problem(manual, expected):
+    """(reason, suggestion) when youtube_channel_username is malformed or is
+    missing the network/studio channel the template requires (Oct 2026 rule:
+    when a network is found, its own channel is added). ('', '') when fine."""
+    lines = [l.strip() for l in str(manual or '').split('\n') if l.strip()]
+    bad = [l for l in lines if 'youtube.com/' not in l.lower()]
+    if bad:
+        keep = [l for l in lines if l not in bad]
+        return ('Not a YouTube URL: ' + '; '.join(bad), '\n'.join(keep))
+    have = {_yt_channel_key(l) for l in lines}
+    need = [l.strip() for l in str(expected or '').split('\n')
+            if '|' in l and l.strip()]
+    missing = [l for l in need if _yt_channel_key(l) and _yt_channel_key(l) not in have]
+    if missing:
+        return ("Missing the network/studio channel: "
+                + '; '.join(l.split('|', 1)[0] for l in missing),
+                '\n'.join(lines + missing))
+    return ('', '')
+
+
+_TERM_LINE_RE = re.compile(r'^([@#][^|\s]+)\|([^|]+)(?:\|([^|]+))?$')
+
+
+def search_terms_problem(manual, expected, is_dar, row_ctx=None):
+    """(reason, suggestion) for twitter_search_terms: every line must be
+    'term|LABEL[|LABEL]', DAR rows carry DAR labels (and base rows never do),
+    and an @handle must be an account on this row (its twitter_handle, or a
+    handle the template itself generates). Curated #hashtags stay valid
+    alternatives (reviewer rule: 'both values are correct')."""
+    lines = [l.strip() for l in str(manual or '').split('\n') if l.strip()]
+    row_ctx = row_ctx or {}
+    allowed = {_tw_handle_key(h) for h in str(row_ctx.get('twitter_handle') or '')
+               .split('\n') if h.strip()}
+    allowed = {re.sub(r'\|\d{4}-\d{2}-\d{2}$', '', a) for a in allowed}
+    for ln in str(expected or '').split('\n'):
+        m = _TERM_LINE_RE.match(ln.strip())
+        if m and m.group(1).startswith('@'):
+            allowed.add(m.group(1)[1:].lower())
+    for h in re.findall(r'@([A-Za-z0-9_]+)', str(row_ctx.get('twitter_search_term_keywords') or '')):
+        allowed.add(h.lower())
+    bad, reasons = [], []
+    for ln in lines:
+        m = _TERM_LINE_RE.match(ln)
+        if not m:
+            bad.append(ln); reasons.append(f"'{ln}' is not term|LABEL|LABEL")
+            continue
+        labels = {x.strip().upper() for x in (m.group(2), m.group(3)) if x}
+        if is_dar and labels != {'DAR'}:
+            bad.append(ln); reasons.append(f"'{ln}' must use the DAR label on a DAR row")
+            continue
+        if not is_dar and 'DAR' in labels:
+            bad.append(ln); reasons.append(f"'{ln}' carries a DAR label on a base row")
+            continue
+        if m.group(1).startswith('@') and allowed and m.group(1)[1:].lower() not in allowed:
+            bad.append(ln); reasons.append(f"{m.group(1)} is not an account on this row")
+    if not bad:
+        return ('', '')
+    keep = [l for l in lines if l not in bad]
+    have = {l.lower() for l in keep}
+    for ln in str(expected or '').split('\n'):
+        if ln.strip() and ln.strip().lower() not in have:
+            keep.append(ln.strip())
+    return ('; '.join(reasons), '\n'.join(keep))
+
+
+def _kw_network_hint(kw, is_movie=True):
+    """Known network named by the distributor clause of a keyword string
+    ('("Title") ("HBO" OR @HBO ...)' -> 'HBO'), else ''."""
+    m = re.match(r'\s*\([^)]*\)\s*\(\s*"([^"]+)"', str(kw or ''))
+    if not m:
+        return ''
+    term = m.group(1).strip()
+    if re.fullmatch(r'(?:19|20)\d{2}', term):
+        return ''
+    try:
+        label, known = resolve_network(term, is_movie=is_movie)
+    except Exception:  # noqa: BLE001
+        return ''
+    return label if known else ''
+
+
+def _social_key(col, v):
+    """Account identity of one facebook_page / instagram_user line."""
+    x = re.sub(r'\|\d{4}-\d{2}-\d{2}\s*$', '', str(v or '').strip())
+    x = re.sub(r'^https?://(?:www\.|m\.|web\.)?(?:facebook|instagram)\.com/', '', x, flags=re.I)
+    return x.split('?')[0].strip('/').lstrip('@').lower()
+
+
+_BOOL_OK = {'true', 'false', 't', 'f', '1', '0', 'yes', 'no', '1.0', '0.0'}
+
+# TV 'Program Type' dropdown (tv_ingest_template.xlsx, DropdownLists)
+TV_PROGRAM_TYPES = ('Series', 'Mini-Series', 'Special', 'TV Movie', 'Live Event', 'Block')
+
+
 def _review_compare(col, manual_raw, expected_raw, title='', cat='',
-                    manual_genre='', sub_raw='', attr_window=''):
+                    manual_genre='', sub_raw='', attr_window='', row_ctx=None):
     """Column-aware comparison. Returns (ok, suggested_str).
 
     Rules from the reviewed-file feedback:
@@ -3687,6 +3949,15 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
     if c == 'genre' and sugg:          # top-3 genres only in suggestions
         sugg = '\n'.join([l.strip() for l in sugg.split('\n') if l.strip()][:3])
 
+    # a primary_genre suggestion must be one of the row's OWN genres -- the
+    # discovered primary ('Action') is useless advice for a row whose genre
+    # cell says 'Horror'.
+    if c == 'primary_genre':
+        _own = [l.strip() for l in str(manual_genre or '').split('\n')
+                if l.strip() and l.strip().lower() != 'nan']
+        if _own and sugg.strip().lower() not in {o.lower() for o in _own}:
+            sugg = _own[0]
+
     # Facebook hygiene (Rule 5) applies regardless of any discovered value: a
     # /p/, /php/, /people/ or profile.php URL is never usable data and is always
     # flagged, even when discovery found nothing to compare against (so the
@@ -3711,6 +3982,8 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
     if c in ('genre', 'primary_genre', 'released_on') and not mval \
             and _cat_is_movie_or_tv(cat):
         return False, sugg
+    if c == 'genre' and not mval and 'game' in str(cat or '').lower():
+        return False, sugg      # genre is mandatory for Video Games too
 
     # Attribution window (Sep 2026): on a Movies DAR row the four social cells
     # carry a '|YYYY-MM-DD' suffix -- one calendar month before the official
@@ -3738,7 +4011,76 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
             and mval.strip().lower() not in _review_lines_ci(manual_genre):
         return False, sugg
 
-    if not eval_ or mval == eval_:
+    # ---- Nov 2026 audit: rules that depend only on the row itself. They used
+    # to sit below the "expected empty -> pass" short-circuit, so with
+    # auto-discovery off (or when a lookup failed) none of them ever ran, and a
+    # malformed value that equalled its own hint ('17/07/2026') always passed.
+    kind = _review_kind(cat)
+    is_dar_row = str(title).strip().lower().endswith('- dar')
+
+    if c == 'released_on' and mval and not _ISO_DATE_RE.match(mval):
+        return False, (_iso_from_any(manual_raw) or sugg)
+
+    if c in _URL_SHAPES and mval and str(cat or '').strip() \
+            and url_shape_problem(c, mval, kind):
+        good = sugg if (eval_ and not url_shape_problem(c, eval_, kind)) else ''
+        return False, good
+
+    if c == 'genre' and kind == 'talent' and mval:
+        return False, ''          # a person carries no genre
+
+    if c == 'genre' and mval and kind in ('movie', 'tv', 'game') \
+            and genre_problem(mval, eval_):
+        return False, sugg
+
+    if c == 'brand_set' and mval and str(title or '').strip() \
+            and brand_set_conflicts(manual_raw, is_dar_row):
+        bad = {b.lower() for b in brand_set_conflicts(manual_raw, is_dar_row)}
+        merged = _merge_brand_set(manual_raw, expected_raw)
+        return False, '\n'.join(l for l in merged.split('\n')
+                                if l.strip().lower() not in bad)
+
+    if c == 'twitter_search_terms' and mval:
+        reason, fix = search_terms_problem(manual_raw, expected_raw, is_dar_row, row_ctx)
+        if reason:
+            return False, fix
+
+    if c == 'youtube_channel_username' and mval:
+        reason, fix = youtube_problem(manual_raw, expected_raw)
+        if reason:
+            return False, fix
+
+    if c == 'title_category' and eval_:
+        # the database category exactly ('Movies', 'TV Shows', 'Talent',
+        # 'Video Game'); only the game category has an accepted plural
+        _cat_ok = {eval_.strip().lower()}
+        if eval_.strip().lower() == 'video game':
+            _cat_ok.add('video games')
+        return (mval.strip().lower() in _cat_ok), sugg
+
+    if c == 'active':
+        # any boolean spelling is fine (TRUE / true / t / 1); blank defaults on
+        return (not mval or mval.strip().lower() in _BOOL_OK), 'TRUE'
+
+    if c == 'title_sub_category' and kind == 'tv' and mval:
+        pt = _sub_parts(manual_raw).get('Program Type')
+        if pt and pt not in TV_PROGRAM_TYPES:
+            fixed = re.sub(r'Program Type - [^\n]*',
+                           'Program Type - ' + (
+                               _sub_parts(expected_raw).get('Program Type')
+                               if _sub_parts(expected_raw).get('Program Type') in TV_PROGRAM_TYPES
+                               else 'Series'), str(manual_raw))
+            return False, fixed
+
+    if c == 'wikipedia_page' and mval and not eval_:
+        # the slug / context check below needs no discovered value
+        expected_raw, eval_ = manual_raw, mval
+        sugg = ''
+        _wiki_offline = True
+    else:
+        _wiki_offline = False
+
+    if (not eval_ or mval == eval_) and not _wiki_offline:
         return True, sugg
 
     man_lines, exp_lines = _review_lines_ci(mval), _review_lines_ci(eval_)
@@ -3785,7 +4127,9 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
         # discovered one (e.g. "Walt Disney Studios Motion Pictures" -> "Disney").
         # A parent/umbrella that cannot resolve to the expected label stays flagged.
         if not mval:
-            return True, sugg
+            # blank is allowed only when no source names a network (Box Office
+            # Mojo may list no distributor); a discovered one is a Gap
+            return (not eval_), sugg
         _is_tv = 'tv' in str(cat or '').lower()
         raw_net = str(manual_raw or '').strip()
         mlabel = _review_norm(_ref_normalize_network(raw_net, is_movie=not _is_tv))
@@ -3804,7 +4148,14 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
         # company (a real distributor name or the literal "Unknown").
         if str(title).strip().lower().endswith('- dar'):
             return mval.strip().lower() == 'pristine brand', 'Pristine Brand'
-        return bool(mval), sugg
+        if not mval:
+            return False, sugg
+        # a base row's company is the network's curated parent; only judged
+        # when the template knows that parent. The literal 'Unknown' stays a
+        # valid curated value (reviewer rule, Jul 2026).
+        if eval_.strip().lower() in ('', 'unknown') or mval.strip().lower() == 'unknown':
+            return True, sugg
+        return _review_slug(mval) == _review_slug(eval_), sugg
 
     if c == 'genre':
         return bool(mval), sugg
@@ -3822,6 +4173,15 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
         tslug = _review_slug(base)
         ttoks = set(re.findall(r'[a-z0-9]+', base.lower()))
         ctx = set(re.findall(r'[a-z0-9]+', (str(cat) + ' ' + str(sub_raw)).lower()))
+        # Nov 2026: the slug check now also runs without discovery, so the
+        # standard disambiguators for the row's kind must count as context
+        # ('(film)' / '(2026_film)' on a Movies row, '(TV_series)' on TV)
+        ctx |= {'movie': {'film', 'movie'},
+                'tv': {'tv', 'series', 'miniseries', 'show', 'programme', 'program'},
+                'game': {'video', 'game'},
+                'talent': set()}.get(_review_kind(cat), set())
+        if _review_kind(cat) == 'talent':
+            ctx |= set(re.findall(r'[a-z]+', str(sub_raw).lower()))
         for ln in mval.split('\n'):
             slug = ln.rsplit('/', 1)[-1]
             if 'disambiguation' in slug.lower():
@@ -3847,6 +4207,12 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
             return (not good), ('\n'.join(good) if good else sugg)
         if any(_BAD_FB_MANUAL_RE.search(l) for l in man_lines):
             return False, '\n'.join(good)
+        # Nov 2026: a curated page used to pass whatever it was. Compare the
+        # account itself (scheme, case, trailing '/', window date ignored), the
+        # same way twitter_handle and tiktok_user are judged.
+        if good and not ({_social_key(c, l) for l in man_lines}
+                         & {_social_key(c, l) for l in good}):
+            return False, '\n'.join(good)
         return True, sugg
 
     if c == 'instagram_user':
@@ -3854,6 +4220,9 @@ def _review_compare(col, manual_raw, expected_raw, title='', cat='',
         if not mval:
             return (not good), ('\n'.join(good) if good else sugg)
         if _FANPAGE_RE.search(mval):
+            return False, '\n'.join(good)
+        if good and not ({_social_key(c, l) for l in man_lines}
+                         & {_social_key(c, l) for l in good}):
             return False, '\n'.join(good)
         return True, sugg
 
@@ -3960,7 +4329,7 @@ def _review_frame(df, auto_fetch=True, progress=None):
     _batch_qual = attribution_batch_qualification(
         [{str(k).lower(): v for k, v in r.items()} for r in records])
     findings, fills = [], {}
-    rows_reviewed = cells_checked = 0
+    rows_reviewed = cells_checked = cells_unverified = 0
     total = len(records)
     # Speed (Sep 2026): the per-row lookups used to run one row after another.
     # Warm the discovery cache for EVERY row concurrently first (same calls,
@@ -3976,6 +4345,7 @@ def _review_frame(df, auto_fetch=True, progress=None):
             continue
         rows_reviewed += 1
         cat = str(r.get(lower_cols.get('title_category', ''), '') or '')
+        _rctx = {str(k).lower(): v for k, v in r.items()}
 
         # ---- PUBLISHERS (40-col BrandDefinitionReport schema) ----
         # Publications are reviewed against the Publishers ingest RULES
@@ -4102,8 +4472,28 @@ def _review_frame(df, auto_fetch=True, progress=None):
             if not meta.get('genre') and g:
                 meta['genre'] = g
             expected = make_row(t, False, '', meta, game=True)
+            # Nov 2026: a release year that disagrees with the sources is raised
+            _grc = lower_cols.get('released_on')
+            if auto_fetch and _grc:
+                _gd = release_dispute(_iso_from_any(r.get(_grc)) or str(r.get(_grc) or ''),
+                                      str(meta.get('released_on') or ''), strong=False)
+                if _gd:
+                    findings.append(dict(row=i + 2, title=t, column=_grc, status=_gd[0],
+                                         current=str(r.get(_grc) or ''), suggested=_gd[1],
+                                         reason=_gd[2]))
+                    if _gd[0] == 'Mismatch':
+                        fills[(i, _grc)] = 'Mismatch'
+            _dev_known = bool(str(meta.get('developer') or '').strip())
             for col in GAME_COLUMNS:
                 if col in REVIEW_SKIP_COLS or col.lower() not in lower_cols:
+                    continue
+                if not _dev_known and col in ('twitter_search_term_keywords',
+                                              'reddit_search_terms') \
+                        and _review_norm(r.get(lower_cols[col])):
+                    # the clause names the developer; with none known there is
+                    # nothing to judge it against (it used to suggest deleting it)
+                    cells_checked += 1
+                    cells_unverified += 1
                     continue
                 src_col = lower_cols[col.lower()]
                 mval = _review_norm(r.get(src_col))
@@ -4111,8 +4501,11 @@ def _review_frame(df, auto_fetch=True, progress=None):
                 ok, sugg = _review_compare(
                     col, r.get(src_col), expected.get(col), title=t, cat=cat,
                     manual_genre=r.get(lower_cols.get('genre', ''), ''),
-                    sub_raw=r.get(lower_cols.get('title_sub_category', ''), ''))
+                    sub_raw=r.get(lower_cols.get('title_sub_category', ''), ''),
+                    row_ctx=_rctx)
                 if ok:
+                    if not _review_norm(expected.get(col)):
+                        cells_unverified += 1
                     continue
                 status = 'Gap' if not mval else 'Mismatch'
                 findings.append(dict(
@@ -4147,8 +4540,11 @@ def _review_frame(df, auto_fetch=True, progress=None):
                 ok, sugg = _review_compare(
                     col, r.get(src_col), expected.get(col), title=t, cat=cat,
                     manual_genre=r.get(lower_cols.get('genre', ''), ''),
-                    sub_raw=r.get(lower_cols.get('title_sub_category', ''), ''))
+                    sub_raw=r.get(lower_cols.get('title_sub_category', ''), ''),
+                    row_ctx=_rctx)
                 if ok:
+                    if not _review_norm(expected.get(col)):
+                        cells_unverified += 1
                     continue
                 status = 'Gap' if not mval else 'Mismatch'
                 findings.append(dict(
@@ -4184,6 +4580,9 @@ def _review_frame(df, auto_fetch=True, progress=None):
                 meta = dict(fetch_metadata_by_tt(tt.group(0), is_movie, t, year_hint=rel_year) or {})
             else:
                 meta = dict(fetch_metadata(t, is_movie, year_hint=rel_year) or {})
+        _disc_date = str(meta.get('released_on') or '').strip()
+        _disc_network = str(meta.get('network') or '').strip()
+        _strong_id = bool(re.search(r'tt\d{5,}', str(r.get(lower_cols.get('imdb_id', ''), '') or '')))
         for k, v in hints.items():
             if meta.get(k) in (None, ''):
                 meta[k] = v
@@ -4201,6 +4600,29 @@ def _review_frame(df, auto_fetch=True, progress=None):
         # tell the reviewer what to double-check but never replace a value on
         # the INGESTED row -- the note is prose, not data.
         _fstart = len(findings)   # this row's findings start here (Movies gate)
+        # Nov 2026: a release date that disagrees with the sources is raised on
+        # released_on itself. It used to be silently 'fixed' downstream: the
+        # file's wrong year was pushed into the keyword / reddit year terms.
+        _date_dispute = None
+        _rel_col = lower_cols.get('released_on')
+        if _rel_col and hints.get('released_on') and _disc_date:
+            _date_dispute = release_dispute(hints['released_on'], _disc_date,
+                                            strong=_strong_id)
+        if _date_dispute:
+            _st, _sg, _why = _date_dispute
+            findings.append(dict(row=i + 2, title=t, column=_rel_col, status=_st,
+                                 current=str(r.get(_rel_col) or ''), suggested=_sg,
+                                 reason=_why))
+            if _st == 'Mismatch':
+                fills[(i, _rel_col)] = 'Mismatch'
+            _rctx['_date_disputed'] = True
+        # With auto-discovery OFF the user asked for template rules only, and the
+        # Oct 2026 anchor rule (released_on is the truth) applies as before. With
+        # discovery ON, the anchor is trusted only once a source agrees with it.
+        _date_confirmed = (not auto_fetch) or bool(
+            hints.get('released_on') and _disc_date
+            and _year_of(hints['released_on']) == _year_of(_disc_date))
+        _rctx['_date_confirmed'] = _date_confirmed
         _notes = []
         _imdb_note = meta.pop('_imdb_year_note', '')
         if _imdb_note:
@@ -4218,7 +4640,27 @@ def _review_frame(df, auto_fetch=True, progress=None):
                       r.get(lower_cols.get('network', ''), '') or '').strip()
         if exp_net and not meta.get('network'):
             meta['network'] = exp_net
-        expected = make_row(t, is_movie, exp_net, meta)
+        # Nov 2026: url_managers is derived from the row's social accounts.
+        # When discovery returned none (toggle off, a timeout, a rate limit)
+        # the expected url_managers lost every social line, so a correct row
+        # was flagged and the suggestion DELETED its facebook / instagram /
+        # tiktok / twitter lines. The row's own accounts stand in for missing
+        # discovery when building the expected row (social cells themselves
+        # still only compare against discovered values).
+        _exp_meta = dict(meta)
+        for _sc in ('facebook_page', 'twitter_handle', 'instagram_user', 'tiktok_user',
+                    'linkedin_page', 'threads_page', 'pinterest_user_username'):
+            _mv = str(r.get(lower_cols.get(_sc, ''), '') or '').strip()
+            if _mv and _mv.lower() != 'nan' and not str(_exp_meta.get(_sc) or '').strip():
+                _exp_meta[_sc] = '\n'.join(
+                    re.sub(r'\|\d{4}-\d{2}-\d{2}\s*$', '', l.strip())
+                    for l in _mv.split('\n') if l.strip())
+        expected = make_row(t, is_movie, exp_net, _exp_meta)
+        # expected social cells must still reflect DISCOVERY only
+        for _sc in ('facebook_page', 'twitter_handle', 'instagram_user', 'tiktok_user',
+                    'linkedin_page', 'threads_page', 'pinterest_user_username'):
+            if not str(meta.get(_sc) or '').strip():
+                expected[_sc] = ''
 
         # Attribution window for this row. It applies ONLY where an earlier
         # title already used these accounts, so qualification is settled first:
@@ -4263,9 +4705,26 @@ def _review_frame(df, auto_fetch=True, progress=None):
                 col, r.get(src_col), expected.get(col), title=t, cat=cat,
                 manual_genre=r.get(lower_cols.get('genre', ''), ''),
                 sub_raw=r.get(lower_cols.get('title_sub_category', ''), ''),
-                attr_window=_attr_win)
+                attr_window=_attr_win, row_ctx=_rctx)
             if ok:
+                if not _review_norm(expected.get(col)):
+                    cells_unverified += 1
                 continue
+            if col in ('twitter_search_term_keywords', 'reddit_search_terms') \
+                    and _review_norm(r.get(src_col)) \
+                    and _same_but_year(r.get(src_col), expected.get(col)):
+                if _date_dispute:
+                    continue   # the year conflict is reported once, on released_on
+                if not _date_confirmed:
+                    # no source confirms the file's date, so it is unknown which
+                    # of the two years is wrong -- ask, never rewrite
+                    findings.append(dict(
+                        row=i + 2, title=t, column=src_col, status='Verify',
+                        current=str(r.get(src_col) or ''),
+                        suggested=f"The year in {col} does not match released_on "
+                                  f"({hints.get('released_on', '')}) -- confirm which is right.",
+                        reason='year term vs released_on'))
+                    continue
             status = 'Gap' if not mval else 'Mismatch'
             findings.append(dict(
                 row=i + 2, title=t, column=src_col, status=status,
@@ -4273,9 +4732,48 @@ def _review_frame(df, auto_fetch=True, progress=None):
                 suggested=sugg))
             fills[(i, src_col)] = status
 
+        # Nov 2026: a wrong network used to be judged correct (nothing to compare
+        # it with when discovery is off or found none) while every column
+        # derived from it -- sub-category, ticker, companies, keywords, reddit
+        # terms -- was 'corrected' to match the wrong network. When the row's
+        # own keyword clause names a different known network, the network is the
+        # suspect: raise one Verify on it instead of rewriting the rest.
+        _net_col = lower_cols.get('network')
+        if _net_col and not _disc_network:
+            _kw_net = _kw_network_hint(r.get(lower_cols.get('twitter_search_term_keywords', ''), ''),
+                                       is_movie)
+            _file_net = str(r.get(_net_col) or '').strip()
+            if _file_net.lower() == 'nan':
+                _file_net = ''
+            if _kw_net and not _file_net and not fills.get((i, _net_col)):
+                findings.append(dict(
+                    row=i + 2, title=t, column=_net_col, status='Gap', current='',
+                    suggested=_kw_net,
+                    reason="network is blank; the row's keyword clause names this network"))
+                fills[(i, _net_col)] = 'Gap'
+            if _kw_net and _file_net and \
+                    _kw_net.lower() != resolve_network(_file_net, is_movie=is_movie)[0].lower():
+                _derived = {'title_sub_category', 'ticker_symbol', 'companies', 'brand_set',
+                            'twitter_search_term_keywords', 'reddit_search_terms',
+                            'twitter_search_terms', 'youtube_channel_username', 'url_managers'}
+                _keep = []
+                for _f in findings[_fstart:]:
+                    if str(_f['column']).lower() in _derived and _f['status'] == 'Mismatch':
+                        fills.pop((i, _f['column']), None)
+                        continue
+                    _keep.append(_f)
+                findings[_fstart:] = _keep
+                findings.append(dict(
+                    row=i + 2, title=t, column=_net_col, status='Verify',
+                    current=_file_net,
+                    suggested=f"This row's keywords and other derived columns point to "
+                              f"'{_kw_net}', not '{_file_net}' -- confirm the network before "
+                              f"changing the columns that follow from it.",
+                    reason='network disagrees with the rest of the row'))
+
         # ---- Movies (Oct 2026 rebuild): LF-row-anchored rules + precision gate
         if MOVIE_RULES_ENABLED and _is_movies_cat(cat):
-            _lrow = {str(k).lower(): v for k, v in r.items()}
+            _lrow = dict(_rctx)
             _disc = findings[_fstart:]
             del findings[_fstart:]
             for _c in [c for (ri, c) in list(fills) if ri == i]:
@@ -4295,7 +4793,8 @@ def _review_frame(df, auto_fetch=True, progress=None):
             progress(i + 1, total)
 
     return dict(df=df, lower_cols=lower_cols, records=records, findings=findings,
-                fills=fills, rows_reviewed=rows_reviewed, cells_checked=cells_checked)
+                fills=fills, rows_reviewed=rows_reviewed, cells_checked=cells_checked,
+                cells_unverified=cells_unverified)
 
 
 def build_review(src, auto_fetch=True, progress=None):
@@ -4321,6 +4820,7 @@ def build_review(src, auto_fetch=True, progress=None):
     findings = [f for fr in frames for f in fr['findings']]
     rows_reviewed = sum(fr['rows_reviewed'] for fr in frames)
     cells_checked = sum(fr['cells_checked'] for fr in frames)
+    cells_unverified = sum(fr.get('cells_unverified', 0) for fr in frames)
 
     # ---------------- build the output workbook ----------------
     import openpyxl as _oxl
@@ -4350,7 +4850,9 @@ def build_review(src, auto_fetch=True, progress=None):
                  ('Sheets reviewed', ', '.join(str(fr['name']) for fr in frames)),
                  ('Rows reviewed', rows_reviewed),
                  ('Cells checked', cells_checked),
-                 ('Cells OK', cells_checked - len(value_findings)),
+                 ('Cells OK (confirmed against a source or rule)',
+                  max(cells_checked - len(value_findings) - cells_unverified, 0)),
+                 ('Cells not verifiable (no source value to compare)', cells_unverified),
                  ('Gaps (empty, value suggested)', gaps),
                  ('Mismatches (differs from expected)', mism),
                  ('To verify (sources disagree / unconfirmed)', verify)]:
@@ -4462,8 +4964,13 @@ def build_review(src, auto_fetch=True, progress=None):
 
     # Findings detail
     ws3 = wb.create_sheet('Findings')
+    # 'Row' is the row in the uploaded sheet. The Reviewed sheet carries TWO
+    # rows per record (INGESTED, then FROM DB), so the record's INGESTED row
+    # there is 2 x (Row - 2) + 2 -- added as the last column (existing column
+    # positions are unchanged for anything that reads this sheet).
     hdr = (['Sheet'] if multi else []) + ['Row', 'Title', 'Column', 'Type',
-                                          'Current Value', 'Suggested Value', 'Why']
+                                          'Current Value', 'Suggested Value', 'Why',
+                                          'Reviewed Row']
     ws3.append(hdr)
     off = 1 if multi else 0
     for c in range(1, len(hdr) + 1):
@@ -4472,11 +4979,12 @@ def build_review(src, auto_fetch=True, progress=None):
     for f in findings:
         ws3.append(([f.get('sheet', '')] if multi else [])
                    + [f['row'], f['title'], f['column'], f['status'],
-                      f['current'], f['suggested'], f.get('reason', '')])
+                      f['current'], f['suggested'], f.get('reason', ''),
+                      2 * (f['row'] - 2) + 2])
         ws3.cell(ws3.max_row, 4 + off).fill = {'Mismatch': RED, 'Verify': BLUE}.get(f['status'], AMBER)
         for c in (5 + off, 6 + off, 7 + off):
             ws3.cell(ws3.max_row, c).alignment = Alignment(wrap_text=True, vertical='top')
-    widths = ([16] if multi else []) + [6, 34, 26, 11, 60, 60, 60]
+    widths = ([16] if multi else []) + [6, 34, 26, 11, 60, 60, 60, 13]
     for c, w in enumerate(widths, start=1):
         ws3.column_dimensions[get_column_letter(c)].width = w
     ws3.freeze_panes = 'A2'
@@ -4486,7 +4994,8 @@ def build_review(src, auto_fetch=True, progress=None):
     wb.save(out)
     summary = {'rows': rows_reviewed, 'cells_checked': cells_checked,
                'gaps': gaps, 'mismatches': mism, 'verify': verify,
-               'ok': cells_checked - len(value_findings)}
+               'unverified': cells_unverified,
+               'ok': max(cells_checked - len(value_findings) - cells_unverified, 0)}
     return out.getvalue(), summary
 
 
