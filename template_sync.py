@@ -5,9 +5,10 @@ Keeps the Generator and Review on the LATEST Ops ingest templates in Google
 Drive, so a template update needs no code change or redeploy.
 
 For each category the newest Google Sheet in the templates folder whose NAME
-matches the category is used (shortcuts are followed to their target):
+matches the category is used (shortcuts are followed to their target), unless
+a file is PINNED for that category (see TEMPLATE_PIN_* below):
 
-    film    "Movies" or "Film"   -> e.g. "NEW Ingest Template - Movies (2026)"
+    film    "Movies" or "Film"   -> pinned: "NEW Ingest Template - Film w/ Language"
     tv      "TV"                 -> "New Brand Definitions Ingest Template - TV"
     talent  "Talent"             -> "Ingest Template - Talent"
     game    "Video Game"         -> "New Video Game - Ingest Template"
@@ -23,6 +24,11 @@ Setup (Render environment variables):
                                   folder AND to the files its shortcuts point to
     TEMPLATE_DRIVE_FOLDER_ID      defaults to the Ops templates folder
     TEMPLATE_REFRESH_HOURS        default 6
+    TEMPLATE_PIN_FILM             exact file name to use for Movies / Film
+                                  (default "NEW Ingest Template - Film w/ Language";
+                                  set it to "NEW Ingest Template - Movies (2026)"
+                                  to switch, or to "" to use the newest file)
+    TEMPLATE_PIN_TV / _TALENT / _GAME   same, for the other categories (unset)
 Without credentials the module stays idle and the bundled copies are used.
 """
 
@@ -63,13 +69,23 @@ CATEGORIES = {
              {"GAME_PUBLISHERS": 50}),
 }
 LABELS = {"film": "Movies / Film", "tv": "TV", "talent": "Talent", "game": "Video Game"}
+# Owner decision (Nov 2026): Movies / Film stays on the "Film w/ Language"
+# template for the next couple of months, then moves to "Movies (2026)" --
+# switched by changing TEMPLATE_PIN_FILM on Render, no code change.
+_PIN_DEFAULTS = {"film": "NEW Ingest Template - Film w/ Language"}
+
+
+def pins():
+    """category -> pinned file name ('' = use the newest matching file)."""
+    return {c: os.getenv(f"TEMPLATE_PIN_{c.upper()}", _PIN_DEFAULTS.get(c, "")).strip()
+            for c in CATEGORIES}
 # never pick an obvious archive / working copy
 _SKIP = re.compile(r"\b(old|archive[d]?|backup|deprecated|copy of|do not use)\b", re.I)
 
 _lock = threading.Lock()
 _thread = None
 STATUS = {c: {"source": "bundled", "file": "", "file_id": "", "modified": "",
-              "checked": "", "error": ""} for c in CATEGORIES}
+              "pinned": False, "checked": "", "error": ""} for c in CATEGORIES}
 STATE = {"enabled": False, "last_run": "", "last_error": ""}
 
 
@@ -146,14 +162,31 @@ def list_folder(sess, folder_id=FOLDER_ID):
     return out
 
 
-def pick_latest(files):
-    """category -> the newest spreadsheet whose name matches it."""
-    best = {}
+def pick_latest(files, pinned=None):
+    """category -> the spreadsheet to use: the PINNED file name when one is set
+    and present in the folder, otherwise the newest file whose name matches the
+    category. A pinned name that is missing falls back to the newest match and
+    is reported as f['pin_missing']."""
+    pinned = pins() if pinned is None else pinned
+    newest, pinned_hit = {}, {}
     for f in files:
         cat = category_for(f["name"])
         if not cat or f.get("error") or f.get("mimeType") not in (GSHEET, XLSX):
             continue
-        if cat not in best or f.get("modifiedTime", "") > best[cat].get("modifiedTime", ""):
+        if cat not in newest or f.get("modifiedTime", "") > newest[cat].get("modifiedTime", ""):
+            newest[cat] = f
+        want = pinned.get(cat, "")
+        if want and f["name"].strip().lower() == want.lower():
+            if cat not in pinned_hit or \
+                    f.get("modifiedTime", "") > pinned_hit[cat].get("modifiedTime", ""):
+                pinned_hit[cat] = f
+    best = {}
+    for cat, f in newest.items():
+        if cat in pinned_hit:
+            best[cat] = dict(pinned_hit[cat], pinned=True)
+        elif pinned.get(cat):
+            best[cat] = dict(f, pin_missing=pinned[cat])
+        else:
             best[cat] = f
     return best
 
@@ -223,7 +256,6 @@ def sync(force=False, sess=None):
                     continue
                 if (not force and st["source"] == "drive" and st["file_id"] == f["id"]
                         and st["modified"] == f.get("modifiedTime", "")):
-                    st["error"] = ""
                     continue                      # unchanged since the last pass
                 try:
                     path = os.path.join(CACHE_DIR, f"{cat}.xlsx")
@@ -235,7 +267,9 @@ def sync(force=False, sess=None):
                     REF.install(cat, tables, path)
                     _after_install()
                     st.update(source="drive", file=f["name"], file_id=f["id"],
-                              modified=f.get("modifiedTime", ""), error="")
+                              modified=f.get("modifiedTime", ""), pinned=bool(f.get("pinned")),
+                              error=(f"pinned file '{f['pin_missing']}' is not in the folder; "
+                                     "using the newest matching file") if f.get("pin_missing") else "")
                     log.info("template %s -> %s (%s)", cat, f["name"], f.get("modifiedTime"))
                 except Exception as e:  # noqa: BLE001 - keep the last good copy
                     st["error"] = f"kept previous copy: {e}"
@@ -258,7 +292,7 @@ def status():
     return {
         "enabled": STATE["enabled"], "folder_id": FOLDER_ID,
         "last_run": STATE["last_run"], "last_error": STATE["last_error"],
-        "refresh_hours": REFRESH_HOURS,
+        "refresh_hours": REFRESH_HOURS, "pins": pins(),
         "categories": {cat: dict(STATUS[cat], label=LABELS[cat], loaded=rows[cat])
                        for cat in CATEGORIES},
     }

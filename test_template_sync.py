@@ -93,7 +93,8 @@ class Base(unittest.TestCase):
         self._cache = TS.CACHE_DIR
         TS.CACHE_DIR = tempfile.mkdtemp()
         for st in TS.STATUS.values():
-            st.update(source='bundled', file='', file_id='', modified='', checked='', error='')
+            st.update(source='bundled', file='', file_id='', modified='', pinned=False,
+                      checked='', error='')
 
     def tearDown(self):
         TS.CACHE_DIR = self._cache
@@ -115,12 +116,43 @@ class Selection(Base):
             with self.subTest(name=name):
                 self.assertEqual(TS.category_for(name), cat)
 
-    def test_newest_of_movies_and_film_wins(self):
+    def test_film_pinned_to_film_with_language_by_default(self):
+        # owner decision: Film w/ Language for now, even though Movies (2026) is newer
         best = TS.pick_latest(TS.list_folder(_drive(film_newer='movies')))
-        self.assertEqual(best['film']['name'], 'NEW Ingest Template - Movies (2026)')
-        best = TS.pick_latest(TS.list_folder(_drive(film_newer='film')))
         self.assertEqual(best['film']['name'], 'NEW Ingest Template - Film w/ Language')
+        self.assertTrue(best['film'].get('pinned'))
         self.assertEqual(best['tv']['id'], 'T')            # shortcut followed to target
+
+    def test_switch_pin_to_movies_2026(self):
+        best = TS.pick_latest(TS.list_folder(_drive(film_newer='film')),
+                              pinned={'film': 'NEW Ingest Template - Movies (2026)'})
+        self.assertEqual(best['film']['name'], 'NEW Ingest Template - Movies (2026)')
+
+    def test_no_pin_uses_newest(self):
+        files = TS.list_folder(_drive(film_newer='movies'))
+        self.assertEqual(TS.pick_latest(files, pinned={})['film']['name'],
+                         'NEW Ingest Template - Movies (2026)')
+        files = TS.list_folder(_drive(film_newer='film'))
+        self.assertEqual(TS.pick_latest(files, pinned={})['film']['name'],
+                         'NEW Ingest Template - Film w/ Language')
+
+    def test_pinned_name_missing_falls_back_and_says_so(self):
+        best = TS.pick_latest(TS.list_folder(_drive()), pinned={'film': 'Some Renamed Template'})
+        self.assertEqual(best['film']['name'], 'NEW Ingest Template - Movies (2026)')
+        self.assertEqual(best['film']['pin_missing'], 'Some Renamed Template')
+
+    def test_env_var_controls_pin(self):
+        old = os.environ.get('TEMPLATE_PIN_FILM')
+        try:
+            os.environ['TEMPLATE_PIN_FILM'] = 'NEW Ingest Template - Movies (2026)'
+            self.assertEqual(TS.pins()['film'], 'NEW Ingest Template - Movies (2026)')
+            os.environ['TEMPLATE_PIN_FILM'] = ''
+            self.assertEqual(TS.pins()['film'], '')
+        finally:
+            if old is None:
+                os.environ.pop('TEMPLATE_PIN_FILM', None)
+            else:
+                os.environ['TEMPLATE_PIN_FILM'] = old
 
 
 class Sync(Base):
@@ -132,7 +164,8 @@ class Sync(Base):
         for cat in ('film', 'tv', 'talent', 'game'):
             self.assertEqual(st[cat]['source'], 'drive', cat)
             self.assertEqual(st[cat]['error'], '', cat)
-        self.assertEqual(st['film']['file'], 'NEW Ingest Template - Movies (2026)')
+        self.assertEqual(st['film']['file'], 'NEW Ingest Template - Film w/ Language')
+        self.assertTrue(st['film']['pinned'])
         self.assertIsNotNone(REF.film_studio('Brand New Pictures'))
         # the Generator picks the new studio up with no code change
         r = A.make_row('Some Film', True, 'Brand New Pictures', {'network': 'Brand New Pictures'})
