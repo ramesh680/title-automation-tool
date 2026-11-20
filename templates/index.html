@@ -313,6 +313,7 @@
             </div>
         </div>
 
+        <div id="tplInfo" style="margin:14px auto 0;max-width:900px;font-size:12.5px;line-height:1.5;opacity:.75;text-align:center"></div>
         <footer class="footer">🚀 Powered by <span class="grad">Ramesh Goswami</span> · Automation at Scale</footer>
     </div>
     <script>
@@ -1028,5 +1029,26 @@
         }
     </script>
 
+<script>
+/* Ingest templates in use (latest from the Ops Drive folder, or bundled copies) */
+(function () {
+    const el = document.getElementById('tplInfo');
+    if (!el) return;
+    const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    fetch('/api/templates/status').then(r => r.json()).then(s => {
+        const cats = s.categories || {};
+        const parts = Object.values(cats).map(c => {
+            const when = c.modified ? ' · ' + new Date(c.modified).toLocaleDateString() : '';
+            const what = c.source === 'drive' ? esc(c.file) + when : 'bundled copy';
+            const warn = c.error ? ' ⚠️' : '';
+            return '<b>' + esc(c.label) + ':</b> ' + what + warn;
+        });
+        const head = s.enabled ? 'Ingest templates in use (latest from Drive)' : 'Ingest templates in use (bundled copies — Drive sync not configured)';
+        el.innerHTML = head + '<br>' + parts.join(' &nbsp;|&nbsp; ');
+        const errs = Object.values(cats).filter(c => c.error).map(c => c.label + ': ' + c.error);
+        if (errs.length) el.title = errs.join('\n');
+    }).catch(() => {});
+})();
+</script>
 </body>
 </html>
