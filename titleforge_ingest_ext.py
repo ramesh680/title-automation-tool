@@ -413,13 +413,20 @@ def build_branddef_row(schema_key: str, ingest_row: Dict[str, Any]) -> Dict[str,
 
     # companies
     if schema_key in ("general", "sports"):
-        companies = _get(r, "Company") or ("Pristine Brand" if standard else "")
+        # Nov 2026: a base row with no Company column value used to be left
+        # blank, which the Validator rejects; 'Unknown' is the template default
+        # for a non-DAR row (same as Beauty / Beverages).
+        companies = _get(r, "Company") or ("Pristine Brand" if standard else "Unknown")
     else:
         companies = "Pristine Brand" if standard else "Unknown"
 
     # brand_set
     if schema_key in ("general", "sports"):
-        brand_set = _get(r, "Brand Sets") or (sc["brand_set_standard"] if standard else "")
+        # Nov 2026: Sports base rows fell back to blank although the schema
+        # names "Competitive View"; use the schema's sets when the sheet gives
+        # none (General has none configured, so it stays as before).
+        brand_set = _get(r, "Brand Sets") or (
+            sc["brand_set_standard"] if standard else sc["brand_set_competitive"])
     else:
         brand_set = sc["brand_set_standard"] if standard else sc["brand_set_competitive"]
 

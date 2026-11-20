@@ -93,7 +93,8 @@ DEFAULT_RULES = {
          "check": "imdb_ttcode_format", "applies_to": ["Movies", "TV Shows"],
          "message": "IMDb value should be an IMDb title URL / ttNNNNNNN code."},
         {"sheet": "*", "column": "metacritic", "check": "metacritic_url_format",
-         "message": "metacritic value should be a metacritic.com movie/tv URL."},
+         "message": "metacritic value should be a metacritic.com movie/tv URL "
+                    "(a /game/ URL for Video Games)."},
         {"sheet": "*", "column": "rottentomatoes", "check": "rottentomatoes_url_format",
          "applies_to": ["Movies", "TV Shows"],
          "message": "Rotten Tomatoes value should be a movie URL (contains /m/ or "
@@ -123,11 +124,15 @@ DEFAULT_RULES = {
          "message": "url_managers must reference the row's social accounts (Unknown / Pristine Brand skipped)."},
         {"sheet": "*", "column": "network", "check": "network_boxofficemojo_checkpoint",
          "applies_to": ["Movies", "TV Shows"],
+         # Movies: Box Office Mojo distributor labels. TV Shows: the network list
+         # in the TV ingest template (Nov 2026 -- TV networks such as HBO used to
+         # be checked against the MOVIE distributor list and always warned).
          "message": "network should be a specific Box Office Mojo distribution label "
                     "(blank is allowed when Box Office Mojo lists no distributor); "
                     "not a parent/umbrella studio."},
         {"sheet": "*", "column": "twitter_search_terms", "check": "twitter_search_terms_structure",
-         "message": "twitter_search_terms lines must be '#hashtag or @handle|label|label' "
+         "message": "twitter_search_terms lines must be '#hashtag or @handle|label' or "
+                    "'#hashtag or @handle|label|label' "
                     "(DAR rows use DAR|DAR; no duplicate terms; no runs of spaces in labels)."},
         {"sheet": "*", "column": "twitter_search_term_keywords",
          "check": "twitter_search_term_keywords_query",
@@ -336,15 +341,27 @@ def _chk_imdb_ttcode_format(val, row, rule):
 
 
 # Metacritic: format only -- metacritic.com movie OR tv paths are both fine.
-_MC_RE = re.compile(r"metacritic\.com/(movie|tv)/", re.I)
+_MC_RE = re.compile(r"metacritic\.com/(movie|tv|game)/", re.I)
+# Nov 2026: a /game/ page is the correct link for a Video Game (the Generator
+# writes it), so it is no longer rejected as "not a movie/tv URL". Video Game rows
+# need the /game/ page and other rows must not carry one; Movies / TV keep their
+# original behaviour (a /movie/ or /tv/ page is accepted on either).
+_MC_GAME_CATS = {"video game", "video games"}
 
 
 def _chk_metacritic_url_format(val, row, rule):
     v = _s(val)
     if v == "":
         return SEV_WARN, "Metacritic URL missing (lookup from title pending)."
-    if not _MC_RE.search(v):
+    m = _MC_RE.search(v)
+    if not m:
         return SEV_FAIL, rule.get("message", "Metacritic URL malformed.")
+    section = m.group(1).lower()
+    is_game = _norm(_row_get(row, "title_category")) in _MC_GAME_CATS
+    if is_game and section != "game":
+        return SEV_FAIL, f"Metacritic link is a /{section}/ page; a Video Game needs the /game/ page."
+    if not is_game and section == "game" and _s(_row_get(row, "title_category")):
+        return SEV_FAIL, "Metacritic /game/ pages are only valid on Video Game rows."
     return None, ""
 
 
@@ -521,6 +538,25 @@ APPROVED_NETWORKS = {n.lower() for n in [
 ]}
 
 
+_TV_NETS = (None, set())     # (reference_data.VERSION, names)
+
+
+def _tv_networks():
+    """Lower-cased network names from the TV ingest template -- the latest one
+    synced from Drive when available (re-read whenever the templates reload);
+    an empty set when no reference data loads, which skips the TV check."""
+    global _TV_NETS
+    try:
+        import reference_data as _ref
+        if not _ref.TV_NETWORKS:
+            _ref.load()
+        if _TV_NETS[0] != _ref.VERSION:
+            _TV_NETS = (_ref.VERSION, set(_ref.TV_NETWORKS))
+        return _TV_NETS[1]
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def _chk_network_checkpoint(val, row, rule):
     """SOFT checkpoint for the movie `network` (distribution label).
     Blank is allowed (Box Office Mojo may list no distributor). A parent/umbrella
@@ -532,6 +568,12 @@ def _chk_network_checkpoint(val, row, rule):
     if v == "":
         return None, ""  # blank allowed: no distributor on Box Office Mojo
     key = v.lower()
+    if _norm(_row_get(row, "title_category")) == "tv shows":
+        tv = _tv_networks()
+        if tv and key not in tv:
+            return SEV_WARN, (f"network '{v}' is not in the TV ingest template's network "
+                              "list; check the spelling against the database label.")
+        return None, ""
     parents = dict(NETWORK_PARENTS)
     for k, kids in (rule.get("parents") or {}).items():
         parents[k.lower()] = kids
@@ -559,7 +601,11 @@ def _chk_twitter_search_terms(val, row, rule):
         if not line:
             continue
         parts = line.split("|")
-        if len(parts) != 3:
+        # Nov 2026: the ingest templates are the upload format (owner decision).
+        # Their formulas write 'term|label' (TV '#x|TV Ops', Movies 2026
+        # '#x|Operations - Core Title', DAR '#x|DAR'); the database later stores
+        # it expanded as 'term|label|label'. Both shapes are accepted.
+        if len(parts) not in (2, 3):
             return SEV_FAIL, (rule.get("message", "Lines must be term|label|label.")
                               + f" Offending line: {line}")
         term = parts[0].strip()
@@ -569,8 +615,8 @@ def _chk_twitter_search_terms(val, row, rule):
             if re.search(r"\s{2,}", lab):
                 return SEV_FAIL, ("Label has runs of spaces (join groups with ' + '). "
                                   f"Offending line: {line}")
-        if dar and (parts[1].strip() != "DAR" or parts[2].strip() != "DAR"):
-            return SEV_WARN, f"DAR row labels should be 'DAR|DAR'. Offending line: {line}"
+        if dar and any(p.strip() != "DAR" for p in parts[1:]):
+            return SEV_WARN, f"DAR row labels should be 'DAR'. Offending line: {line}"
         if term.lower() in seen:
             return SEV_WARN, f"Duplicate term '{term}' (dedupe to avoid ingest conflicts)."
         seen.add(term.lower())

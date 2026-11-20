@@ -5116,6 +5116,39 @@ def api_ping():
     return ('', 204)
 
 
+# ---- latest ingest templates from Google Drive (Nov 2026) --------------------
+# The Generator and Review read their studio / network / talent / game tables
+# from the newest template per category in the Ops Drive folder (see
+# template_sync.py); the bundled reference/ copies are the fallback.
+try:
+    import template_sync as TSYNC
+    TSYNC.start()
+except Exception as _e:  # pragma: no cover - never block startup
+    TSYNC = None
+    logging.warning(f"template sync unavailable: {_e}")
+
+_TSYNC_LAST_MANUAL = [0.0]
+
+
+@app.route('/api/templates/status')
+def templates_status():
+    if TSYNC is None:
+        return jsonify({'enabled': False, 'last_error': 'template sync unavailable'})
+    return jsonify(TSYNC.status())
+
+
+@app.route('/api/templates/refresh', methods=['POST'])
+def templates_refresh():
+    """Check the Drive folder now (at most once a minute)."""
+    if TSYNC is None:
+        return jsonify({'enabled': False, 'last_error': 'template sync unavailable'}), 503
+    if time.time() - _TSYNC_LAST_MANUAL[0] < 60:
+        return jsonify(dict(TSYNC.status(), note='checked less than a minute ago')), 429
+    _TSYNC_LAST_MANUAL[0] = time.time()
+    TSYNC.sync(force=request.args.get('force') == '1')
+    return jsonify(TSYNC.status())
+
+
 def _run_generation(jid, kind, payload):
     _ensure_keepalive()
     try:

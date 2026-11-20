@@ -58,153 +58,241 @@ def _s(v):
     return str(v).strip() if v is not None else ""
 
 
-def _load_film():
-    wb = openpyxl.load_workbook(FILM_TEMPLATE, data_only=True)
+# ---------------- column lookup by header ----------------
+# Templates are matched by HEADER name (the n-th column with that header) so an
+# Ops edit that inserts or moves a column cannot silently shift every field;
+# the historical fixed position is the fallback when a header is missing.
+def _headers(ws):
+    return [_s(c.value) for c in next(ws.iter_rows(min_row=1, max_row=1))]
+
+
+def _col(hdr, name, nth=1, default=None, prefix=False):
+    """1-based index of the nth column whose header is "name" (or starts with
+    it when prefix=True); "default" when not found."""
+    seen = 0
+    want = name.lower()
+    for i, h in enumerate(hdr):
+        hl = h.lower().replace("\n", " ")
+        if (hl.startswith(want) if prefix else hl == want):
+            seen += 1
+            if seen == nth:
+                return i + 1
+    return default
+
+
+def _rows(ws):
+    return list(ws.iter_rows(min_row=2, values_only=True))
+
+
+def _cell(row, idx):
+    return _s(row[idx - 1]) if idx and idx - 1 < len(row) else ""
+
+
+def _load_film(path, T):
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     ws = wb["DropDown"]
-    # main studio table: J=Studio, K=Studio Type, L=YouTube, M=Company, N=Twitter
-    for r in range(2, ws.max_row + 1):
-        s = _s(ws.cell(r, 10).value)
-        if not s:
+    h = _headers(ws)
+    c_st = _col(h, "Studio", 1, 10)
+    c_ty = _col(h, "Studio Type", 2, 11)
+    c_yt = _col(h, "YouTube (Company)", 1, 12)
+    c_co = _col(h, "Company", 2, 13)
+    c_tw = _col(h, "Twitter Keyword String", 1, 14)
+    c_st2 = _col(h, "Studio", 2, 18)
+    c_rd = _col(h, "Reddit Keyword String", 1, 22)
+    rows = _rows(ws)
+    for r in rows:
+        st = _cell(r, c_st)
+        if not st:
             continue
-        FILM_STUDIOS[s.lower()] = dict(
-            name=s,
-            studio_type=_s(ws.cell(r, 11).value),
-            youtube=_s(ws.cell(r, 12).value),
-            company=_s(ws.cell(r, 13).value),
-            twitter_clause=_s(ws.cell(r, 14).value),
-            reddit_clause="",
-        )
-    # parallel reddit table: R=Studio ... V=Reddit Keyword String
-    for r in range(2, ws.max_row + 1):
-        s = _s(ws.cell(r, 18).value)
-        if s and s.lower() in FILM_STUDIOS:
-            FILM_STUDIOS[s.lower()]["reddit_clause"] = _s(ws.cell(r, 22).value)
-    # per-studio conglomerate roll-ups (column-oriented)
+        T["FILM_STUDIOS"][st.lower()] = dict(
+            name=st, studio_type=_cell(r, c_ty), youtube=_cell(r, c_yt),
+            company=_cell(r, c_co), twitter_clause=_cell(r, c_tw), reddit_clause="")
+    for r in rows:
+        st = _cell(r, c_st2)
+        if st and st.lower() in T["FILM_STUDIOS"]:
+            T["FILM_STUDIOS"][st.lower()]["reddit_clause"] = _cell(r, c_rd)
+    # per-studio conglomerate roll-ups (column-oriented: row 2 = studio)
     ws2 = wb["Media Conglomerate Brand Sets"]
-    for c in range(2, ws2.max_column + 1):
-        studio = _s(ws2.cell(2, c).value)
+    grid = list(ws2.iter_rows(min_row=1, max_row=6, values_only=True))
+    width = max(len(g) for g in grid) if grid else 0
+    for c in range(1, width):
+        studio = _s(grid[1][c]) if len(grid) > 1 and c < len(grid[1]) else ""
         if not studio:
             continue
-        lines = [_s(ws2.cell(rr, c).value) for rr in (3, 4, 5)]
+        lines = [_s(grid[rr][c]) for rr in (2, 3, 4) if rr < len(grid) and c < len(grid[rr])]
         lines = [l for l in lines if l]
         if lines:
-            FILM_ROLLUPS[studio.lower()] = "\n".join(lines)
+            T["FILM_ROLLUPS"][studio.lower()] = "\n".join(lines)
+    wb.close()
 
 
-def _load_tv():
-    wb = openpyxl.load_workbook(TV_TEMPLATE, data_only=True)
+def _load_tv(path, T):
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     ws = wb["DropdownLists"]
-    # B=Companies, C=Network, D=Network Type, E=Ticker, F=YouTube, G=Twitter
-    for r in range(2, ws.max_row + 1):
-        n = _s(ws.cell(r, 3).value)
+    h = _headers(ws)
+    c_co = _col(h, "Companies", 1, 2)
+    c_nw = _col(h, "Network", 1, 3)
+    c_ty = _col(h, "Network Type", 1, 4)
+    c_tk = _col(h, "Ticker Symbol", 1, 5)
+    c_yt = _col(h, "YouTube (Company)", 1, 6)
+    c_tw = _col(h, "Twitter Keyword String", 1, 7)
+    c_nw2 = _col(h, "Network", 2, 18)
+    c_rd = _col(h, "Reddit Keyword String", 1, 22)
+    c_g = _col(h, "List of Regular Genres", 1, 14, prefix=True)
+    c_m = _col(h, "Mapped Primary Genre", 1, 15)
+    rows = _rows(ws)
+    for r in rows:
+        n = _cell(r, c_nw)
         if not n:
             continue
-        TV_NETWORKS[n.lower()] = dict(
-            name=n,
-            company=_s(ws.cell(r, 2).value),
-            network_type=_s(ws.cell(r, 4).value),
-            ticker=_s(ws.cell(r, 5).value),
-            youtube=_s(ws.cell(r, 6).value),
-            twitter_clause=_s(ws.cell(r, 7).value),
-            reddit_clause="",
-        )
-    # parallel reddit table: R=Network ... V=Reddit Keyword String
-    for r in range(2, ws.max_row + 1):
-        n = _s(ws.cell(r, 18).value)
-        if n and n.lower() in TV_NETWORKS:
-            TV_NETWORKS[n.lower()]["reddit_clause"] = _s(ws.cell(r, 22).value)
-    # primary-genre Order of Operations: N=genre, O=Mapped Primary Genre
-    for r in range(2, ws.max_row + 1):
-        g, m = _s(ws.cell(r, 14).value), _s(ws.cell(r, 15).value)
+        T["TV_NETWORKS"][n.lower()] = dict(
+            name=n, company=_cell(r, c_co), network_type=_cell(r, c_ty),
+            ticker=_cell(r, c_tk), youtube=_cell(r, c_yt),
+            twitter_clause=_cell(r, c_tw), reddit_clause="")
+    for r in rows:
+        n = _cell(r, c_nw2)
+        if n and n.lower() in T["TV_NETWORKS"]:
+            T["TV_NETWORKS"][n.lower()]["reddit_clause"] = _cell(r, c_rd)
+    for r in rows:
+        g, m = _cell(r, c_g), _cell(r, c_m)
         if g and m:
-            TV_PRIMARY_ORDER.append((g, m))
-    # per-network conglomerate brand-set block
+            T["TV_PRIMARY_ORDER"].append((g, m))
     ws2 = wb["Conglomerate Brand Sets"]
-    for r in range(2, ws2.max_row + 1):
-        n, b = _s(ws2.cell(r, 1).value), _s(ws2.cell(r, 2).value)
+    for r in _rows(ws2):
+        n, b = _cell(r, 1), _cell(r, 2)
         if not n or b in ("", "None"):
             continue
         for key in (n.lower(), n.split("\n")[0].strip().lower()):
-            TV_CONGLOMERATES.setdefault(key, b)
+            T["TV_CONGLOMERATES"].setdefault(key, b)
+    wb.close()
 
 
-def _load_talent():
-    wb = openpyxl.load_workbook(TALENT_TEMPLATE, data_only=True)
+def _load_talent(path, T):
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     ws = wb["DropDown"]
-    for r in range(2, ws.max_row + 1):
-        sub = _s(ws.cell(r, 6).value)     # 'Talent Subtype - ...'
-        typ = _s(ws.cell(r, 7).value)     # 'Talent Type - ...'
-        bs = _s(ws.cell(r, 4).value)      # brand sets
-        if sub and sub not in TALENT_SUBTYPES:
-            TALENT_SUBTYPES.append(sub)
-        if typ and typ not in TALENT_TYPES:
-            TALENT_TYPES.append(typ)
-        if bs and bs not in TALENT_BRAND_SETS:
-            TALENT_BRAND_SETS.append(bs)
+    h = _headers(ws)
+    c_bs = _col(h, "Brand Sets", 1, 4)
+    c_sub = _col(h, "Sub Category", 1, 6)
+    c_typ = c_sub + 1          # 'Talent Type - ...' sits right of Sub Category
+    for r in _rows(ws):
+        sub, typ, bs = _cell(r, c_sub), _cell(r, c_typ), _cell(r, c_bs)
+        if sub and sub not in T["TALENT_SUBTYPES"]:
+            T["TALENT_SUBTYPES"].append(sub)
+        if typ and typ not in T["TALENT_TYPES"]:
+            T["TALENT_TYPES"].append(typ)
+        if bs and bs not in T["TALENT_BRAND_SETS"]:
+            T["TALENT_BRAND_SETS"].append(bs)
+    wb.close()
 
 
 def _dev_key(v):
     return _s(v).replace("Developer - ", "").strip().lower()
 
 
-def _load_game():
-    wb = openpyxl.load_workbook(GAME_TEMPLATE, data_only=True)
+def _load_game(path, T):
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     ws = wb["DropDown"]
-    for r in range(2, ws.max_row + 1):
-        dev = _s(ws.cell(r, 2).value)      # 'Developer - X'
+    h = _headers(ws)
+    c_dev = _col(h, "Developer", 1, 2)
+    c_dtw = _col(h, "Developer Twitter Keyword", 1, 3)
+    c_pub = _col(h, "Publisher", 1, 4)
+    c_pyt = _col(h, "Publisher YouTube (Company)", 1, 5)
+    c_ptw = _col(h, "Publisher Twitter Keyword", 1, 6)
+    c_plat = _col(h, "Platform", 1, 8)
+    c_g = _col(h, "Mapped Genres", 1, 9)
+    c_p = _col(h, "Primary Genres", 1, 10)
+    c_dev2 = _col(h, "Developer", 2, 11)
+    c_drd = _col(h, "Developer Reddit Keyword", 1, 12)
+    c_dev3 = _col(h, "Developer", 3, 14)
+    c_dyt = _col(h, "Developer YouTube (Company)", 1, 15)
+    D, P = T["GAME_DEVELOPERS"], T["GAME_PUBLISHERS"]
+    for r in _rows(ws):
+        dev = _cell(r, c_dev)
         if dev:
-            GAME_DEVELOPERS.setdefault(_dev_key(dev), {})["twitter_clause"] = \
-                _s(ws.cell(r, 3).value)
-        dev_r = _s(ws.cell(r, 11).value)   # reddit table
+            D.setdefault(_dev_key(dev), {})["twitter_clause"] = _cell(r, c_dtw)
+        dev_r = _cell(r, c_dev2)
         if dev_r:
-            GAME_DEVELOPERS.setdefault(_dev_key(dev_r), {})["reddit_clause"] = \
-                _s(ws.cell(r, 12).value)
-        dev_y = _s(ws.cell(r, 14).value)   # dev youtube table
+            D.setdefault(_dev_key(dev_r), {})["reddit_clause"] = _cell(r, c_drd)
+        dev_y = _cell(r, c_dev3)
         if dev_y:
-            GAME_DEVELOPERS.setdefault(_dev_key(dev_y), {})["youtube"] = \
-                _s(ws.cell(r, 15).value)
-        pub = _s(ws.cell(r, 4).value)
+            D.setdefault(_dev_key(dev_y), {})["youtube"] = _cell(r, c_dyt)
+        pub = _cell(r, c_pub)
         if pub:
-            GAME_PUBLISHERS[pub.lower()] = dict(
-                youtube=_s(ws.cell(r, 5).value),
-                twitter_clause=_s(ws.cell(r, 6).value))
-        plat = _s(ws.cell(r, 8).value)
-        if plat and plat not in GAME_PLATFORMS:
-            GAME_PLATFORMS.append(plat)
-        g, p = _s(ws.cell(r, 9).value), _s(ws.cell(r, 10).value)
+            P[pub.lower()] = dict(youtube=_cell(r, c_pyt), twitter_clause=_cell(r, c_ptw))
+        plat = _cell(r, c_plat)
+        if plat and plat not in T["GAME_PLATFORMS"]:
+            T["GAME_PLATFORMS"].append(plat)
+        g, p = _cell(r, c_g), _cell(r, c_p)
         if g and p:
-            GAME_GENRE_MAP[g.lower()] = p
+            T["GAME_GENRE_MAP"][g.lower()] = p
+    wb.close()
 
 
-def load():
-    """(Re)load the templates. Returns True when any reference data loaded."""
-    global LOADED
+_TABLES = ("FILM_STUDIOS", "FILM_ROLLUPS", "TV_NETWORKS", "TV_CONGLOMERATES",
+           "TV_PRIMARY_ORDER", "TALENT_TYPES", "TALENT_SUBTYPES", "TALENT_BRAND_SETS",
+           "GAME_DEVELOPERS", "GAME_PUBLISHERS", "GAME_GENRE_MAP", "GAME_PLATFORMS")
+_LOADERS = {"film": _load_film, "tv": _load_tv, "talent": _load_talent, "game": _load_game}
+_CATEGORY_TABLES = {
+    "film": ("FILM_STUDIOS", "FILM_ROLLUPS"),
+    "tv": ("TV_NETWORKS", "TV_CONGLOMERATES", "TV_PRIMARY_ORDER"),
+    "talent": ("TALENT_TYPES", "TALENT_SUBTYPES", "TALENT_BRAND_SETS"),
+    "game": ("GAME_DEVELOPERS", "GAME_PUBLISHERS", "GAME_GENRE_MAP", "GAME_PLATFORMS"),
+}
+VERSION = 0              # bumped on every successful (re)load; caches key on it
+SOURCES = {}             # category -> path the live tables came from
+
+
+def _empty():
+    return {t: ([] if t in ("TV_PRIMARY_ORDER", "TALENT_TYPES", "TALENT_SUBTYPES",
+                            "TALENT_BRAND_SETS", "GAME_PLATFORMS") else {})
+            for t in _TABLES}
+
+
+def parse_category(category, path):
+    """Parse one template file into fresh tables WITHOUT touching the live
+    ones -- used to validate a downloaded template before switching to it."""
+    T = _empty()
+    _LOADERS[category](path, T)
+    return {t: T[t] for t in _CATEGORY_TABLES[category]}
+
+
+def counts():
+    g = globals()
+    return {t: len(g[t]) for t in _TABLES}
+
+
+def install(category, tables, path=""):
+    """Publish freshly parsed tables for one category. Each table is REBOUND
+    (not mutated), so a request reading the old dict mid-swap stays consistent."""
+    global VERSION, LOADED
+    g = globals()
+    for t in _CATEGORY_TABLES[category]:
+        g[t] = tables[t]
+    SOURCES[category] = path
+    VERSION += 1
+    LOADED = bool(g["FILM_STUDIOS"] or g["TV_NETWORKS"])
+
+
+def load(paths=None):
+    """(Re)load the templates. "paths" maps category -> file (defaults to the
+    bundled reference/ copies). Returns True when any reference data loaded."""
     if openpyxl is None:
         return False
-    try:
-        if os.path.exists(FILM_TEMPLATE):
-            _load_film()
-        else:
-            log.warning("film template not found: %s", FILM_TEMPLATE)
-        if os.path.exists(TV_TEMPLATE):
-            _load_tv()
-        else:
-            log.warning("tv template not found: %s", TV_TEMPLATE)
-        if os.path.exists(TALENT_TEMPLATE):
-            _load_talent()
-        else:
-            log.warning("talent template not found: %s", TALENT_TEMPLATE)
-        if os.path.exists(GAME_TEMPLATE):
-            _load_game()
-        else:
-            log.warning("game template not found: %s", GAME_TEMPLATE)
-        LOADED = bool(FILM_STUDIOS or TV_NETWORKS)
-        log.info("reference templates loaded: %d studios, %d networks, "
-                 "%d film roll-ups, %d tv conglomerates, %d genre mappings",
-                 len(FILM_STUDIOS), len(TV_NETWORKS), len(FILM_ROLLUPS),
-                 len(TV_CONGLOMERATES), len(TV_PRIMARY_ORDER))
-    except Exception as e:  # noqa: BLE001
-        log.warning("reference template load failed: %s", e)
+    default = {"film": FILM_TEMPLATE, "tv": TV_TEMPLATE,
+               "talent": TALENT_TEMPLATE, "game": GAME_TEMPLATE}
+    default.update(paths or {})
+    for cat, path in default.items():
+        try:
+            if os.path.exists(path):
+                install(cat, parse_category(cat, path), path)
+            else:
+                log.warning("%s template not found: %s", cat, path)
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s template load failed (%s): %s", cat, path, e)
+    c = counts()
+    log.info("reference templates loaded: %d studios, %d networks, %d film roll-ups, "
+             "%d tv conglomerates, %d genre mappings", c["FILM_STUDIOS"], c["TV_NETWORKS"],
+             c["FILM_ROLLUPS"], c["TV_CONGLOMERATES"], c["TV_PRIMARY_ORDER"])
     return LOADED
 
 
